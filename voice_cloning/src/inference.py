@@ -19,7 +19,7 @@ import tempfile
 import time
 import warnings
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Protocol
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -130,8 +130,15 @@ app.add_middleware(
 _engine_lock = threading.Lock()
 _engines: dict[tuple[str, str], "StyleTTS2RepoEngine"] = {}
 _lipsync_lock = threading.Lock()
-_lipsync_engine: LipSyncBridge | None = None
+_lipsync_engines: dict[str, "_LipSyncEngineProtocol"] = {}
 _SIGMA_WARNED_PATHS: set[str] = set()
+
+
+class _LipSyncEngineProtocol(Protocol):
+    fps: float
+
+    def load_profile(self, profile: str, profile_type: str = PROFILE_TYPE_AVATAR) -> None: ...
+    def sync_chunk(self, audio_16k: np.ndarray, fps: float | None = None) -> list[np.ndarray]: ...
 
 
 def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
@@ -419,11 +426,12 @@ def _generate_with_seed(
     f0_scale: float,
     phonemizer_lang: str | None,
     lexicon: dict[str, str] | None,
+    prepend_boundary: bool = False,
 ) -> np.ndarray:
     if seed is not None:
         _seed_everything(seed)
-    # Prepend a sacrificial boundary to stabilize alignment on the first phoneme.
-    padded_text = f". {text}"
+    # Optional sacrificial boundary to stabilize the very first chunk only.
+    padded_text = f". {text}" if prepend_boundary else text
     audio = engine.generate(
         padded_text,
         ref_wav_path=ref_wav_path,
@@ -436,10 +444,11 @@ def _generate_with_seed(
         lexicon=lexicon,
         seed=seed,
     )
-    # Trim a short lead-in to remove the sacrificial boundary.
-    trim = int(engine.sample_rate * 0.04)  # ~40ms at 24k
-    if audio is not None and audio.size > trim:
-        audio = audio[trim:]
+    if prepend_boundary:
+        # Trim a short lead-in to remove the sacrificial boundary.
+        trim = int(engine.sample_rate * 0.04)  # ~40ms at 24k
+        if audio is not None and audio.size > trim:
+            audio = audio[trim:]
     return audio
 
 
@@ -906,18 +915,49 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
 
     engine = _get_engine(model_path, config_path)
     try:
-        lipsync = _get_lipsync_engine()
+        lipsync = _get_lipsync_engine(req.lipsync_backend)
         lipsync.load_profile(profile, profile_type)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    is_musetalk = lipsync.__class__.__name__ == "MuseTalkBridge"
     fps = req.avatar_fps or lipsync.fps
 
     profile_defaults = _load_profile_defaults(model_path)
-    max_chars = (
-        req.max_chunk_chars
-        if req.max_chunk_chars is not None
-        else profile_defaults.get("max_chunk_chars", DEFAULT_MAX_CHUNK_CHARS)
-    )
+    # Request-time MuseTalk knobs (ignored for Wav2Lip).
+    # Reset to defaults when no override is provided so stale in-memory values do not linger.
+    if is_musetalk:
+        if req.musetalk_batch_size is not None:
+            lipsync.batch_size = max(1, min(int(req.musetalk_batch_size), 128))
+        if req.musetalk_infer_fps is not None:
+            lipsync.infer_fps = max(6.0, min(float(req.musetalk_infer_fps), 30.0))
+
+        default_face_scale = float(
+            profile_defaults.get(
+                "musetalk_face_scale",
+                os.getenv("MUSE_TALK_FACE_SCALE", "1.0"),
+            )
+        )
+        lipsync.face_scale = max(0.75, min(default_face_scale, 1.15))
+        if req.musetalk_face_scale is not None:
+            lipsync.face_scale = max(0.75, min(float(req.musetalk_face_scale), 1.15))
+
+        if req.musetalk_audio_history_sec is not None:
+            lipsync.audio_history_sec = max(
+                0.5, min(float(req.musetalk_audio_history_sec), 6.0)
+            )
+    if is_musetalk and req.musetalk_max_chunk_chars is not None:
+        max_chars = req.musetalk_max_chunk_chars
+    elif req.max_chunk_chars is not None:
+        max_chars = req.max_chunk_chars
+    elif is_musetalk:
+        max_chars = int(
+            profile_defaults.get(
+                "musetalk_max_chunk_chars",
+                os.getenv("MUSE_TALK_MAX_CHUNK_CHARS", "90"),
+            )
+        )
+    else:
+        max_chars = profile_defaults.get("max_chunk_chars", DEFAULT_MAX_CHUNK_CHARS)
     max_words = (
         req.max_chunk_words
         if req.max_chunk_words is not None
@@ -941,12 +981,12 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
     smart_trim_db = (
         req.smart_trim_db
         if req.smart_trim_db is not None
-        else profile_defaults.get("smart_trim_db", 30.0)
+        else profile_defaults.get("stream_smart_trim_db", 0.0)
     )
     smart_trim_pad_ms = (
         req.smart_trim_pad_ms
         if req.smart_trim_pad_ms is not None
-        else profile_defaults.get("smart_trim_pad_ms", 50.0)
+        else profile_defaults.get("stream_smart_trim_pad_ms", 30.0)
     )
 
     seed = req.seed if req.seed is not None else profile_defaults.get("seed")
@@ -959,6 +999,39 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
     comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
     comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
     comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
+    first_chunk_max_chars: int | None = None
+    if is_musetalk:
+        if req.musetalk_first_chunk_chars is not None:
+            first_chunk_max_chars = max(8, min(int(req.musetalk_first_chunk_chars), 200))
+        else:
+            first_chunk_max_chars = int(
+                profile_defaults.get(
+                    "musetalk_first_chunk_chars",
+                    os.getenv("MUSE_TALK_FIRST_CHUNK_CHARS", "48"),
+                )
+            )
+    musetalk_window_sec = 0.0
+    if is_musetalk:
+        if req.musetalk_stream_window_sec is not None:
+            musetalk_window_sec = max(0.2, min(float(req.musetalk_stream_window_sec), 3.0))
+        else:
+            musetalk_window_sec = float(
+                profile_defaults.get(
+                    "musetalk_stream_window_sec",
+                    os.getenv("MUSE_TALK_STREAM_WINDOW_SEC", "1.0"),
+                )
+            )
+    jpeg_quality = 80
+    if is_musetalk:
+        if req.musetalk_jpeg_quality is not None:
+            jpeg_quality = max(50, min(int(req.musetalk_jpeg_quality), 95))
+        else:
+            jpeg_quality = int(
+                profile_defaults.get(
+                    "musetalk_jpeg_quality",
+                    os.getenv("MUSE_TALK_JPEG_QUALITY", "72"),
+                )
+            )
 
     def _generator() -> Iterator[str]:
         result_queue: queue.Queue[tuple[str, int, np.ndarray | None, np.ndarray | None]] = queue.Queue(
@@ -976,6 +1049,7 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
 
         def _audio_worker() -> None:
             idx = 0
+            first_tts_chunk = True
             try:
                 if seed is not None:
                     _seed_everything(seed)
@@ -987,13 +1061,18 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
                     if not re.search(r"[A-Za-z0-9]", clean_sentence):
                         continue
                     sentence_ref = ref_wav_path
-                    for chunk in _split_text_prosody(clean_sentence, max_chars):
+                    for chunk in _split_text_prosody(
+                        clean_sentence,
+                        max_chars,
+                        first_chunk_max_chars=first_chunk_max_chars,
+                    ):
                         if pad_text:
                             chunk = f"{pad_text_token} {chunk} {pad_text_token}"
+                        chunk_seed = seed if first_tts_chunk else None
                         audio = _AI_EXECUTOR.submit(
                             _generate_with_seed,
                             engine,
-                            seed,
+                            chunk_seed,
                             chunk,
                             sentence_ref,
                             params["alpha"],
@@ -1003,7 +1082,9 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
                             params["f0_scale"],
                             phonemizer_lang,
                             lexicon,
+                            first_tts_chunk,
                         ).result()
+                        first_tts_chunk = False
                         if audio is None or audio.size == 0:
                             continue
                         audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1070,6 +1151,54 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
         threading.Thread(target=_audio_worker, daemon=True).start()
 
         last_frame: np.ndarray | None = None
+        emit_index = 0
+        window_src_samples = 0
+        window_tgt_samples = 0
+        pending_audio = np.zeros(0, dtype=np.float32)
+        pending_audio_16k = np.zeros(0, dtype=np.float32)
+        if is_musetalk and musetalk_window_sec > 0:
+            window_src_samples = max(1, int(round(engine.sample_rate * musetalk_window_sec)))
+            window_tgt_samples = max(1, int(round(16000.0 * musetalk_window_sec)))
+
+        def _emit_one(sub_audio: np.ndarray, sub_audio_16k: np.ndarray) -> Iterator[str]:
+            nonlocal last_frame, emit_index
+            rms = (
+                float(np.sqrt(np.mean(np.square(sub_audio))))
+                if sub_audio is not None and sub_audio.size
+                else 0.0
+            )
+            frames_needed = (
+                max(1, int(round((len(sub_audio_16k) / 16000.0) * fps)))
+                if sub_audio_16k is not None
+                else 0
+            )
+
+            if SILENCE_CULLING_ENABLED and rms < SILENCE_RMS_THRESHOLD and last_frame is not None:
+                frames = [last_frame.copy() for _ in range(frames_needed)]
+            else:
+                frames = lipsync.sync_chunk(sub_audio_16k, fps=fps)
+                if frames:
+                    last_frame = frames[-1].copy()
+            frame_payloads = []
+            for frame in frames:
+                ok, buf = cv2.imencode(
+                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
+                )
+                if ok:
+                    frame_payloads.append(base64.b64encode(buf).decode("ascii"))
+
+            wav_bytes = _audio_to_wav_bytes(sub_audio, engine.sample_rate)
+            payload = base64.b64encode(wav_bytes).decode("ascii")
+            yield json.dumps(
+                {
+                    "chunk_index": emit_index,
+                    "audio_base64": payload,
+                    "sample_rate": engine.sample_rate,
+                    "fps": fps,
+                    "frames_base64": frame_payloads,
+                }
+            ) + "\n"
+            emit_index += 1
 
         try:
             while True:
@@ -1081,39 +1210,29 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
                     yield json.dumps({"event": "error", "detail": detail}) + "\n"
                     break
                 if kind == "done":
+                    if is_musetalk and pending_audio.size and pending_audio_16k.size:
+                        yield from _emit_one(pending_audio, pending_audio_16k)
                     break
 
-                rms = float(np.sqrt(np.mean(np.square(audio)))) if audio is not None and audio.size else 0.0
-                frames_needed = (
-                    max(1, int(round((len(audio_16k) / 16000.0) * fps))) if audio_16k is not None else 0
-                )
+                if audio is None or audio_16k is None:
+                    continue
 
-                if SILENCE_CULLING_ENABLED and rms < SILENCE_RMS_THRESHOLD and last_frame is not None:
-                    frames = [last_frame.copy() for _ in range(frames_needed)]
-                else:
-                    frames = lipsync.sync_chunk(audio_16k, fps=fps)
-                    if frames:
-                        last_frame = frames[-1].copy()
-                frame_payloads = []
-                jpeg_quality = 80
-                for frame in frames:
-                    ok, buf = cv2.imencode(
-                        ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
+                if is_musetalk and window_src_samples > 0 and window_tgt_samples > 0:
+                    pending_audio = np.concatenate([pending_audio, audio.astype(np.float32, copy=False)])
+                    pending_audio_16k = np.concatenate(
+                        [pending_audio_16k, audio_16k.astype(np.float32, copy=False)]
                     )
-                    if ok:
-                        frame_payloads.append(base64.b64encode(buf).decode("ascii"))
-
-                wav_bytes = _audio_to_wav_bytes(audio, engine.sample_rate)
-                payload = base64.b64encode(wav_bytes).decode("ascii")
-                yield json.dumps(
-                    {
-                        "chunk_index": idx,
-                        "audio_base64": payload,
-                        "sample_rate": engine.sample_rate,
-                        "fps": fps,
-                        "frames_base64": frame_payloads,
-                    }
-                ) + "\n"
+                    while (
+                        pending_audio.size >= window_src_samples
+                        and pending_audio_16k.size >= window_tgt_samples
+                    ):
+                        sub_audio = pending_audio[:window_src_samples]
+                        sub_audio_16k = pending_audio_16k[:window_tgt_samples]
+                        pending_audio = pending_audio[window_src_samples:]
+                        pending_audio_16k = pending_audio_16k[window_tgt_samples:]
+                        yield from _emit_one(sub_audio, sub_audio_16k)
+                else:
+                    yield from _emit_one(audio, audio_16k)
         except Exception:
             logger.exception("Avatar stream failed")
             yield json.dumps({"event": "error", "detail": traceback.format_exc()}) + "\n"
@@ -1166,12 +1285,12 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
     smart_trim_db = (
         req.smart_trim_db
         if req.smart_trim_db is not None
-        else profile.get("smart_trim_db", 30.0)
+        else profile.get("stream_smart_trim_db", 0.0)
     )
     smart_trim_pad_ms = (
         req.smart_trim_pad_ms
         if req.smart_trim_pad_ms is not None
-        else profile.get("smart_trim_pad_ms", 50.0)
+        else profile.get("stream_smart_trim_pad_ms", 30.0)
     )
     pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
     comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
@@ -1182,6 +1301,7 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
 
     def _generator() -> Iterator[str]:
         idx = 0
+        tts_chunk_index = 0
         stitcher = AudioStitcher(sample_rate=engine.sample_rate, fade_len_ms=15.0)
         try:
             if seed is not None:
@@ -1192,6 +1312,7 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
                 for chunk in _split_text_prosody(clean_sentence, max_chars):
                     if pad_text:
                         chunk = f"{pad_text_token} {chunk} {pad_text_token}"
+                    chunk_seed = seed if tts_chunk_index == 0 else None
                     audio = engine.generate(
                         chunk,
                         ref_wav_path=sentence_ref,
@@ -1202,8 +1323,9 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
                         f0_scale=params["f0_scale"],
                         phonemizer_lang=phonemizer_lang,
                         lexicon=lexicon,
-                        seed=seed,
+                        seed=chunk_seed,
                     )
+                    tts_chunk_index += 1
                     if smart_trim_db and smart_trim_db > 0:
                         audio = _smart_vad_trim(
                             audio,
@@ -1240,7 +1362,6 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
                         audio = np.concatenate([audio, pause])
                     elif suffix.endswith((",", ";", ":")) and comma_pause.size:
                         audio = np.concatenate([audio, comma_pause])
-
                     stitched = stitcher.process(audio)
                     if stitched.size:
                         wav_bytes = _audio_to_wav_bytes(stitched, engine.sample_rate)
@@ -1278,6 +1399,7 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
 
 class GenerateRequest(BaseModel):
     text: str
+    lipsync_backend: str | None = None
     model_path: str | None = None
     config_path: str | None = None
     ref_wav_path: str | None = None
@@ -1304,6 +1426,14 @@ class GenerateRequest(BaseModel):
     crossfade_ms: float | None = None
     avatar_profile: str | None = None
     avatar_fps: float | None = None
+    musetalk_batch_size: int | None = None
+    musetalk_infer_fps: float | None = None
+    musetalk_stream_window_sec: float | None = None
+    musetalk_jpeg_quality: int | None = None
+    musetalk_face_scale: float | None = None
+    musetalk_audio_history_sec: float | None = None
+    musetalk_max_chunk_chars: int | None = None
+    musetalk_first_chunk_chars: int | None = None
     return_base64: bool = False
 
 
@@ -1625,12 +1755,57 @@ class StyleTTS2RepoEngine:
 
 
 
-def _get_lipsync_engine() -> LipSyncBridge:
-    global _lipsync_engine
+def _resolve_lipsync_backend(requested_backend: str | None = None) -> str:
+    backend = (
+        requested_backend.strip().lower()
+        if isinstance(requested_backend, str) and requested_backend.strip()
+        else os.getenv("LIPSYNC_BACKEND", "wav2lip").strip().lower()
+    )
+    aliases = {
+        "wav2lip": "wav2lip",
+        "w2l": "wav2lip",
+        "musetalk": "musetalk",
+        "mt": "musetalk",
+    }
+    resolved = aliases.get(backend)
+    if not resolved:
+        raise ValueError(
+            f"Unsupported LIPSYNC_BACKEND={backend}. Use one of: wav2lip, musetalk."
+        )
+    return resolved
+
+
+def _build_lipsync_engine(backend: str) -> _LipSyncEngineProtocol:
+    if backend == "musetalk":
+        from src.musetalk_bridge import MuseTalkBridge
+
+        return MuseTalkBridge()
+    return LipSyncBridge()
+
+
+def _get_lipsync_engine(requested_backend: str | None = None) -> _LipSyncEngineProtocol:
     with _lipsync_lock:
-        if _lipsync_engine is None:
-            _lipsync_engine = LipSyncBridge()
-        return _lipsync_engine
+        desired_backend = _resolve_lipsync_backend(requested_backend)
+        if desired_backend not in _lipsync_engines:
+            try:
+                _lipsync_engines[desired_backend] = _build_lipsync_engine(desired_backend)
+                logger.info(
+                    "component=lipsync op=engine_init status=ok backend=%s",
+                    desired_backend,
+                )
+            except Exception:
+                fallback_enabled = os.getenv("LIPSYNC_BACKEND_FALLBACK", "0") == "1"
+                if desired_backend != "wav2lip" and fallback_enabled:
+                    logger.exception(
+                        "component=lipsync op=engine_init status=error backend=%s fallback=wav2lip",
+                        desired_backend,
+                    )
+                    if "wav2lip" not in _lipsync_engines:
+                        _lipsync_engines["wav2lip"] = LipSyncBridge()
+                    desired_backend = "wav2lip"
+                else:
+                    raise
+        return _lipsync_engines[desired_backend]
 
 
 def _get_engine(model_path: Path, config_path: Path) -> StyleTTS2RepoEngine:
@@ -1699,10 +1874,22 @@ def _warmup_profile(profile: str, profile_type: str) -> None:
     key = (profile, profile_type)
     if key in _warmed_profiles:
         return
-    model_path = _resolve_model_path(None, profile, profile_type)
-    config_path = _resolve_config_path(model_path, None, profile, profile_type)
-    if model_path and config_path:
+    try:
+        model_path = _resolve_model_path(None, profile, profile_type)
+        config_path = _resolve_config_path(model_path, None, profile, profile_type)
         _warmup_engine(model_path, config_path)
+    except HTTPException:
+        logger.info(
+            "component=backend op=warmup_profile skip=tts profile=%s profile_type=%s reason=model_unset",
+            profile,
+            profile_type,
+        )
+    except Exception:
+        logger.exception(
+            "component=backend op=warmup_profile skip=tts profile=%s profile_type=%s reason=error",
+            profile,
+            profile_type,
+        )
     if profile_type == PROFILE_TYPE_AVATAR:
         _warmup_lipsync(profile, profile_type)
     _warmed_profiles.add(key)
@@ -2002,12 +2189,17 @@ def stream(req: GenerateRequest):
     if seed is None and len(chunks) > 1:
         seed = 1234
     pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
-
+    comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
+    comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
     def _generator() -> Iterator[str]:
+        tts_chunk_index = 0
+        if seed is not None:
+            _seed_everything(seed)
         for idx, chunk in enumerate(chunks):
             ref_for_chunk = ref_wav_path
             if pad_text:
                 chunk = f"{pad_text_token} {chunk} {pad_text_token}"
+            chunk_seed = seed if tts_chunk_index == 0 else None
             audio = engine.generate(
                 chunk,
                 ref_wav_path=ref_for_chunk,
@@ -2018,8 +2210,9 @@ def stream(req: GenerateRequest):
                 f0_scale=params["f0_scale"],
                 phonemizer_lang=phonemizer_lang,
                 lexicon=lexicon,
-                seed=seed,
+                seed=chunk_seed,
             )
+            tts_chunk_index += 1
             if smart_trim_db and smart_trim_db > 0:
                 audio = _smart_vad_trim(
                     audio,
@@ -2144,10 +2337,14 @@ def generate(req: GenerateRequest):
         seed = req.seed if req.seed is not None else profile.get("seed")
         if seed is None and len(chunks) > 1:
             seed = 1234
+        if seed is not None:
+            _seed_everything(seed)
+        tts_chunk_index = 0
         for idx, chunk in enumerate(chunks):
             ref_for_chunk = ref_wav_path
             if pad_text:
                 chunk = f"{pad_text_token} {chunk} {pad_text_token}"
+            chunk_seed = seed if tts_chunk_index == 0 else None
             audio = engine.generate(
                 chunk,
                 ref_wav_path=ref_for_chunk,
@@ -2158,8 +2355,9 @@ def generate(req: GenerateRequest):
                 f0_scale=params["f0_scale"],
                 phonemizer_lang=phonemizer_lang,
                 lexicon=lexicon,
-                seed=seed,
+                seed=chunk_seed,
             )
+            tts_chunk_index += 1
             if smart_trim_db and smart_trim_db > 0:
                 audio = _smart_vad_trim(
                     audio,
@@ -2255,9 +2453,5 @@ def speak(req: GenerateRequest):
         raise HTTPException(status_code=400, detail="Text is empty.")
     profile_type = req.profile_type or PROFILE_TYPE_VOICE
     if profile_type == PROFILE_TYPE_AVATAR or req.avatar_profile:
-        text_iter = iter(_split_text_prosody(req.text, max_chars=DEFAULT_MAX_CHUNK_CHARS))
-        return _stream_avatar_from_text_iter(req, text_iter)
-    return _stream_voice_from_text_iter(
-        req,
-        iter(_split_text_prosody(req.text, max_chars=DEFAULT_MAX_CHUNK_CHARS)),
-    )
+        return _stream_avatar_from_text_iter(req, iter([req.text]))
+    return _stream_voice_from_text_iter(req, iter([req.text]))

@@ -124,6 +124,7 @@ const App: React.FC = () => {
   const [latency, setLatency] = useState<{ ttfa: number; total: number } | null>(null);
   const [modelOverride, setModelOverride] = useState('');
   const [refOverride, setRefOverride] = useState('');
+  const [avatarBackend, setAvatarBackend] = useState<'wav2lip' | 'musetalk'>('musetalk');
   const [outputMode, setOutputMode] = useState<'voice' | 'avatar'>(DEFAULT_OUTPUT_MODE);
   const [videoState, setVideoState] = useState<'idle' | 'buffering' | 'playing'>('idle');
   const [videoFps, setVideoFps] = useState(DEFAULT_VIDEO_FPS);
@@ -471,8 +472,11 @@ const App: React.FC = () => {
       audio_filename: lastUploadedAudioFilename ?? null,
       profile_type: profileType,
       bake_avatar: profileType === 'avatar',
+      avatar_fps: profileType === 'avatar' ? 25 : null,
       avatar_start_sec: profileType === 'avatar' ? avatarStartSec : null,
       avatar_loop_sec: profileType === 'avatar' ? 10 : null,
+      avatar_resize_factor: profileType === 'avatar' ? 1 : null,
+      avatar_pads: profileType === 'avatar' ? '0 10 0 0' : null,
       avatar_blur_background: profileType === 'avatar',
       avatar_blur_kernel: profileType === 'avatar' ? BLUR_KERNEL_BY_LEVEL[avatarBlurLevel] : null,
     };
@@ -773,12 +777,12 @@ const App: React.FC = () => {
     activeSourcesRef.current.add(source);
     source.onended = () => activeSourcesRef.current.delete(source);
 
-    const fadeMs = 12;
+    const fadeMs = 6;
     const fadeTime = Math.min(fadeMs / 1000, Math.max(0.003, buffer.duration / 4));
-    // Slight overlap to hide tiny inter-chunk gaps.
-    const overlap = Math.min(0.04, fadeTime); // up to 40ms overlap
-    const desiredStart = nextStartTimeRef.current - overlap;
-    const startAt = Math.max(ctx.currentTime + 0.05, desiredStart);
+    // Backend already stitches/crossfades chunk boundaries.
+    // Keep scheduling gapless without extra overlap to avoid comb-like artifacts.
+    const desiredStart = nextStartTimeRef.current;
+    const startAt = Math.max(ctx.currentTime + 0.01, desiredStart);
     const endAt = startAt + buffer.duration;
 
     const fadeSamples = Math.max(32, Math.floor(ctx.sampleRate * fadeTime));
@@ -818,7 +822,7 @@ const App: React.FC = () => {
     setInferenceChunks([]);
     setLatency(null);
     setInferenceStageIndex(inferenceSteps.length > 0 ? 0 : null);
-    nextStartTimeRef.current = audioContextRef.current?.currentTime || 0;
+    nextStartTimeRef.current = (audioContextRef.current?.currentTime || 0) + audioStartDelayRef.current;
     audioEndTimeRef.current = nextStartTimeRef.current;
     audioStartDelayRef.current = outputMode === 'avatar' ? 0.35 : 0.05;
     let sawError = false;
@@ -842,6 +846,7 @@ const App: React.FC = () => {
     };
     if (outputMode === 'avatar') {
       payload.avatar_profile = profile.name;
+      payload.lipsync_backend = avatarBackend;
     }
 
     try {
@@ -912,7 +917,7 @@ const App: React.FC = () => {
         setInferenceStageIndex(null);
       }
     }
-  }, [apiBase, enqueueFrames, modelOverride, outputMode, profile.name, profileType, refOverride, resetVideo, unlockAudio]);
+  }, [apiBase, avatarBackend, enqueueFrames, modelOverride, outputMode, profile.name, profileType, refOverride, resetVideo, unlockAudio]);
 
   const startInference = useCallback(async () => {
     await runInference(inferenceText, '/speak');
@@ -961,16 +966,6 @@ const App: React.FC = () => {
       : stepStatuses.train === 'done'
         ? 1
         : null;
-  const inferenceDisplayProgress =
-    stepStatuses.inference === 'running'
-      ? Math.max(
-          Math.min(1, inferenceChunks.length / 20),
-          stageProgress(inferenceStageIndex, inferenceSteps.length, 0.2),
-        )
-      : stepStatuses.inference === 'done'
-        ? 1
-        : null;
-
   const trainingStatusCard = (
     <div className="bg-amber-50 border border-amber-200 rounded-2xl p-5 shadow-sm">
       <p className="text-[10px] font-bold uppercase tracking-widest text-amber-600">Training Progress</p>
@@ -1595,10 +1590,6 @@ const App: React.FC = () => {
               description="Stream voice-only or voice + lip sync with chunked playback."
               status={stepStatuses.inference}
               isActive={true}
-              statusSteps={inferenceSteps}
-              statusNote="First request warms the model. Subsequent requests are near-instant."
-              progress={inferenceDisplayProgress}
-              activeStepIndex={stepStatuses.inference === 'running' ? inferenceStageIndex : null}
             >
                 <div className="space-y-6">
                 {isWarmingUp && (
@@ -1606,57 +1597,75 @@ const App: React.FC = () => {
                     Warming up the selected profile for faster first response…
                   </div>
                 )}
-                <div className="grid grid-cols-1 gap-6 items-stretch">
-                  <div className="flex flex-col gap-4 w-full max-w-[740px] mx-auto items-center">
-                    <div className="w-full bg-slate-50 border border-slate-100 rounded-xl p-4 text-xs text-slate-600">
-                      <p className="uppercase tracking-widest text-[9px] font-bold text-slate-400">Defaults</p>
-                      <p>Profile: <span className="font-semibold">{profile.name || '—'}</span></p>
-                      <p>Model/Ref: <span className="font-semibold">profile.json unless overridden</span></p>
+                <div className="bg-slate-50 border border-slate-100 rounded-xl px-4 py-3 text-sm text-slate-700">
+                  <span className="font-semibold">Profile:</span> {profile.name || '—'}
+                </div>
+                <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+                  <div className={`xl:col-span-7 bg-slate-950 border border-slate-900 rounded-2xl p-4 flex flex-col ${outputMode === 'avatar' ? '' : 'opacity-40'}`}>
+                    <div className="flex items-center justify-between text-xs text-slate-300">
+                      <span className="uppercase tracking-widest text-[9px] font-bold text-slate-400">Avatar Preview</span>
+                      <span className="text-[10px] font-bold text-teal-300">{outputMode === 'avatar' ? `${videoFps} FPS · ${videoQueue} queued` : 'disabled'}</span>
                     </div>
-                    <div className="w-full grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <input
-                        value={modelOverride}
-                        onChange={(e) => setModelOverride(e.target.value)}
-                        placeholder="Model path override (optional)"
-                        className="w-full bg-white border-2 border-slate-100 rounded-xl px-4 py-3 text-sm"
+                    <div className="mt-3 bg-black rounded-xl overflow-hidden border border-slate-800 w-full max-w-[720px] mx-auto min-h-[720px]">
+                      <canvas ref={videoCanvasRef} width={640} height={853} className="w-full h-full" />
+                    </div>
+                    <div className="mt-3 text-[11px] text-slate-400 flex items-center justify-between">
+                      <span>Status: <span className="font-semibold text-slate-200">{videoState}</span></span>
+                      <span>Queue: <span className="font-semibold text-slate-200">{videoQueue}</span></span>
+                    </div>
+                  </div>
+
+                  <div className="xl:col-span-5 space-y-4">
+                    <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                        Lip Sync Model
+                      </p>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setAvatarBackend('wav2lip')}
+                          className={`px-3 py-2 rounded-lg text-sm font-semibold transition-all ${
+                            avatarBackend === 'wav2lip'
+                              ? 'bg-teal-600 text-white'
+                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                          }`}
+                        >
+                          Wav2Lip
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setAvatarBackend('musetalk')}
+                          className={`px-3 py-2 rounded-lg text-sm font-semibold transition-all ${
+                            avatarBackend === 'musetalk'
+                              ? 'bg-teal-600 text-white'
+                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                          }`}
+                        >
+                          MuseTalk
+                        </button>
+                      </div>
+                      <p className="text-[11px] text-slate-500">
+                        Choose a lip-sync model. First run after switching may be slower due to warmup.
+                      </p>
+                    </div>
+
+                    <div className="bg-slate-950 border border-slate-900 rounded-2xl p-4">
+                      <ControlPanel
+                        variant="embedded"
+                        onInterrupt={stopInference}
+                        onSendChat={async (text) => runInference(text, '/chat')}
+                        onSendDirect={async (text) => {
+                          setInferenceText(text);
+                          await runInference(text, '/speak');
+                        }}
                       />
-                      <input
-                        value={refOverride}
-                        onChange={(e) => setRefOverride(e.target.value)}
-                        placeholder="Reference wav override (optional)"
-                        className="w-full bg-white border-2 border-slate-100 rounded-xl px-4 py-3 text-sm"
-                      />
                     </div>
-                    <div className={`w-full bg-slate-950 border border-slate-900 rounded-2xl p-4 flex flex-col ${outputMode === 'avatar' ? '' : 'opacity-40'}`}>
-                      <div className="flex items-center justify-between text-xs text-slate-300">
-                        <span className="uppercase tracking-widest text-[9px] font-bold text-slate-400">Avatar Preview</span>
-                        <span className="text-[10px] font-bold text-teal-300">{outputMode === 'avatar' ? `${videoFps} FPS · ${videoQueue} queued` : 'disabled'}</span>
-                      </div>
-                      <div className="mt-3 bg-black rounded-xl overflow-hidden border border-slate-800 flex-1 min-h-[720px] w-full max-w-[640px] mx-auto">
-                        <canvas ref={videoCanvasRef} width={640} height={853} className="w-full h-full" />
-                      </div>
-                      <div className="mt-3 text-[11px] text-slate-400 flex items-center justify-between">
-                        <span>Status: <span className="font-semibold text-slate-200">{videoState}</span></span>
-                        <span>Queue: <span className="font-semibold text-slate-200">{videoQueue}</span></span>
-                      </div>
-                      <button
-                        onClick={stopInference}
-                        className="mt-3 w-full px-4 py-2 bg-slate-900 text-white text-xs font-bold rounded-lg"
-                      >
-                        Stop
-                      </button>
-                      <div className="mt-4">
-                        <ControlPanel
-                          variant="embedded"
-                          onInterrupt={stopInference}
-                          onSendChat={async (text) => runInference(text, '/chat')}
-                          onSendDirect={async (text) => {
-                            setInferenceText(text);
-                            await runInference(text, '/speak');
-                          }}
-                        />
-                      </div>
-                    </div>
+                    <button
+                      onClick={stopInference}
+                      className="w-full px-4 py-2 bg-slate-900 text-white text-sm font-bold rounded-lg"
+                    >
+                      Stop
+                    </button>
                   </div>
                 </div>
 
