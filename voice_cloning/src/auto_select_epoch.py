@@ -583,8 +583,8 @@ def main() -> None:
         checkpoints = checkpoints[-args.limit :]
 
     profile = _load_profile_defaults(training_dir)
-    alpha = args.alpha if args.alpha is not None else profile.get("alpha", 0.1)
-    beta = args.beta if args.beta is not None else profile.get("beta", 0.1)
+    alpha = args.alpha if args.alpha is not None else profile.get("alpha", 0.2)
+    beta = args.beta if args.beta is not None else profile.get("beta", 0.5)
     diffusion_steps = (
         args.diffusion_steps if args.diffusion_steps is not None else profile.get("diffusion_steps", 10)
     )

@@ -29,6 +29,7 @@ class LipSyncBridge:
         self.frames: np.ndarray | None = None
         self.coords: np.ndarray | None = None
         self.fps: float = 25.0
+        self._mask_cache: dict[tuple[int, int, int], np.ndarray] = {}
 
         lip_dir = LIP_SYNCING_DIR / "lib" / "Wav2Lip"
         if not lip_dir.exists():
@@ -161,6 +162,32 @@ class LipSyncBridge:
         mel_batch = np.reshape(mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1])
         return img_batch, mel_batch, frame_batch, coord_batch
 
+    def _soft_mask(self, h: int, w: int, feather: int) -> np.ndarray:
+        key = (h, w, feather)
+        cached = self._mask_cache.get(key)
+        if cached is not None:
+            return cached
+        feather = max(1, min(feather, min(h, w) // 2))
+        mask = np.ones((h, w), dtype=np.float32)
+        ramp = np.linspace(0.0, 1.0, feather, endpoint=False, dtype=np.float32)
+        mask[:feather, :] *= ramp[:, None]
+        mask[-feather:, :] *= ramp[::-1][:, None]
+        mask[:, :feather] = np.minimum(mask[:, :feather], ramp[None, :])
+        mask[:, -feather:] = np.minimum(mask[:, -feather:], ramp[::-1][None, :])
+        mask = mask[:, :, None]
+        self._mask_cache[key] = mask
+        return mask
+
+    @staticmethod
+    def _match_mean_color(target: np.ndarray, source: np.ndarray) -> np.ndarray:
+        if target.size == 0 or source.size == 0:
+            return source
+        t_mean = target.reshape(-1, 3).mean(axis=0)
+        s_mean = source.reshape(-1, 3).mean(axis=0)
+        diff = t_mean - s_mean
+        corrected = source.astype(np.float32) + diff
+        return np.clip(corrected, 0, 255).astype(np.uint8)
+
     def sync_chunk(self, audio_16k: np.ndarray, fps: float | None = None) -> list[np.ndarray]:
         if self.frames is None or self.coords is None:
             raise RuntimeError("Avatar cache not loaded.")
@@ -199,7 +226,13 @@ class LipSyncBridge:
             pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.0
             for p, f, c in zip(pred, frame_batch, coord_batch):
                 y1, y2, x1, x2 = c
-                p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
-                f[y1:y2, x1:x2] = p
+                p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1), interpolation=cv2.INTER_LANCZOS4)
+                roi = f[y1:y2, x1:x2].astype(np.uint8, copy=False)
+                p = self._match_mean_color(roi, p)
+                h, w = p.shape[:2]
+                feather = max(6, min(20, min(h, w) // 4))
+                mask = self._soft_mask(h, w, feather)
+                blended = (p.astype(np.float32) * mask) + (roi.astype(np.float32) * (1.0 - mask))
+                f[y1:y2, x1:x2] = blended.astype(np.uint8)
                 output_frames.append(f)
         return output_frames

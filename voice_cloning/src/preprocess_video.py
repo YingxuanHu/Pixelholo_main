@@ -18,6 +18,9 @@ from config import (
     DEFAULT_MIN_CHUNK_DBFS,
     DEFAULT_MIN_WORDS,
     DEFAULT_MIN_SPEECH_RATIO,
+    DEFAULT_AVATAR_FPS,
+    DEFAULT_AVATAR_PADS,
+    DEFAULT_AVATAR_NOSMOOTH,
     PROFILE_TYPE_AVATAR,
 )
 from src.preprocess import process_video
@@ -49,14 +52,14 @@ def main() -> None:
     parser.add_argument("--legacy_split", action="store_true", help="Use silence split before transcription")
 
     parser.add_argument("--no_bake_avatar", action="store_true", help="Skip avatar cache baking for lip-sync")
-    parser.add_argument("--avatar_fps", type=float, default=25.0)
+    parser.add_argument("--avatar_fps", type=float, default=DEFAULT_AVATAR_FPS)
     parser.add_argument("--avatar_start_sec", type=float, default=5.0)
     parser.add_argument("--avatar_loop_sec", type=float, default=10.0)
     parser.add_argument("--avatar_loop_fade_sec", type=float, default=0.0)
     parser.add_argument("--avatar_resize_factor", type=int, default=1)
-    parser.add_argument("--avatar_pads", type=str, default="0 10 0 0")
+    parser.add_argument("--avatar_pads", type=str, default=DEFAULT_AVATAR_PADS)
     parser.add_argument("--avatar_batch_size", type=int, default=16)
-    parser.add_argument("--avatar_nosmooth", action="store_true")
+    parser.add_argument("--avatar_nosmooth", action="store_true", default=DEFAULT_AVATAR_NOSMOOTH)
     parser.add_argument("--avatar_no_blur_background", action="store_true")
     parser.add_argument("--avatar_blur_kernel", type=int, default=75)
     parser.add_argument("--avatar_device", type=str, default=None)

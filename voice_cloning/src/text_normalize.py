@@ -86,6 +86,13 @@ def clean_text_for_tts(text: str) -> str:
     if not text:
         return text
 
+    # Convert numbered list items to ordinals: "1." -> "first"
+    def _list_num_to_ordinal(match: re.Match) -> str:
+        num = int(match.group(1))
+        return f"{num2words(num, to='ordinal')} "
+
+    text = re.sub(r"(?m)^\s*(\d+)\.\s+", _list_num_to_ordinal, text)
+
     # Normalize smart quotes/dashes to avoid phonemizer confusion.
     text = (
         text.replace("’", "'")
@@ -151,26 +158,56 @@ def clean_text_for_tts(text: str) -> str:
     # 2) If NeMo is available, let it handle general TN/ITN
     normalizer = _get_nemo_normalizer()
     if normalizer is not None:
-        return normalizer.normalize(text)
+        text = normalizer.normalize(text)
+    else:
+        # 3) Fallback: lightweight rules
+        for key, value in _ABBREVIATIONS.items():
+            text = re.sub(rf"\b{re.escape(key)}\b", value, text)
 
-    # 3) Fallback: lightweight rules
-    for key, value in _ABBREVIATIONS.items():
-        text = re.sub(rf"\b{re.escape(key)}\b", value, text)
+        text = (
+            text.replace("%", " percent")
+            .replace("&", " and ")
+            .replace("+", " plus ")
+            .replace("@", " at ")
+            .replace("#", " number ")
+        )
 
-    text = (
-        text.replace("%", " percent")
-        .replace("&", " and ")
-        .replace("+", " plus ")
-        .replace("@", " at ")
-        .replace("#", " number ")
-    )
+        # Decimals: "1.3" -> "1 point 3" (before currency/number rules)
+        text = re.sub(r"(\d+)\.(\d+)", r"\1 point \2", text)
 
-    # Decimals: "1.3" -> "1 point 3" (before currency/number rules)
-    text = re.sub(r"(\d+)\.(\d+)", r"\1 point \2", text)
+        text = _CURRENCY_RE.sub(_replace_currency, text)
 
-    text = _CURRENCY_RE.sub(_replace_currency, text)
+        def year_hint(value: int) -> bool:
+            return 1000 <= value <= 2099
 
-    def year_hint(value: int) -> bool:
-        return 1000 <= value <= 2099
+        text = _NUMBER_RE.sub(lambda m: _replace_number(m, year_hint), text)
 
-    return _NUMBER_RE.sub(lambda m: _replace_number(m, year_hint), text)
+    text = _glue_connectors(text)
+    return text
+
+
+def _glue_connectors(text: str) -> str:
+    connectors = [
+        "What's",
+        "How's",
+        "Where's",
+        "Who's",
+        "What",
+        "How",
+        "Where",
+        "When",
+        "Why",
+        "It's",
+        "That's",
+    ]
+    no_glue_after = {"about"}
+    connectors.sort(key=len, reverse=True)
+    for word in connectors:
+        pattern = re.compile(rf"\b({re.escape(word)})\s+([A-Za-z]+)", re.IGNORECASE)
+        def _repl(match: re.Match) -> str:
+            next_word = match.group(2)
+            if next_word.lower() in no_glue_after:
+                return f"{match.group(1)} {next_word}"
+            return f"{match.group(1)}{next_word}"
+        text = pattern.sub(_repl, text)
+    return text

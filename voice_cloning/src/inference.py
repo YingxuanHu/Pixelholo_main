@@ -38,6 +38,7 @@ from src.text_normalize import clean_text_for_tts, warmup_text_normalizer
 from src.utils.smart_buffer import SmartStreamBuffer
 from src.utils.prosody_chunker import prosody_split
 from src.llm.llm_service import LLMService
+from src.utils.audio_stitcher import AudioStitcher
 
 SILENCE_CULLING_ENABLED = True
 SILENCE_RMS_THRESHOLD = 0.003
@@ -54,6 +55,7 @@ def _get_llm_service() -> LLMService:
             system_prompt="You are a helpful, witty AI assistant. Keep answers concise."
         )
     return _llm_service
+
 
 warnings.filterwarnings(
     "ignore",
@@ -77,6 +79,9 @@ STYLE_TTS2_DIR = PROJECT_ROOT / "lib" / "StyleTTS2"
 
 sys.path.append(str(PROJECT_ROOT))
 from config import (  # noqa: E402
+    DEFAULT_AVATAR_FPS,
+    DEFAULT_AVATAR_PADS,
+    DEFAULT_AVATAR_NOSMOOTH,
     PROFILE_TYPE_AVATAR,
     PROFILE_TYPE_VOICE,
     OUTPUTS_DIR,
@@ -95,10 +100,10 @@ if STYLE_TTS2_DIR.exists():
 
 MEAN = -4
 STD = 4
-DEFAULT_ALPHA = 0.1
-DEFAULT_BETA = 0.1
+DEFAULT_ALPHA = 0.2
+DEFAULT_BETA = 0.7
 DEFAULT_DIFFUSION_STEPS = 10
-DEFAULT_EMBEDDING_SCALE = 1.5
+DEFAULT_EMBEDDING_SCALE = 1.7
 DEFAULT_F0_SCALE = 1.0
 DEFAULT_LANG = "en-ca"
 DEFAULT_MAX_CHUNK_CHARS = 180
@@ -229,8 +234,9 @@ def _split_text_staircase(
     return chunks
 
 
-def _split_text_prosody(text: str, max_chars: int) -> list[str]:
-    return prosody_split(text, max_chars=max_chars)
+def _split_text_prosody(text: str, max_chars: int, first_chunk_max_chars: int | None = None) -> list[str]:
+    limit = first_chunk_max_chars or max(60, int(max_chars * 0.5))
+    return prosody_split(text, max_chars=max_chars, first_chunk_max_chars=limit)
 
 
 def _smart_chunks(text: str, min_chars: int = 40, max_chars: int = 150) -> list[str]:
@@ -416,8 +422,10 @@ def _generate_with_seed(
 ) -> np.ndarray:
     if seed is not None:
         _seed_everything(seed)
-    return engine.generate(
-        text,
+    # Prepend a sacrificial boundary to stabilize alignment on the first phoneme.
+    padded_text = f". {text}"
+    audio = engine.generate(
+        padded_text,
         ref_wav_path=ref_wav_path,
         alpha=alpha,
         beta=beta,
@@ -428,6 +436,11 @@ def _generate_with_seed(
         lexicon=lexicon,
         seed=seed,
     )
+    # Trim a short lead-in to remove the sacrificial boundary.
+    trim = int(engine.sample_rate * 0.04)  # ~40ms at 24k
+    if audio is not None and audio.size > trim:
+        audio = audio[trim:]
+    return audio
 
 
 def _stream_subprocess(command: list[str], cwd: Path) -> Iterator[str]:
@@ -952,6 +965,7 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
             maxsize=3
         )
         sentence_queue: queue.Queue[str | None] = queue.Queue(maxsize=10)
+        stitcher = AudioStitcher(sample_rate=engine.sample_rate, fade_len_ms=15.0)
 
         def _sentence_reader() -> None:
             try:
@@ -970,6 +984,8 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
                     if sentence is None:
                         break
                     clean_sentence = clean_text_for_tts(sentence)
+                    if not re.search(r"[A-Za-z0-9]", clean_sentence):
+                        continue
                     sentence_ref = ref_wav_path
                     for chunk in _split_text_prosody(clean_sentence, max_chars):
                         if pad_text:
@@ -988,6 +1004,9 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
                             phonemizer_lang,
                             lexicon,
                         ).result()
+                        if audio is None or audio.size == 0:
+                            continue
+                        audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
                         if smart_trim_db and smart_trim_db > 0:
                             audio = _smart_vad_trim(
                                 audio,
@@ -996,14 +1015,6 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
                                 pad_ms=float(smart_trim_pad_ms),
                             )
                         audio = _remove_dc(audio.astype(np.float32, copy=False))
-                        audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
-                        is_sentence_end = chunk.rstrip().endswith((".", "!", "?"))
-                        is_clause_end = chunk.rstrip().endswith((",", ";", ":"))
-                        if is_sentence_end and pause.size:
-                            audio = np.concatenate([audio, pause])
-                        elif is_clause_end and comma_pause.size:
-                            audio = np.concatenate([audio, comma_pause])
-
                         pitch_shift = (
                             req.pitch_shift
                             if req.pitch_shift is not None
@@ -1026,10 +1037,31 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
                                 audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order)
                             )
                         audio = _soft_clip(audio)
-
-                        audio_16k = librosa.resample(audio, orig_sr=engine.sample_rate, target_sr=16000)
-                        result_queue.put(("data", idx, audio, audio_16k.astype(np.float32)))
-                        idx += 1
+                        audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
+                        is_sentence_end = chunk.rstrip().endswith((".", "!", "?"))
+                        is_clause_end = chunk.rstrip().endswith((",", ";", ":"))
+                        if is_sentence_end and pause.size:
+                            audio = np.concatenate([audio, pause])
+                        elif is_clause_end and comma_pause.size:
+                            audio = np.concatenate([audio, comma_pause])
+                        stitched = stitcher.process(audio)
+                        if stitched.size:
+                            audio_16k = librosa.resample(
+                                stitched, orig_sr=engine.sample_rate, target_sr=16000
+                            )
+                            result_queue.put(
+                                ("data", idx, stitched, audio_16k.astype(np.float32))
+                            )
+                            idx += 1
+                tail = stitcher.flush()
+                if tail.size:
+                    audio_16k = librosa.resample(
+                        tail, orig_sr=engine.sample_rate, target_sr=16000
+                    )
+                    result_queue.put(
+                        ("data", idx, tail, audio_16k.astype(np.float32))
+                    )
+                    idx += 1
                 result_queue.put(("done", -1, None, None))
             except Exception as exc:
                 result_queue.put(("error", -1, np.array([str(exc)], dtype=object), None))
@@ -1142,12 +1174,15 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
         else profile.get("smart_trim_pad_ms", 50.0)
     )
     pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
+    comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
+    comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
     seed = req.seed if req.seed is not None else profile.get("seed")
     if seed is None:
         seed = 1234
 
     def _generator() -> Iterator[str]:
         idx = 0
+        stitcher = AudioStitcher(sample_rate=engine.sample_rate, fade_len_ms=15.0)
         try:
             if seed is not None:
                 _seed_everything(seed)
@@ -1177,12 +1212,6 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
                             pad_ms=float(smart_trim_pad_ms),
                         )
                     audio = _remove_dc(audio.astype(np.float32, copy=False))
-                    audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
-                    suffix = chunk.rstrip()
-                    if suffix.endswith((".", "!", "?")) and pause.size:
-                        audio = np.concatenate([audio, pause])
-                    elif suffix.endswith((",", ";", ":")) and comma_pause.size:
-                        audio = np.concatenate([audio, comma_pause])
                     pitch_shift = (
                         req.pitch_shift
                         if req.pitch_shift is not None
@@ -1205,17 +1234,37 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
                             audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order)
                         )
                     audio = _soft_clip(audio)
+                    audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
+                    suffix = chunk.rstrip()
+                    if suffix.endswith((".", "!", "?")) and pause.size:
+                        audio = np.concatenate([audio, pause])
+                    elif suffix.endswith((",", ";", ":")) and comma_pause.size:
+                        audio = np.concatenate([audio, comma_pause])
 
-                    wav_bytes = _audio_to_wav_bytes(audio, engine.sample_rate)
-                    payload = base64.b64encode(wav_bytes).decode("ascii")
-                    yield json.dumps(
-                        {
-                            "chunk_index": idx,
-                            "audio_base64": payload,
-                            "sample_rate": engine.sample_rate,
-                        }
-                    ) + "\n"
-                    idx += 1
+                    stitched = stitcher.process(audio)
+                    if stitched.size:
+                        wav_bytes = _audio_to_wav_bytes(stitched, engine.sample_rate)
+                        payload = base64.b64encode(wav_bytes).decode("ascii")
+                        yield json.dumps(
+                            {
+                                "chunk_index": idx,
+                                "audio_base64": payload,
+                                "sample_rate": engine.sample_rate,
+                            }
+                        ) + "\n"
+                        idx += 1
+            tail = stitcher.flush()
+            if tail.size:
+                wav_bytes = _audio_to_wav_bytes(tail, engine.sample_rate)
+                payload = base64.b64encode(wav_bytes).decode("ascii")
+                yield json.dumps(
+                    {
+                        "chunk_index": idx,
+                        "audio_base64": payload,
+                        "sample_rate": engine.sample_rate,
+                    }
+                ) + "\n"
+                idx += 1
         except Exception:
             logger.exception("Voice stream failed")
             yield json.dumps({"event": "error", "detail": traceback.format_exc()}) + "\n"
@@ -1264,14 +1313,14 @@ class PreprocessRequest(BaseModel):
     audio_filename: str | None = None
     profile_type: str | None = None
     bake_avatar: bool = True
-    avatar_fps: float | None = None
+    avatar_fps: float | None = DEFAULT_AVATAR_FPS
     avatar_start_sec: float | None = None
     avatar_loop_sec: float | None = None
     avatar_loop_fade_sec: float | None = None
     avatar_resize_factor: int | None = None
-    avatar_pads: str | None = None
+    avatar_pads: str | None = DEFAULT_AVATAR_PADS
     avatar_batch_size: int | None = None
-    avatar_nosmooth: bool = False
+    avatar_nosmooth: bool = DEFAULT_AVATAR_NOSMOOTH
     avatar_blur_background: bool | None = None
     avatar_blur_kernel: int | None = None
     avatar_device: str | None = None
@@ -1979,7 +2028,6 @@ def stream(req: GenerateRequest):
                     pad_ms=float(smart_trim_pad_ms),
                 )
             audio = _remove_dc(audio.astype(np.float32, copy=False))
-            audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
             if idx < len(chunks) - 1:
                 suffix = chunk.rstrip()
                 if suffix.endswith((".", "!", "?")) and pause.size:
@@ -2006,6 +2054,7 @@ def stream(req: GenerateRequest):
             if de_esser_cutoff:
                 audio = _apply_de_esser(audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order))
             audio = _soft_clip(audio)
+            audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
             wav_bytes = _audio_to_wav_bytes(audio, engine.sample_rate)
             payload = base64.b64encode(wav_bytes).decode("ascii")
             yield json.dumps(
@@ -2119,7 +2168,6 @@ def generate(req: GenerateRequest):
                     pad_ms=float(smart_trim_pad_ms),
                 )
             audio = _remove_dc(audio.astype(np.float32, copy=False))
-            audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
             parts.append(audio)
             if idx < len(chunks) - 1:
                 suffix = chunk.rstrip()
@@ -2148,6 +2196,7 @@ def generate(req: GenerateRequest):
         if de_esser_cutoff:
             audio = _apply_de_esser(audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order))
         audio = _soft_clip(audio)
+        audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
     except HTTPException:
         raise
     except Exception as exc:
@@ -2177,6 +2226,23 @@ def chat(req: GenerateRequest):
         raise HTTPException(status_code=400, detail="Text is empty.")
     llm = _get_llm_service()
     llm_stream = llm.stream_response(req.text)
+    # Stabilize LLM mode with conservative defaults if not provided.
+    if req.alpha is None:
+        req.alpha = 0.2
+    if req.beta is None:
+        req.beta = 0.5
+    if req.embedding_scale is None:
+        req.embedding_scale = 1.2
+    if req.diffusion_steps is None:
+        req.diffusion_steps = 10
+    if req.seed is None:
+        req.seed = 1234
+    if req.pad_text is None:
+        req.pad_text = False
+    if req.smart_trim_db is None:
+        req.smart_trim_db = 0.0
+    if req.smart_trim_pad_ms is None:
+        req.smart_trim_pad_ms = 0.0
     profile_type = req.profile_type or PROFILE_TYPE_VOICE
     if profile_type == PROFILE_TYPE_AVATAR or req.avatar_profile:
         return _stream_avatar_from_text_iter(req, llm_stream)

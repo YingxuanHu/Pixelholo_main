@@ -11,6 +11,7 @@ import {
   TrainStats,
   InferenceChunk,
   ProfileInfo,
+  ProfileType,
 } from './types';
 
 type TrainFlags = {
@@ -90,6 +91,9 @@ const App: React.FC = () => {
   const [lastUploadedAudioFilename, setLastUploadedAudioFilename] = useState<string | null>(null);
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [profilesStatus, setProfilesStatus] = useState<'idle' | 'loading' | 'error'>('idle');
+  const warmupTimerRef = useRef<number | null>(null);
+  const warmupNoticeTimerRef = useRef<number | null>(null);
+  const [isWarmingUp, setIsWarmingUp] = useState(false);
   const [uiNotice, setUiNotice] = useState<string | null>(null);
   const [stepStatuses, setStepStatuses] = useState<Record<string, StepStatus>>(DEFAULT_STEP_STATUSES);
   const [preprocessLogs, setPreprocessLogs] = useState<LogEntry[]>([]);
@@ -211,7 +215,7 @@ const App: React.FC = () => {
   const loadProfiles = useCallback(async () => {
     setProfilesStatus('loading');
     try {
-      const res = await fetch(`${apiBase}/profiles?profile_type=${profileType}`);
+      const res = await fetch(`${apiBase}/profiles?profile_type=${profileType}`, { cache: 'no-store' });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setProfiles(Array.isArray(data.profiles) ? data.profiles : []);
@@ -220,6 +224,30 @@ const App: React.FC = () => {
       setProfilesStatus('error');
     }
   }, [apiBase, profileType]);
+
+  const triggerWarmup = useCallback(
+    (profileName: string, type: ProfileType) => {
+      if (!profileName) return;
+      if (warmupTimerRef.current) {
+        window.clearTimeout(warmupTimerRef.current);
+      }
+      warmupTimerRef.current = window.setTimeout(() => {
+        setIsWarmingUp(true);
+        if (warmupNoticeTimerRef.current) {
+          window.clearTimeout(warmupNoticeTimerRef.current);
+        }
+        warmupNoticeTimerRef.current = window.setTimeout(() => {
+          setIsWarmingUp(false);
+        }, 8000);
+        fetch(`${apiBase}/warmup`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ profile: profileName, profile_type: type }),
+        }).catch(() => {});
+      }, 300);
+    },
+    [apiBase],
+  );
 
   useEffect(() => {
     loadProfiles();
@@ -1140,7 +1168,6 @@ const App: React.FC = () => {
                       <p className="uppercase tracking-widest text-[9px] font-bold text-slate-400">Existing Profiles</p>
                       <button
                         onClick={loadProfiles}
-                        disabled={isBusy}
                         className="text-[10px] font-bold text-teal-600"
                         type="button"
                       >
@@ -1169,6 +1196,7 @@ const App: React.FC = () => {
                                 setProfileType('voice');
                               }
                               setProfile(prev => ({ ...prev, name: item.name }));
+                              triggerWarmup(item.name, item.profile_type);
                               setLastUploadedFilename(null);
                               setLastUploadedAudioFilename(null);
                               // Jump to generation if this profile is ready.
@@ -1572,83 +1600,64 @@ const App: React.FC = () => {
               progress={inferenceDisplayProgress}
               activeStepIndex={stepStatuses.inference === 'running' ? inferenceStageIndex : null}
             >
-              <div className="space-y-6">
-                <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_1.4fr] gap-6 items-stretch">
-                  <div className="bg-white border border-slate-100 rounded-2xl p-5 space-y-4">
-                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Output Mode</p>
-                    <div className="grid grid-cols-2 gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setOutputMode('voice')}
-                        className={`px-4 py-2 rounded-xl text-xs font-bold transition-all ${outputMode === 'voice' ? 'bg-teal-600 text-white shadow-lg shadow-teal-600/20' : 'bg-slate-100 text-slate-500'}`}
-                      >
-                        Voice Only
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setOutputMode('avatar')}
-                        disabled={profileType === 'voice'}
-                        className={`px-4 py-2 rounded-xl text-xs font-bold transition-all ${outputMode === 'avatar' ? 'bg-slate-900 text-white shadow-lg' : 'bg-slate-100 text-slate-500'} ${profileType === 'voice' ? 'opacity-40 cursor-not-allowed' : ''}`}
-                      >
-                        Voice + Lip Sync
-                      </button>
-                    </div>
-                    <p className="text-xs text-slate-500 leading-relaxed">
-                      Lip sync uses the baked avatar frames from preprocessing. Upload a portrait video for best results.
-                    </p>
+                <div className="space-y-6">
+                {isWarmingUp && (
+                  <div className="bg-amber-50 border border-amber-200 text-amber-800 text-xs font-semibold px-4 py-3 rounded-xl">
+                    Warming up the selected profile for faster first response…
                   </div>
-                  <div className={`bg-slate-950 border border-slate-900 rounded-2xl p-4 flex flex-col ${outputMode === 'avatar' ? '' : 'opacity-40'}`}>
-                    <div className="flex items-center justify-between text-xs text-slate-300">
-                      <span className="uppercase tracking-widest text-[9px] font-bold text-slate-400">Avatar Preview</span>
-                      <span className="text-[10px] font-bold text-teal-300">{outputMode === 'avatar' ? `${videoFps} FPS · ${videoQueue} queued` : 'disabled'}</span>
+                )}
+                <div className="grid grid-cols-1 gap-6 items-stretch">
+                  <div className="flex flex-col gap-4 w-full max-w-[740px] mx-auto items-center">
+                    <div className="w-full bg-slate-50 border border-slate-100 rounded-xl p-4 text-xs text-slate-600">
+                      <p className="uppercase tracking-widest text-[9px] font-bold text-slate-400">Defaults</p>
+                      <p>Profile: <span className="font-semibold">{profile.name || '—'}</span></p>
+                      <p>Model/Ref: <span className="font-semibold">profile.json unless overridden</span></p>
                     </div>
-                    <div className="mt-3 bg-black rounded-xl overflow-hidden border border-slate-800 flex-1 min-h-[420px] w-full max-w-[420px] mx-auto">
-                      <canvas ref={videoCanvasRef} width={420} height={560} className="w-full h-full" />
+                    <div className="w-full grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <input
+                        value={modelOverride}
+                        onChange={(e) => setModelOverride(e.target.value)}
+                        placeholder="Model path override (optional)"
+                        className="w-full bg-white border-2 border-slate-100 rounded-xl px-4 py-3 text-sm"
+                      />
+                      <input
+                        value={refOverride}
+                        onChange={(e) => setRefOverride(e.target.value)}
+                        placeholder="Reference wav override (optional)"
+                        className="w-full bg-white border-2 border-slate-100 rounded-xl px-4 py-3 text-sm"
+                      />
                     </div>
-                    <div className="mt-3 text-[11px] text-slate-400 flex items-center justify-between">
-                      <span>Status: <span className="font-semibold text-slate-200">{videoState}</span></span>
-                      <span>Queue: <span className="font-semibold text-slate-200">{videoQueue}</span></span>
+                    <div className={`w-full bg-slate-950 border border-slate-900 rounded-2xl p-4 flex flex-col ${outputMode === 'avatar' ? '' : 'opacity-40'}`}>
+                      <div className="flex items-center justify-between text-xs text-slate-300">
+                        <span className="uppercase tracking-widest text-[9px] font-bold text-slate-400">Avatar Preview</span>
+                        <span className="text-[10px] font-bold text-teal-300">{outputMode === 'avatar' ? `${videoFps} FPS · ${videoQueue} queued` : 'disabled'}</span>
+                      </div>
+                      <div className="mt-3 bg-black rounded-xl overflow-hidden border border-slate-800 flex-1 min-h-[720px] w-full max-w-[640px] mx-auto">
+                        <canvas ref={videoCanvasRef} width={640} height={853} className="w-full h-full" />
+                      </div>
+                      <div className="mt-3 text-[11px] text-slate-400 flex items-center justify-between">
+                        <span>Status: <span className="font-semibold text-slate-200">{videoState}</span></span>
+                        <span>Queue: <span className="font-semibold text-slate-200">{videoQueue}</span></span>
+                      </div>
+                      <button
+                        onClick={stopInference}
+                        className="mt-3 w-full px-4 py-2 bg-slate-900 text-white text-xs font-bold rounded-lg"
+                      >
+                        Stop
+                      </button>
+                      <div className="mt-4">
+                        <ControlPanel
+                          variant="embedded"
+                          onInterrupt={stopInference}
+                          onSendChat={async (text) => runInference(text, '/chat')}
+                          onSendDirect={async (text) => {
+                            setInferenceText(text);
+                            await runInference(text, '/speak');
+                          }}
+                        />
+                      </div>
                     </div>
                   </div>
-                </div>
-                <div className="bg-slate-50 border border-slate-100 rounded-xl p-4 text-xs text-slate-600">
-                  <p className="uppercase tracking-widest text-[9px] font-bold text-slate-400">Defaults</p>
-                  <p>Profile: <span className="font-semibold">{profile.name || '—'}</span></p>
-                  <p>Model/Ref: <span className="font-semibold">profile.json unless overridden</span></p>
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <input
-                    value={modelOverride}
-                    onChange={(e) => setModelOverride(e.target.value)}
-                    placeholder="Model path override (optional)"
-                    className="w-full bg-white border-2 border-slate-100 rounded-xl px-4 py-3 text-sm"
-                  />
-                  <input
-                    value={refOverride}
-                    onChange={(e) => setRefOverride(e.target.value)}
-                    placeholder="Reference wav override (optional)"
-                    className="w-full bg-white border-2 border-slate-100 rounded-xl px-4 py-3 text-sm"
-                  />
-                </div>
-                <div className="relative">
-                  <ControlPanel
-                    disabled={stepStatuses.inference === 'running'}
-                    onInterrupt={stopInference}
-                    onSendChat={async (text) => runInference(text, '/chat')}
-                    onSendDirect={async (text) => {
-                      setInferenceText(text);
-                      await runInference(text, '/speak');
-                    }}
-                  />
-                </div>
-
-                <div className="flex items-center gap-3">
-                  <button
-                    onClick={stopInference}
-                    className="px-4 py-2 bg-slate-900 text-white text-xs font-bold rounded-lg"
-                  >
-                    Stop
-                  </button>
                 </div>
 
                 {latency && (
@@ -1679,7 +1688,9 @@ const App: React.FC = () => {
                         Stream pending...
                       </div>
                     ) : (
-                      inferenceChunks.map(c => (
+                      [...inferenceChunks]
+                        .sort((a, b) => a.index - b.index)
+                        .map(c => (
                         <div key={c.index} className="flex-shrink-0 w-24 bg-white border border-slate-200 p-2 rounded-lg flex flex-col animate-in scale-in">
                           <span className="text-[9px] font-bold text-slate-400">CHUNK {c.index + 1}</span>
                           <span className="text-xs font-bold text-teal-600">{c.duration.toFixed(2)}s</span>

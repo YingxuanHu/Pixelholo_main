@@ -1,5 +1,6 @@
-torch
-torchaudio
+torch==2.9.1
+torchvision==0.24.1
+torchaudio==2.9.1
 styletts2
 faster-whisper
 ffmpeg-python
@@ -7,7 +8,7 @@ pydub
 fastapi
 uvicorn
 python-multipart
-numpy<2
+numpy==1.26.4
 scipy
 pyyaml
 librosa
@@ -17,6 +18,7 @@ soundfile
 transformers
 resemblyzer
 opencv-python
+filelock==3.12.4
 rembg
 num2words
 nemo_text_processing
@@ -32,4 +34,4 @@ einops
 einops-exts
 tqdm
 git+https://github.com/resemble-ai/monotonic_align.git
-networkx<3
+networkx==2.8.8

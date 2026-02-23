@@ -8,21 +8,21 @@ type ControlPanelProps = {
   onSendDirect: (text: string) => Promise<void> | void;
   onInterrupt?: () => Promise<void> | void;
   disabled?: boolean;
+  variant?: 'card' | 'embedded';
 };
 
-const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, onInterrupt, disabled }) => {
+const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, onInterrupt, disabled, variant = 'card' }) => {
   const [mode, setMode] = useState<Mode>('tts');
   const [text, setText] = useState('');
   const [chatText, setChatText] = useState('');
   const [isSending, setIsSending] = useState(false);
+  const isDisabled = !!disabled;
 
   const handleSend = useCallback(
     async (selectedMode: Mode, inputText: string) => {
-      if (!inputText.trim() || isSending) return;
-      if (disabled && onInterrupt) {
+      if (!inputText.trim()) return;
+      if (onInterrupt) {
         await onInterrupt();
-      } else if (disabled) {
-        return;
       }
       setIsSending(true);
       try {
@@ -35,7 +35,7 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
         setIsSending(false);
       }
     },
-    [disabled, isSending, onSendChat, onSendDirect],
+    [onInterrupt, onSendChat, onSendDirect],
   );
 
   const onSpeechResult = useCallback(
@@ -47,9 +47,25 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
   );
 
   const { isListening, startListening, hasSupport, transcript } = useSpeechToText(onSpeechResult);
+  const startListeningSafe = useCallback(async () => {
+    if (onInterrupt) {
+      await onInterrupt();
+    }
+    startListening();
+  }, [onInterrupt, startListening]);
+
+  const containerClass =
+    variant === 'embedded'
+      ? 'w-full'
+      : 'w-full rounded-2xl border border-slate-800 bg-slate-950/90 p-4 backdrop-blur';
+
+  const inputClass =
+    variant === 'embedded'
+      ? 'h-24 w-full rounded-xl border border-slate-800 bg-slate-950 p-3 text-sm text-white outline-none'
+      : 'h-24 w-full rounded-xl border border-slate-800 bg-slate-900/70 p-3 text-sm text-white outline-none';
 
   return (
-    <div className="w-full rounded-2xl border border-slate-800 bg-slate-950/90 p-4 backdrop-blur">
+    <div className={containerClass}>
       <div className="mb-3 flex gap-2">
         <button
           onClick={() => setMode('chat')}
@@ -73,7 +89,7 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
         value={mode === 'chat' ? (transcript || chatText) : text}
         onChange={(e) => (mode === 'chat' ? setChatText(e.target.value) : setText(e.target.value))}
         placeholder={mode === 'chat' ? 'Ask the assistant…' : 'Type what to say…'}
-        className="h-24 w-full rounded-xl border border-slate-800 bg-slate-900/70 p-3 text-sm text-white outline-none"
+        className={inputClass}
         onKeyDown={(e) => {
           if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
@@ -87,8 +103,8 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
         <div className="flex items-center gap-2">
           {mode === 'chat' && hasSupport && (
             <button
-              onClick={startListening}
-              disabled={isSending}
+              onClick={startListeningSafe}
+              disabled={isDisabled}
               className={`rounded-lg px-3 py-2 text-xs font-bold ${
                 isListening ? 'bg-rose-500 text-white' : 'bg-slate-800 text-slate-200'
               }`}
@@ -98,7 +114,7 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
           )}
           <button
             onClick={() => handleSend(mode, mode === 'chat' ? chatText : text)}
-            disabled={isSending}
+            disabled={isDisabled}
             className="rounded-lg bg-teal-600 px-4 py-2 text-xs font-bold text-white"
           >
             {isSending ? 'Processing…' : mode === 'chat' ? 'Send to LLM' : 'Generate'}

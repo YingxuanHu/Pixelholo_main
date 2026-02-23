@@ -23,6 +23,11 @@ DEFAULT_PROBE_TEXTS = [
     "I can't make the meeting today, sorry about that.",
 ]
 
+PROFILE_DEFAULT_ALPHA = 0.2
+PROFILE_DEFAULT_BETA = 0.7
+PROFILE_DEFAULT_EMBEDDING_SCALE = 1.7
+PROFILE_DEFAULT_SEED = 1234
+
 
 def _find_latest_checkpoint(training_dir: Path) -> Path | None:
     checkpoints = sorted(training_dir.glob("epoch_2nd_*.pth"))
@@ -528,8 +533,8 @@ def main() -> None:
     if not ref_wavs:
         raise FileNotFoundError("Reference wav not found. Provide --ref_wav or --ref_dir.")
 
-    alphas = _parse_list(args.alphas, [0.6])
-    betas = _parse_list(args.betas, [0.7])
+    alphas = _parse_list(args.alphas, [0.2])
+    betas = _parse_list(args.betas, [0.5])
     diffusions = _parse_int_list(args.diffusions, [15])
     embeddings = _parse_list(args.embeddings, [1.2])
 
@@ -642,11 +647,12 @@ def main() -> None:
         "model_path": str(model_path),
         "config_path": str(config_path),
         "ref_wav_path": str(ref_wavs[0]),
-        "alpha": best["alpha"],
-        "beta": best["beta"],
+        "alpha": PROFILE_DEFAULT_ALPHA,
+        "beta": PROFILE_DEFAULT_BETA,
         "diffusion_steps": best["diffusion_steps"],
-        "embedding_scale": best["embedding_scale"],
+        "embedding_scale": PROFILE_DEFAULT_EMBEDDING_SCALE,
         "f0_scale": best["f0_scale"],
+        "seed": PROFILE_DEFAULT_SEED,
         "score": best["score"],
         "metrics": best["metrics"],
         "max_chunk_chars": args.max_chunk_chars,

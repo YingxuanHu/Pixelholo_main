@@ -27,6 +27,9 @@ from config import (  # noqa: E402
     DEFAULT_MIN_SPEECH_RATIO,
     DEFAULT_SAMPLE_RATE,
     DEFAULT_VAD_FILTER,
+    DEFAULT_AVATAR_FPS,
+    DEFAULT_AVATAR_PADS,
+    DEFAULT_AVATAR_NOSMOOTH,
     PROFILE_TYPE_VOICE,
     KEEP_SILENCE_MS,
     MAX_CHUNK_SEC,
@@ -43,7 +46,7 @@ from config import (  # noqa: E402
 
 
 def _run_ffmpeg_extract(video_path: Path, wav_path: Path) -> None:
-    filters = ["highpass=f=80", "lowpass=f=8000", f"loudnorm=I={TARGET_LUFS}:TP=-2:LRA=7"]
+    filters = ["highpass=f=80", "lowpass=f=16000"]
     command = [
         "ffmpeg",
         "-y",
@@ -238,14 +241,14 @@ def process_video(
     min_speech_ratio: float | None = DEFAULT_MIN_SPEECH_RATIO,
     legacy_split: bool = False,
     bake_avatar: bool = True,
-    avatar_fps: float = 25.0,
+    avatar_fps: float = DEFAULT_AVATAR_FPS,
     avatar_start_sec: float = 5.0,
     avatar_loop_sec: float = 10.0,
     avatar_loop_fade_sec: float = 0.0,
     avatar_resize_factor: int = 1,
-    avatar_pads: str = "0 10 0 0",
+    avatar_pads: str = DEFAULT_AVATAR_PADS,
     avatar_batch_size: int = 16,
-    avatar_nosmooth: bool = False,
+    avatar_nosmooth: bool = DEFAULT_AVATAR_NOSMOOTH,
     avatar_blur_background: bool = True,
     avatar_blur_kernel: int = 75,
     avatar_device: str | None = None,
@@ -353,7 +356,12 @@ def process_video(
                     for sub_chunk in _split_to_max_len(chunk, max_len_ms):
                         if len(sub_chunk) < min_len_ms:
                             continue
-                        if not _chunk_is_usable(sub_chunk, min_chunk_dbfs, max_clip_dbfs, min_speech_ratio):
+                        if not _chunk_is_usable(
+                            sub_chunk,
+                            min_chunk_dbfs,
+                            max_clip_dbfs,
+                            min_speech_ratio,
+                        ):
                             continue
                         chunk_name = f"{speaker_name}_{chunk_index:04d}.wav"
                         chunk_path = wavs_dir / chunk_name
@@ -375,7 +383,12 @@ def process_video(
                             _log(f"Wrote {chunk_name} ({chunk_index}/{len(segments)})")
                         chunk_index += 1
                 else:
-                    if not _chunk_is_usable(chunk, min_chunk_dbfs, max_clip_dbfs, min_speech_ratio):
+                    if not _chunk_is_usable(
+                        chunk,
+                        min_chunk_dbfs,
+                        max_clip_dbfs,
+                        min_speech_ratio,
+                    ):
                         continue
                     chunk_name = f"{speaker_name}_{chunk_index:04d}.wav"
                     chunk_path = wavs_dir / chunk_name
@@ -416,7 +429,12 @@ def process_video(
 
             _log(f"Transcribing {len(filtered_chunks)} chunks...")
             for chunk in filtered_chunks:
-                if not _chunk_is_usable(chunk, min_chunk_dbfs, max_clip_dbfs, min_speech_ratio):
+                if not _chunk_is_usable(
+                    chunk,
+                    min_chunk_dbfs,
+                    max_clip_dbfs,
+                    min_speech_ratio,
+                ):
                     continue
                 chunk_name = f"{speaker_name}_{chunk_index:04d}.wav"
                 chunk_path = wavs_dir / chunk_name

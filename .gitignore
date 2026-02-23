@@ -38,6 +38,7 @@ voice_cloning/data/
 voice_cloning/outputs/
 lip_syncing/data/
 lip_syncing/outputs/
+lip_syncing/training_data
 
 # Model weights / checkpoints
 lip_syncing/models/
@@ -54,3 +55,7 @@ frontend/.env*
 .env
 .env.*
 reference/
+# Large training datasets (downloaded locally)
+lip_syncing/training_data/
+# Local tools in voice_cloning (binaries, helpers)
+voice_cloning/tools/
