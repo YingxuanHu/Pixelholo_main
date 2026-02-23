@@ -223,7 +223,7 @@ def bake_avatar(
     nosmooth: bool = False,
     blur_background: bool = True,
     blur_kernel: int = 75,
-    face_crop_scale: float = 2.0,
+    face_crop_scale: float = 0.0,
     device: str = "cuda",
 ) -> Path:
     cache_dir = avatar_cache_dir(profile, profile_type)
@@ -305,11 +305,13 @@ def bake_avatar(
         h, w = frames[0].shape[:2]
         coords_arr = np.array([[0, h, 0, w]] * len(frames), dtype=np.int32)
 
-    # 2. Tight crop around face for sharper mouth detail.
-    frames, coords_arr = _tight_crop_to_face(frames, coords_arr, scale=face_crop_scale)
-    if frames:
-        base_h, base_w = frames[0].shape[:2]
-        frames, coords_arr = _resize_frames_and_coords(frames, coords_arr, (base_w, base_h))
+    # 2. Optional tight crop around face.
+    # Default is disabled to preserve the original center 3:4 framing from uploaded video.
+    if face_crop_scale and face_crop_scale > 1.0:
+        frames, coords_arr = _tight_crop_to_face(frames, coords_arr, scale=face_crop_scale)
+        if frames:
+            base_h, base_w = frames[0].shape[:2]
+            frames, coords_arr = _resize_frames_and_coords(frames, coords_arr, (base_w, base_h))
 
     # 3. Blur using Rembg
     if blur_background:
@@ -328,6 +330,8 @@ def bake_avatar(
         "source_video": str(video_path),
         "fps": float(fps),
         "frame_count": len(frames),
+        "center_crop_3_4": True,
+        "tight_face_crop_enabled": bool(face_crop_scale and face_crop_scale > 1.0),
         "face_crop_scale": float(face_crop_scale),
         "width": int(frames[0].shape[1]),
         "height": int(frames[0].shape[0]),
@@ -353,7 +357,12 @@ def main() -> None:
     # Flags for blurring
     parser.add_argument("--no_blur_background", action="store_true")
     parser.add_argument("--blur_kernel", type=int, default=55)
-    parser.add_argument("--face_crop_scale", type=float, default=2.0)
+    parser.add_argument(
+        "--face_crop_scale",
+        type=float,
+        default=0.0,
+        help="Optional face-tight crop scale (>1 enables). Default 0 keeps center 3:4 crop.",
+    )
     parser.add_argument("--device", type=str, default="cuda")
 
     args = parser.parse_args()

@@ -49,6 +49,33 @@ python src/train.py \
 ```bash
 uvicorn src.inference:app --host 0.0.0.0 --port 8000
 ```
+Default lip-sync backend is `wav2lip`.
+
+Backend selection is controlled by env flag at backend startup:
+```bash
+# Wav2Lip (default path, unchanged)
+LIPSYNC_BACKEND=wav2lip uvicorn src.inference:app --host 0.0.0.0 --port 8000
+
+# MuseTalk (low-latency defaults)
+LIPSYNC_BACKEND=musetalk \
+MUSE_TALK_BATCH_SIZE=24 \
+MUSE_TALK_INFER_FPS=12 \
+MUSE_TALK_STREAM_WINDOW_SEC=1.0 \
+MUSE_TALK_BLEND_EXPAND=1.2 \
+MUSE_TALK_FACE_SCALE=1.0 \
+MUSE_TALK_ALPHA_BLUR_RATIO=0.05 \
+uvicorn src.inference:app --host 0.0.0.0 --port 8000
+
+# Optional fallback: if MuseTalk init fails, fallback to Wav2Lip
+LIPSYNC_BACKEND=musetalk LIPSYNC_BACKEND_FALLBACK=1 uvicorn src.inference:app --host 0.0.0.0 --port 8000
+```
+
+MuseTalk notes:
+- First request for a profile can rebuild `musetalk_latents.pt` and `musetalk_masks.pkl`.
+- Runtime now auto-converts avatar `coords.npy` from bake format (`[y1, y2, x1, x2]`) before MuseTalk processing.
+- For lower startup latency, call `POST /warmup` for the target avatar profile once after backend start.
+- Default tuning is balanced for latency + quality. Override only if you need profile-specific changes.
+
 Endpoints:
 - `POST /stream_avatar` - NDJSON stream (audio + JPEG frames)
 - `POST /stream` - audio-only stream
@@ -98,6 +125,14 @@ git clone https://github.com/yl4579/StyleTTS2.git
 mkdir -p StyleTTS2/Models/LibriTTS
 wget -O StyleTTS2/Models/LibriTTS/epochs_2nd_00020.pth   https://huggingface.co/yl4579/StyleTTS2-LibriTTS/resolve/main/Models/LibriTTS/epochs_2nd_00020.pth
 wget -O StyleTTS2/Models/LibriTTS/config.yml   https://huggingface.co/yl4579/StyleTTS2-LibriTTS/resolve/main/Models/LibriTTS/config.yml
+```
+
+Optional: install MuseTalk repo + weights (needed only when `LIPSYNC_BACKEND=musetalk`):
+```bash
+cd /home/alvin/PixelHolo_trial/lip_syncing/lib
+git clone https://github.com/TMElyralab/MuseTalk.git
+cd MuseTalk
+bash download_weights.sh
 ```
 
 ## Troubleshooting
