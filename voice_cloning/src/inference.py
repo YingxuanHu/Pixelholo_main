@@ -953,7 +953,7 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
         max_chars = int(
             profile_defaults.get(
                 "musetalk_max_chunk_chars",
-                os.getenv("MUSE_TALK_MAX_CHUNK_CHARS", "90"),
+                os.getenv("MUSE_TALK_MAX_CHUNK_CHARS", "120"),
             )
         )
     else:
@@ -995,10 +995,6 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
     pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
     comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
     comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
-    comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
-    comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
-    comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
-    comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
     first_chunk_max_chars: int | None = None
     if is_musetalk:
         if req.musetalk_first_chunk_chars is not None:
@@ -1007,7 +1003,7 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
             first_chunk_max_chars = int(
                 profile_defaults.get(
                     "musetalk_first_chunk_chars",
-                    os.getenv("MUSE_TALK_FIRST_CHUNK_CHARS", "48"),
+                    os.getenv("MUSE_TALK_FIRST_CHUNK_CHARS", "72"),
                 )
             )
     musetalk_window_sec = 0.0
@@ -1018,7 +1014,18 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
             musetalk_window_sec = float(
                 profile_defaults.get(
                     "musetalk_stream_window_sec",
-                    os.getenv("MUSE_TALK_STREAM_WINDOW_SEC", "1.0"),
+                    os.getenv("MUSE_TALK_STREAM_WINDOW_SEC", "1.2"),
+                )
+            )
+    musetalk_lookahead_sec = 0.0
+    if is_musetalk:
+        if req.musetalk_lookahead_sec is not None:
+            musetalk_lookahead_sec = max(0.0, min(float(req.musetalk_lookahead_sec), 0.8))
+        else:
+            musetalk_lookahead_sec = float(
+                profile_defaults.get(
+                    "musetalk_lookahead_sec",
+                    os.getenv("MUSE_TALK_LOOKAHEAD_SEC", "0.16"),
                 )
             )
     jpeg_quality = 80
@@ -1151,17 +1158,44 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
         threading.Thread(target=_audio_worker, daemon=True).start()
 
         last_frame: np.ndarray | None = None
+        musetalk_prev_tail_frames: list[np.ndarray] = []
+        musetalk_frame_crossfade = 0
+        if is_musetalk:
+            try:
+                musetalk_frame_crossfade = max(
+                    0,
+                    min(
+                        6,
+                        int(
+                            profile_defaults.get(
+                                "musetalk_frame_crossfade",
+                                os.getenv("MUSE_TALK_FRAME_CROSSFADE", "2"),
+                            )
+                        ),
+                    ),
+                )
+            except (TypeError, ValueError):
+                musetalk_frame_crossfade = 2
         emit_index = 0
         window_src_samples = 0
         window_tgt_samples = 0
+        lookahead_src_samples = 0
+        lookahead_tgt_samples = 0
         pending_audio = np.zeros(0, dtype=np.float32)
         pending_audio_16k = np.zeros(0, dtype=np.float32)
         if is_musetalk and musetalk_window_sec > 0:
             window_src_samples = max(1, int(round(engine.sample_rate * musetalk_window_sec)))
             window_tgt_samples = max(1, int(round(16000.0 * musetalk_window_sec)))
+        if is_musetalk and musetalk_lookahead_sec > 0:
+            lookahead_src_samples = max(0, int(round(engine.sample_rate * musetalk_lookahead_sec)))
+            lookahead_tgt_samples = max(0, int(round(16000.0 * musetalk_lookahead_sec)))
 
-        def _emit_one(sub_audio: np.ndarray, sub_audio_16k: np.ndarray) -> Iterator[str]:
-            nonlocal last_frame, emit_index
+        def _emit_one(
+            sub_audio: np.ndarray,
+            sub_audio_16k: np.ndarray,
+            lookahead_16k: np.ndarray | None = None,
+        ) -> Iterator[str]:
+            nonlocal last_frame, emit_index, musetalk_prev_tail_frames
             rms = (
                 float(np.sqrt(np.mean(np.square(sub_audio))))
                 if sub_audio is not None and sub_audio.size
@@ -1176,8 +1210,39 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
             if SILENCE_CULLING_ENABLED and rms < SILENCE_RMS_THRESHOLD and last_frame is not None:
                 frames = [last_frame.copy() for _ in range(frames_needed)]
             else:
-                frames = lipsync.sync_chunk(sub_audio_16k, fps=fps)
+                if is_musetalk and lookahead_16k is not None and lookahead_16k.size > 0:
+                    frames = lipsync.sync_chunk(
+                        sub_audio_16k,
+                        fps=fps,
+                        lookahead_16k=lookahead_16k,
+                    )
+                else:
+                    frames = lipsync.sync_chunk(sub_audio_16k, fps=fps)
                 if frames:
+                    if is_musetalk and musetalk_frame_crossfade > 0 and musetalk_prev_tail_frames:
+                        n = min(
+                            musetalk_frame_crossfade,
+                            len(musetalk_prev_tail_frames),
+                            len(frames),
+                        )
+                        # Blend boundary frames to hide diffusion chunk-edge jitter.
+                        for i in range(n):
+                            alpha_new = float(i + 1) / float(n + 1)
+                            alpha_old = 1.0 - alpha_new
+                            frames[i] = cv2.addWeighted(
+                                musetalk_prev_tail_frames[-n + i],
+                                alpha_old,
+                                frames[i],
+                                alpha_new,
+                                0.0,
+                            )
+                        musetalk_prev_tail_frames = [
+                            f.copy() for f in frames[-musetalk_frame_crossfade:]
+                        ]
+                    elif is_musetalk and musetalk_frame_crossfade > 0:
+                        musetalk_prev_tail_frames = [
+                            f.copy() for f in frames[-musetalk_frame_crossfade:]
+                        ]
                     last_frame = frames[-1].copy()
             frame_payloads = []
             for frame in frames:
@@ -1226,11 +1291,21 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
                         pending_audio.size >= window_src_samples
                         and pending_audio_16k.size >= window_tgt_samples
                     ):
+                        lookahead_16k = None
+                        if lookahead_tgt_samples > 0:
+                            if (
+                                pending_audio.size < (window_src_samples + lookahead_src_samples)
+                                or pending_audio_16k.size < (window_tgt_samples + lookahead_tgt_samples)
+                            ):
+                                break
+                            lookahead_16k = pending_audio_16k[
+                                window_tgt_samples : window_tgt_samples + lookahead_tgt_samples
+                            ]
                         sub_audio = pending_audio[:window_src_samples]
                         sub_audio_16k = pending_audio_16k[:window_tgt_samples]
                         pending_audio = pending_audio[window_src_samples:]
                         pending_audio_16k = pending_audio_16k[window_tgt_samples:]
-                        yield from _emit_one(sub_audio, sub_audio_16k)
+                        yield from _emit_one(sub_audio, sub_audio_16k, lookahead_16k=lookahead_16k)
                 else:
                     yield from _emit_one(audio, audio_16k)
         except Exception:
@@ -1429,6 +1504,7 @@ class GenerateRequest(BaseModel):
     musetalk_batch_size: int | None = None
     musetalk_infer_fps: float | None = None
     musetalk_stream_window_sec: float | None = None
+    musetalk_lookahead_sec: float | None = None
     musetalk_jpeg_quality: int | None = None
     musetalk_face_scale: float | None = None
     musetalk_audio_history_sec: float | None = None
