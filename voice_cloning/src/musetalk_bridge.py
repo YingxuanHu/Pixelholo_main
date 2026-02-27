@@ -725,7 +725,12 @@ class MuseTalkBridge:
         out[cy1:cy2, cx1:cx2] = np.clip(blended_patch, 0, 255).astype(np.uint8)
         return out
 
-    def sync_chunk(self, audio_16k: np.ndarray, fps: float | None = None) -> list[np.ndarray]:
+    def sync_chunk(
+        self,
+        audio_16k: np.ndarray,
+        fps: float | None = None,
+        lookahead_16k: np.ndarray | None = None,
+    ) -> list[np.ndarray]:
         if self.frames is None or self.coords_xyxy is None:
             raise RuntimeError("Avatar cache not loaded.")
         if audio_16k.size == 0:
@@ -734,6 +739,11 @@ class MuseTalkBridge:
         audio_chunk = self._normalize_audio(audio_16k)
         if audio_chunk.size == 0:
             return []
+        lookahead_chunk = (
+            self._normalize_audio(lookahead_16k)
+            if lookahead_16k is not None and np.asarray(lookahead_16k).size > 0
+            else np.array([], dtype=np.float32)
+        )
 
         output_fps = float(fps or self.fps or 25.0)
         output_target_frames = self._compute_target_frames(audio_chunk, output_fps)
@@ -744,13 +754,22 @@ class MuseTalkBridge:
         if infer_target_frames <= 0:
             infer_target_frames = 1
 
-        self.audio_history = np.concatenate([self.audio_history, audio_chunk])
+        history_append = audio_chunk
+        lookahead_infer_frames = 0.0
+        if lookahead_chunk.size:
+            history_append = np.concatenate([history_append, lookahead_chunk])
+            lookahead_infer_frames = (len(lookahead_chunk) / 16000.0) * infer_fps
+
+        self.audio_history = np.concatenate([self.audio_history, history_append])
         max_history = int(max(0.5, self.audio_history_sec) * 16000)
-        if len(self.audio_history) > max_history + len(audio_chunk):
-            self.audio_history = self.audio_history[-(max_history + len(audio_chunk)) :]
+        if len(self.audio_history) > max_history + len(history_append):
+            self.audio_history = self.audio_history[-(max_history + len(history_append)) :]
 
         total_buffer_frames = (len(self.audio_history) / 16000.0) * infer_fps
-        start_frame_offset = max(0, int(math.floor(total_buffer_frames - infer_target_frames)))
+        start_frame_offset = max(
+            0,
+            int(math.floor(total_buffer_frames - lookahead_infer_frames - infer_target_frames)),
+        )
         whisper_chunks = self._extract_whisper_prompts(
             self.audio_history,
             infer_fps,
