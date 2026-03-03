@@ -16,6 +16,7 @@ phonemizer
 nltk
 soundfile
 transformers
+diffusers
 resemblyzer
 opencv-python
 filelock==3.12.4

@@ -12,7 +12,7 @@ type ControlPanelProps = {
 };
 
 const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, onInterrupt, disabled, variant = 'card' }) => {
-  const [mode, setMode] = useState<Mode>('tts');
+  const [mode, setMode] = useState<Mode>('chat');
   const [text, setText] = useState('');
   const [chatText, setChatText] = useState('');
   const [isSending, setIsSending] = useState(false);
