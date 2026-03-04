@@ -26,6 +26,8 @@ type TrainParams = {
   maxLen: number;
 };
 
+type ProfileType = 'voice' | 'avatar';
+
 const DEFAULT_API_BASE = 'http://127.0.0.1:8000';
 const LOCAL_STORAGE_API_BASE_KEY = 'voxclone_api_base';
 const DEFAULT_PROFILE_TYPE: 'voice' | 'avatar' = 'voice';
@@ -90,6 +92,7 @@ const App: React.FC = () => {
   const [lastUploadedAudioFilename, setLastUploadedAudioFilename] = useState<string | null>(null);
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [profilesStatus, setProfilesStatus] = useState<'idle' | 'loading' | 'error'>('idle');
+  const [profileMenuKey, setProfileMenuKey] = useState<string | null>(null);
   const warmupTimerRef = useRef<number | null>(null);
   const warmupNoticeTimerRef = useRef<number | null>(null);
   const [isWarmingUp, setIsWarmingUp] = useState(false);
@@ -219,11 +222,93 @@ const App: React.FC = () => {
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setProfiles(Array.isArray(data.profiles) ? data.profiles : []);
+      setProfileMenuKey(null);
       setProfilesStatus('idle');
     } catch (err) {
       setProfilesStatus('error');
     }
   }, [apiBase, profileType]);
+
+  const readErrorDetail = useCallback(async (res: Response) => {
+    const raw = await res.text();
+    if (!raw) return `HTTP ${res.status}`;
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed?.detail === 'string') return parsed.detail;
+      return raw;
+    } catch {
+      return raw;
+    }
+  }, []);
+
+  const handleRenameProfile = useCallback(
+    async (item: ProfileInfo) => {
+      if (isBusy) {
+        setUiNotice('Stop the current job before renaming profiles.');
+        return;
+      }
+      const currentType = (item.profile_type === 'avatar' ? 'avatar' : 'voice') as 'avatar' | 'voice';
+      const nextNameRaw = window.prompt('Rename profile', item.name);
+      if (nextNameRaw === null) return;
+      const nextName = nextNameRaw.trim();
+      if (!nextName || nextName === item.name) return;
+      setProfileMenuKey(null);
+      try {
+        const res = await fetch(`${apiBase}/profiles/${encodeURIComponent(item.name)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ new_name: nextName, profile_type: currentType }),
+        });
+        if (!res.ok) {
+          throw new Error(await readErrorDetail(res));
+        }
+        if (profile.name === item.name && profileType === currentType) {
+          setProfile(prev => ({ ...prev, name: nextName }));
+        }
+        warmedProfilesRef.current.delete(item.name);
+        warmedProfilesRef.current.delete(nextName);
+        await loadProfiles();
+      } catch (err) {
+        setUiNotice(`Rename failed: ${String(err)}`);
+      }
+    },
+    [apiBase, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
+  );
+
+  const handleDeleteProfile = useCallback(
+    async (item: ProfileInfo) => {
+      if (isBusy) {
+        setUiNotice('Stop the current job before deleting profiles.');
+        return;
+      }
+      const currentType = (item.profile_type === 'avatar' ? 'avatar' : 'voice') as 'avatar' | 'voice';
+      const confirmed = window.confirm(
+        `Delete profile "${item.name}" and all related files (data, training checkpoints, inference cache)?`,
+      );
+      if (!confirmed) return;
+      setProfileMenuKey(null);
+      try {
+        const params = new URLSearchParams({ profile_type: currentType });
+        const res = await fetch(`${apiBase}/profiles/${encodeURIComponent(item.name)}?${params.toString()}`, {
+          method: 'DELETE',
+        });
+        if (!res.ok) {
+          throw new Error(await readErrorDetail(res));
+        }
+        if (profile.name === item.name && profileType === currentType) {
+          setProfile(prev => ({ ...prev, name: '', lastUploadedFile: null, fileSize: null }));
+          setLastUploadedFilename(null);
+          setLastUploadedAudioFilename(null);
+          setActiveStep(1);
+        }
+        warmedProfilesRef.current.delete(item.name);
+        await loadProfiles();
+      } catch (err) {
+        setUiNotice(`Delete failed: ${String(err)}`);
+      }
+    },
+    [apiBase, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
+  );
 
   const triggerWarmup = useCallback(
     (profileName: string, type: ProfileType) => {
@@ -254,6 +339,13 @@ const App: React.FC = () => {
   }, [loadProfiles]);
 
   useEffect(() => {
+    if (!profileMenuKey) return;
+    const onDocClick = () => setProfileMenuKey(null);
+    document.addEventListener('click', onDocClick);
+    return () => document.removeEventListener('click', onDocClick);
+  }, [profileMenuKey]);
+
+  useEffect(() => {
     let cancelled = false;
     const controller = new AbortController();
     setApiStatus('checking');
@@ -269,6 +361,27 @@ const App: React.FC = () => {
       controller.abort();
     };
   }, [apiBase]);
+
+  useEffect(() => {
+    if (apiStatus !== 'online') return;
+    let cancelled = false;
+    fetch(`${apiBase}/lipsync_backend`, { cache: 'no-store' })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await res.text());
+        return res.json();
+      })
+      .then((data) => {
+        if (cancelled) return;
+        const backend = data?.backend === 'wav2lip' ? 'wav2lip' : 'musetalk';
+        setAvatarBackend(backend);
+      })
+      .catch(() => {
+        // Keep existing value on endpoint/read errors.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiBase, apiStatus]);
 
   const currentProfileInfo = profiles.find((item) => item.name === profile.name);
   const hasTrainedProfile = Boolean(currentProfileInfo?.has_profile);
@@ -661,6 +774,14 @@ const App: React.FC = () => {
     }
   };
 
+  const interruptBackend = useCallback(async () => {
+    try {
+      await fetch(`${apiBase}/interrupt`, { method: 'POST', keepalive: true });
+    } catch {
+      // ignore best-effort interrupt failures
+    }
+  }, [apiBase]);
+
   const stopAllAudio = () => {
     for (const src of activeSourcesRef.current) {
       try {
@@ -769,34 +890,17 @@ const App: React.FC = () => {
     if (!audioContextRef.current) return;
     const ctx = audioContextRef.current;
     const source = ctx.createBufferSource();
-    const gain = ctx.createGain();
     source.buffer = buffer;
-    source.connect(gain);
-    gain.connect(ctx.destination);
+    source.connect(ctx.destination);
     activeSourcesRef.current.add(source);
     source.onended = () => activeSourcesRef.current.delete(source);
 
-    const fadeMs = 6;
-    const fadeTime = Math.min(fadeMs / 1000, Math.max(0.003, buffer.duration / 4));
-    // Backend already stitches/crossfades chunk boundaries.
-    // Keep scheduling gapless without extra overlap to avoid comb-like artifacts.
+    // Backend already handles chunk-boundary stitching/crossfades.
+    // Frontend should focus on stable scheduling with enough lead time.
     const desiredStart = nextStartTimeRef.current;
-    const startAt = Math.max(ctx.currentTime + 0.01, desiredStart);
+    const minLead = outputMode === 'avatar' ? 0.05 : 0.03;
+    const startAt = Math.max(ctx.currentTime + minLead, desiredStart);
     const endAt = startAt + buffer.duration;
-
-    const fadeSamples = Math.max(32, Math.floor(ctx.sampleRate * fadeTime));
-    const fadeIn = new Float32Array(fadeSamples);
-    const fadeOut = new Float32Array(fadeSamples);
-    for (let i = 0; i < fadeSamples; i += 1) {
-      const t = i / (fadeSamples - 1);
-      fadeIn[i] = Math.sin(t * Math.PI * 0.5);
-      fadeOut[i] = Math.cos(t * Math.PI * 0.5);
-    }
-
-    gain.gain.setValueAtTime(0, startAt);
-    gain.gain.setValueCurveAtTime(fadeIn, startAt, fadeTime);
-    gain.gain.setValueAtTime(1, Math.max(startAt + fadeTime, endAt - fadeTime));
-    gain.gain.setValueCurveAtTime(fadeOut, Math.max(startAt, endAt - fadeTime), fadeTime);
 
     source.start(startAt);
     nextStartTimeRef.current = endAt;
@@ -821,13 +925,15 @@ const App: React.FC = () => {
     setInferenceChunks([]);
     setLatency(null);
     setInferenceStageIndex(inferenceSteps.length > 0 ? 0 : null);
+    // Set lead first, then schedule against it.
+    audioStartDelayRef.current = outputMode === 'avatar' ? 0.35 : 0.08;
     nextStartTimeRef.current = (audioContextRef.current?.currentTime || 0) + audioStartDelayRef.current;
     audioEndTimeRef.current = nextStartTimeRef.current;
-    audioStartDelayRef.current = outputMode === 'avatar' ? 0.35 : 0.05;
     let sawError = false;
 
     if (streamAbortRef.current) {
       streamAbortRef.current.abort();
+      await interruptBackend();
     }
     const controller = new AbortController();
     streamAbortRef.current = controller;
@@ -916,7 +1022,7 @@ const App: React.FC = () => {
         setInferenceStageIndex(null);
       }
     }
-  }, [apiBase, avatarBackend, enqueueFrames, modelOverride, outputMode, profile.name, profileType, refOverride, resetVideo, unlockAudio]);
+  }, [apiBase, avatarBackend, enqueueFrames, interruptBackend, modelOverride, outputMode, profile.name, profileType, refOverride, resetVideo, unlockAudio]);
 
   const startInference = useCallback(async () => {
     await runInference(inferenceText, '/speak');
@@ -924,6 +1030,7 @@ const App: React.FC = () => {
 
   const stopInference = async () => {
     if (streamAbortRef.current) streamAbortRef.current.abort();
+    await interruptBackend();
     streamSessionRef.current += 1;
     await resetAudio();
     resetVideo();
@@ -1176,45 +1283,83 @@ const App: React.FC = () => {
                     {profilesStatus === 'idle' && profiles.length > 0 && (
                       <div className="space-y-2 max-h-40 overflow-auto pr-1">
                         {profiles.map((item) => (
-                          <button
-                            key={item.name}
-                            type="button"
-                            onClick={() => {
-                              if (isBusy) {
-                                setUiNotice('Stop the current job before switching profiles.');
-                                return;
-                              }
-                              if (item.profile_type === 'avatar') {
-                                setProfileType('avatar');
-                              } else if (item.profile_type === 'voice') {
-                                setProfileType('voice');
-                              }
-                              setProfile(prev => ({ ...prev, name: item.name }));
-                              triggerWarmup(item.name, item.profile_type);
-                              setLastUploadedFilename(null);
-                              setLastUploadedAudioFilename(null);
-                              // Jump to generation if this profile is ready.
-                              if (item.has_profile) {
-                                setActiveStep(4);
-                              }
-                            }}
-                            disabled={isBusy}
-                            className={`w-full flex items-center justify-between border rounded-lg px-3 py-2 text-left ${
+                          <div
+                            key={`${item.profile_type || profileType}:${item.name}`}
+                            className={`w-full flex items-center gap-2 border rounded-lg px-3 py-2 ${
                               profile.name === item.name
                                 ? 'border-teal-600 bg-teal-50 text-teal-800'
                                 : 'border-slate-200 bg-white text-slate-600'
-                            } ${isBusy ? 'opacity-60 cursor-not-allowed' : ''}`}
+                            } ${isBusy ? 'opacity-60' : ''}`}
                           >
-                            <div>
-                              <p className="text-xs font-bold">{item.name}</p>
-                              <p className="text-[10px] text-slate-400">
-                                {item.processed_wavs} clips · {(item.raw_audio_files ?? 0)} audio · {item.raw_files} video · {item.profile_type || profileType}
-                              </p>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (isBusy) {
+                                  setUiNotice('Stop the current job before switching profiles.');
+                                  return;
+                                }
+                                if (item.profile_type === 'avatar') {
+                                  setProfileType('avatar');
+                                } else if (item.profile_type === 'voice') {
+                                  setProfileType('voice');
+                                }
+                                setProfile(prev => ({ ...prev, name: item.name }));
+                                const selectedType = item.profile_type === 'avatar' ? 'avatar' : 'voice';
+                                triggerWarmup(item.name, selectedType);
+                                setLastUploadedFilename(null);
+                                setLastUploadedAudioFilename(null);
+                                if (item.has_profile) {
+                                  setActiveStep(4);
+                                }
+                                setProfileMenuKey(null);
+                              }}
+                              disabled={isBusy}
+                              className="flex-1 min-w-0 flex items-center justify-between text-left disabled:cursor-not-allowed"
+                            >
+                              <div className="min-w-0">
+                                <p className="text-xs font-bold truncate">{item.name}</p>
+                                <p className="text-[10px] text-slate-400 truncate">
+                                  {item.processed_wavs} clips · {(item.raw_audio_files ?? 0)} audio · {item.raw_files} video · {item.profile_type || profileType}
+                                </p>
+                              </div>
+                              <div className="text-[10px] font-bold ml-2">
+                                {item.has_profile ? 'ready' : 'needs training'}
+                              </div>
+                            </button>
+
+                            <div className="relative" onClick={(e) => e.stopPropagation()}>
+                              <button
+                                type="button"
+                                disabled={isBusy}
+                                aria-label={`Profile options for ${item.name}`}
+                                className="h-7 w-7 rounded-md border border-slate-200 bg-white text-slate-500 hover:text-slate-700 hover:border-slate-300 disabled:cursor-not-allowed disabled:opacity-50 text-lg leading-none"
+                                onClick={() => {
+                                  const key = `${item.profile_type || profileType}:${item.name}`;
+                                  setProfileMenuKey(prev => (prev === key ? null : key));
+                                }}
+                              >
+                                ⋯
+                              </button>
+                              {profileMenuKey === `${item.profile_type || profileType}:${item.name}` && (
+                                <div className="absolute right-0 mt-1 min-w-[120px] rounded-lg border border-slate-200 bg-white shadow-lg z-20 py-1">
+                                  <button
+                                    type="button"
+                                    className="w-full text-left px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                                    onClick={() => handleRenameProfile(item)}
+                                  >
+                                    Rename
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="w-full text-left px-3 py-1.5 text-xs font-medium text-rose-600 hover:bg-rose-50"
+                                    onClick={() => handleDeleteProfile(item)}
+                                  >
+                                    Delete
+                                  </button>
+                                </div>
+                              )}
                             </div>
-                            <div className="text-[10px] font-bold">
-                              {item.has_profile ? 'ready' : 'needs training'}
-                            </div>
-                          </button>
+                          </div>
                         ))}
                       </div>
                     )}
@@ -1593,7 +1738,7 @@ const App: React.FC = () => {
                 <div className="space-y-6">
                 {isWarmingUp && (
                   <div className="bg-amber-50 border border-amber-200 text-amber-800 text-xs font-semibold px-4 py-3 rounded-xl">
-                    Warming up the selected profile for faster first response…
+                    Warming up {outputMode === 'avatar' ? (avatarBackend === 'wav2lip' ? 'Wav2Lip' : 'MuseTalk') : 'model'} for selected profile…
                   </div>
                 )}
                 <div className="bg-slate-50 border border-slate-100 rounded-xl px-4 py-3 text-sm text-slate-700">
@@ -1619,33 +1764,11 @@ const App: React.FC = () => {
                       <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
                         Lip Sync Model
                       </p>
-                      <div className="grid grid-cols-2 gap-2">
-                        <button
-                          type="button"
-                          onClick={() => setAvatarBackend('wav2lip')}
-                          className={`px-3 py-2 rounded-lg text-sm font-semibold transition-all ${
-                            avatarBackend === 'wav2lip'
-                              ? 'bg-teal-600 text-white'
-                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                          }`}
-                        >
-                          Wav2Lip
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setAvatarBackend('musetalk')}
-                          className={`px-3 py-2 rounded-lg text-sm font-semibold transition-all ${
-                            avatarBackend === 'musetalk'
-                              ? 'bg-teal-600 text-white'
-                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                          }`}
-                        >
-                          MuseTalk
-                        </button>
+                      <div className="grid grid-cols-1 gap-2">
+                        <div className="px-3 py-2 rounded-lg text-sm font-semibold bg-teal-600 text-white text-center">
+                          {avatarBackend === 'wav2lip' ? 'Wav2Lip' : 'MuseTalk'}
+                        </div>
                       </div>
-                      <p className="text-[11px] text-slate-500">
-                        Choose a lip-sync model. First run after switching may be slower due to warmup.
-                      </p>
                     </div>
 
                     <div className="bg-slate-950 border border-slate-900 rounded-2xl p-4">
