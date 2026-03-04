@@ -56,7 +56,9 @@ class MuseTalkBridge:
         self.fps = 25.0
         self.audio_history = np.array([], dtype=np.float32)
         self.audio_history_sec = float(os.getenv("MUSE_TALK_AUDIO_HISTORY_SEC", "2.0"))
-        self.infer_fps = float(os.getenv("MUSE_TALK_INFER_FPS", "12.0"))
+        # Keep default infer fps equal to output/avatar fps to avoid apparent slow-motion
+        # (low infer fps + frame upsampling reduces base-frame progression speed).
+        self.infer_fps = float(os.getenv("MUSE_TALK_INFER_FPS", "25.0"))
 
         # Keep MuseTalk box expansion conservative. This avoids chin cut lines without
         # shifting the mouth target area too far from the model's expected region.
