@@ -21,9 +21,6 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
   const handleSend = useCallback(
     async (selectedMode: Mode, inputText: string) => {
       if (!inputText.trim()) return;
-      if (onInterrupt) {
-        await onInterrupt();
-      }
       setIsSending(true);
       try {
         if (selectedMode === 'chat') {
@@ -47,9 +44,11 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
   );
 
   const { isListening, startListening, hasSupport, transcript } = useSpeechToText(onSpeechResult);
-  const startListeningSafe = useCallback(async () => {
+  const startListeningSafe = useCallback(() => {
     if (onInterrupt) {
-      await onInterrupt();
+      // Keep mic start inside the click gesture path.
+      // Awaiting async interrupt can cause browser speech APIs to reject start().
+      void Promise.resolve(onInterrupt()).catch(() => {});
     }
     startListening();
   }, [onInterrupt, startListening]);

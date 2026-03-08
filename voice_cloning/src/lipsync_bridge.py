@@ -1,6 +1,7 @@
 import importlib.util
 import logging
 import sys
+import threading
 from pathlib import Path
 from typing import Iterable
 
@@ -30,6 +31,8 @@ class LipSyncBridge:
         self.coords: np.ndarray | None = None
         self.fps: float = 25.0
         self._mask_cache: dict[tuple[int, int, int], np.ndarray] = {}
+        self._profile_load_lock = threading.Lock()
+        self._loaded_cache_dir: Path | None = None
 
         lip_dir = LIP_SYNCING_DIR / "lib" / "Wav2Lip"
         if not lip_dir.exists():
@@ -77,43 +80,54 @@ class LipSyncBridge:
         self.model.eval()
 
     def load_profile(self, profile: str, profile_type: str = PROFILE_TYPE_AVATAR) -> None:
-        cache_dir = avatar_cache_dir(profile, profile_type)
-        frames_path = cache_dir / "frames.npy"
-        coords_path = cache_dir / "coords.npy"
-        meta_path = cache_dir / "meta.json"
-        if not frames_path.exists() or not coords_path.exists():
-            raise FileNotFoundError(
-                f"Avatar cache missing for {profile}. Run preprocess with avatar baking."
-            )
-        self.frames = np.load(frames_path)
-        self.coords = np.load(coords_path)
-        if meta_path.exists():
-            meta = meta_path.read_text()
-            try:
-                import json
+        with self._profile_load_lock:
+            cache_dir = avatar_cache_dir(profile, profile_type)
+            frames_path = cache_dir / "frames.npy"
+            coords_path = cache_dir / "coords.npy"
+            meta_path = cache_dir / "meta.json"
+            if not frames_path.exists() or not coords_path.exists():
+                raise FileNotFoundError(
+                    f"Avatar cache missing for {profile}. Run preprocess with avatar baking."
+                )
 
-                data = json.loads(meta)
-                if isinstance(data, dict) and "fps" in data:
-                    self.fps = float(data.get("fps", self.fps))
-                else:
+            if (
+                self._loaded_cache_dir == cache_dir
+                and self.frames is not None
+                and self.coords is not None
+            ):
+                self.frame_idx = 0
+                return
+
+            self.frames = np.load(frames_path)
+            self.coords = np.load(coords_path)
+            if meta_path.exists():
+                meta = meta_path.read_text()
+                try:
+                    import json
+
+                    data = json.loads(meta)
+                    if isinstance(data, dict) and "fps" in data:
+                        self.fps = float(data.get("fps", self.fps))
+                    else:
+                        logger.warning(
+                            "component=lipsync op=load_profile fallback=default_fps reason=missing_fps profile=%s profile_type=%s",
+                            profile,
+                            profile_type,
+                        )
+                except Exception:
                     logger.warning(
-                        "component=lipsync op=load_profile fallback=default_fps reason=missing_fps profile=%s profile_type=%s",
+                        "component=lipsync op=load_profile fallback=default_fps reason=invalid_meta profile=%s profile_type=%s",
                         profile,
                         profile_type,
                     )
-            except Exception:
+            else:
                 logger.warning(
-                    "component=lipsync op=load_profile fallback=default_fps reason=invalid_meta profile=%s profile_type=%s",
+                    "component=lipsync op=load_profile fallback=default_fps reason=meta_missing profile=%s profile_type=%s",
                     profile,
                     profile_type,
                 )
-        else:
-            logger.warning(
-                "component=lipsync op=load_profile fallback=default_fps reason=meta_missing profile=%s profile_type=%s",
-                profile,
-                profile_type,
-            )
-        self.frame_idx = 0
+            self._loaded_cache_dir = cache_dir
+            self.frame_idx = 0
 
     def _mel_chunks(self, audio_16k: np.ndarray, fps: float | None = None) -> list[np.ndarray]:
         mel = self._wav_audio.melspectrogram(audio_16k)
