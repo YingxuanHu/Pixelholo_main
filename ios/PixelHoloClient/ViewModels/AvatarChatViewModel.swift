@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 @MainActor
@@ -18,12 +19,12 @@ final class AvatarChatViewModel: ObservableObject {
 
     init(
         player: AvatarPlayer? = nil,
-        streamingClient: StreamingClient = StreamingClient(),
-        apiClient: APIClient = APIClient()
+        streamingClient: StreamingClient? = nil,
+        apiClient: APIClient? = nil
     ) {
         self.player = player ?? AvatarPlayer()
-        self.streamingClient = streamingClient
-        self.apiClient = apiClient
+        self.streamingClient = streamingClient ?? StreamingClient()
+        self.apiClient = apiClient ?? APIClient()
     }
 
     func startStreaming(baseURL: URL?, text: String) {

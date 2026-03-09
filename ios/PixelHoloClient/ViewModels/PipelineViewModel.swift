@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 @MainActor
@@ -10,8 +11,8 @@ final class PipelineViewModel: ObservableObject {
     private let apiClient: APIClient
     private var activeTask: Task<Void, Never>?
 
-    init(apiClient: APIClient = APIClient()) {
-        self.apiClient = apiClient
+    init(apiClient: APIClient? = nil) {
+        self.apiClient = apiClient ?? APIClient()
     }
 
     func startPreprocess(baseURL: URL?, request: PreprocessRequest) {
@@ -90,4 +91,3 @@ final class PipelineViewModel: ObservableObject {
         )
     }
 }
-

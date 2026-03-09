@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import Foundation
 import Speech
 
@@ -108,4 +109,3 @@ final class SpeechRecognizerManager: NSObject, ObservableObject {
         try session.setActive(true, options: .notifyOthersOnDeactivation)
     }
 }
-

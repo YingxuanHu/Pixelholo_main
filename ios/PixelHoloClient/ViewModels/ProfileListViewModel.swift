@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 @MainActor
@@ -9,8 +10,8 @@ final class ProfileListViewModel: ObservableObject {
 
     private let apiClient: APIClient
 
-    init(apiClient: APIClient = APIClient()) {
-        self.apiClient = apiClient
+    init(apiClient: APIClient? = nil) {
+        self.apiClient = apiClient ?? APIClient()
     }
 
     func loadProfiles(baseURL: URL?) async {
@@ -40,4 +41,3 @@ final class ProfileListViewModel: ObservableObject {
         }
     }
 }
-

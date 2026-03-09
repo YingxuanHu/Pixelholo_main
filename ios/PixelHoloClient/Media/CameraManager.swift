@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import Combine
 @preconcurrency import CoreImage
 @preconcurrency import Foundation
 
@@ -31,17 +32,13 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             }
         }
         let granted = video && audio
-        runOnMain {
-            self.isAuthorized = granted
-        }
+        isAuthorized = granted
         return granted
     }
 
     func configureIfNeeded() async {
         guard isAuthorized else {
-            runOnMain {
-                self.errorMessage = "Camera and microphone permission are required."
-            }
+            errorMessage = "Camera and microphone permission are required."
             return
         }
         guard !isConfigured else { return }
@@ -55,15 +52,16 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
                 do {
                     try self.configureSession()
-                    self.runOnMain {
-                        self.isConfigured = true
+                    Task { @MainActor [weak self] in
+                        self?.isConfigured = true
+                        done.resume()
                     }
                 } catch {
-                    self.runOnMain {
-                        self.errorMessage = error.localizedDescription
+                    Task { @MainActor [weak self] in
+                        self?.errorMessage = error.localizedDescription
+                        done.resume()
                     }
                 }
-                done.resume()
             }
         }
     }
@@ -75,8 +73,8 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             guard let self else { return }
             guard !session.isRunning else { return }
             session.startRunning()
-            self.runOnMain {
-                self.isRunning = true
+            Task { @MainActor [weak self] in
+                self?.isRunning = true
             }
         }
     }
@@ -87,8 +85,8 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             guard let self else { return }
             guard session.isRunning else { return }
             session.stopRunning()
-            self.runOnMain {
-                self.isRunning = false
+            Task { @MainActor [weak self] in
+                self?.isRunning = false
             }
         }
     }
@@ -199,11 +197,11 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             do {
                 let outputURL = try await Self.cropVideoToThreeByFour(inputURL: tempURL)
                 try? FileManager.default.removeItem(at: tempURL)
-                self.runOnMain {
+                await MainActor.run {
                     self.recordedURL = outputURL
                 }
             } catch {
-                self.runOnMain {
+                await MainActor.run {
                     self.errorMessage = "Video crop failed: \(error.localizedDescription)"
                 }
             }
@@ -299,14 +297,6 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         }
 
         return outputURL
-    }
-
-    private func runOnMain(_ block: @escaping () -> Void) {
-        if Thread.isMainThread {
-            block()
-        } else {
-            DispatchQueue.main.async(execute: block)
-        }
     }
 }
 

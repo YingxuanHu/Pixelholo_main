@@ -32,7 +32,7 @@ enum WAVDecoder {
         let bitsPerSample: UInt16
     }
 
-    static func decodePCMBuffer(from wavData: Data) throws -> AVAudioPCMBuffer {
+    nonisolated static func decodePCMBuffer(from wavData: Data) throws -> AVAudioPCMBuffer {
         guard wavData.count >= 44 else {
             throw WAVDecoderError.invalidHeader
         }
@@ -125,13 +125,13 @@ enum WAVDecoder {
         return buffer
     }
 
-    private static func readUInt16LE(_ data: Data, at offset: Int) -> UInt16 {
+    nonisolated private static func readUInt16LE(_ data: Data, at offset: Int) -> UInt16 {
         let b0 = UInt16(data[offset])
         let b1 = UInt16(data[offset + 1]) << 8
         return b0 | b1
     }
 
-    private static func readUInt32LE(_ data: Data, at offset: Int) -> UInt32 {
+    nonisolated private static func readUInt32LE(_ data: Data, at offset: Int) -> UInt32 {
         let b0 = UInt32(data[offset])
         let b1 = UInt32(data[offset + 1]) << 8
         let b2 = UInt32(data[offset + 2]) << 16
@@ -139,4 +139,3 @@ enum WAVDecoder {
         return b0 | b1 | b2 | b3
     }
 }
-
