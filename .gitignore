@@ -54,3 +54,7 @@ frontend/.env*
 .env
 .env.*
 reference/
+
+# Xcode user state
+xcuserdata/
+*.xcuserstate
