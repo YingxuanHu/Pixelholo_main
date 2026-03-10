@@ -15,6 +15,7 @@ final class AvatarPlayer: ObservableObject {
 
     private var frameTimeline: [UIImage] = []
     private var streamFPS: Double = 25
+    private var trimmedFrameCount = 0
     private var connectedFormatSignature: String?
 
     init() {
@@ -58,6 +59,7 @@ final class AvatarPlayer: ObservableObject {
             engine.stop()
         }
         frameTimeline.removeAll()
+        trimmedFrameCount = 0
         currentFrame = nil
         isPlaying = false
         errorMessage = nil
@@ -100,16 +102,31 @@ final class AvatarPlayer: ObservableObject {
         }
 
         let elapsedSeconds = Double(playerTime.sampleTime) / playerTime.sampleRate
-        let frameIndex = Int(elapsedSeconds * streamFPS)
+        let absoluteFrameIndex = Int(elapsedSeconds * streamFPS)
+        let localFrameIndex = absoluteFrameIndex - trimmedFrameCount
 
-        if frameIndex >= 0 && frameIndex < frameTimeline.count {
-            currentFrame = frameTimeline[frameIndex]
-        } else if frameIndex >= frameTimeline.count, let last = frameTimeline.last {
+        if localFrameIndex >= 0 && localFrameIndex < frameTimeline.count {
+            currentFrame = frameTimeline[localFrameIndex]
+        } else if localFrameIndex >= frameTimeline.count, let last = frameTimeline.last {
             currentFrame = last
         }
+
+        trimFramesIfNeeded(currentFrameIndex: absoluteFrameIndex)
 
         if !playerNode.isPlaying, isPlaying {
             isPlaying = false
         }
+    }
+
+    private func trimFramesIfNeeded(currentFrameIndex: Int) {
+        guard frameTimeline.count > 180 else { return }
+        let framesBehindCurrent = currentFrameIndex - trimmedFrameCount
+        guard framesBehindCurrent > 90 else { return }
+
+        let removableCount = min(framesBehindCurrent - 45, frameTimeline.count - 90)
+        guard removableCount > 0 else { return }
+
+        frameTimeline.removeFirst(removableCount)
+        trimmedFrameCount += removableCount
     }
 }

@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct PipelineControlView: View {
+    @EnvironmentObject private var appSession: AppSessionViewModel
     @EnvironmentObject private var serverConfig: ServerConfig
     @StateObject private var viewModel = PipelineViewModel()
 
@@ -12,85 +13,133 @@ struct PipelineControlView: View {
     @State private var maxLen = "400"
 
     var body: some View {
-        VStack(spacing: 12) {
-            Form {
-                Section("Profile") {
-                    TextField("Profile name", text: $profileName)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled(true)
-                    Picker("Type", selection: $profileType) {
-                        Text("Voice").tag(ProfileType.voice)
-                        Text("Avatar").tag(ProfileType.avatar)
-                    }
-                    .pickerStyle(.segmented)
-                }
+        AppScreen {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: AppSpacing.cardSpacing) {
+                    AppScreenHeader(
+                        title: "Train",
+                        subtitle: "Run preprocess and fine-tuning steps against the selected backend profile."
+                    )
 
-                Section("Preprocess") {
-                    Button {
-                        startPreprocess()
-                    } label: {
-                        Text(viewModel.isPreprocessing ? "Running..." : "Start Preprocess")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .disabled(viewModel.isPreprocessing || profileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
+                    AppCard {
+                        AppSectionHeader(
+                            title: "Training Target",
+                            subtitle: "Pick the profile you want to preprocess or train. Tapping a profile in the Profiles tab will prefill this screen."
+                        )
 
-                Section("Training") {
-                    HStack {
-                        Text("Batch")
-                        Spacer()
-                        TextField("2", text: $batchSize)
-                            .multilineTextAlignment(.trailing)
-                            .keyboardType(.numberPad)
-                            .frame(width: 72)
-                    }
-                    HStack {
-                        Text("Epochs")
-                        Spacer()
-                        TextField("15", text: $epochs)
-                            .multilineTextAlignment(.trailing)
-                            .keyboardType(.numberPad)
-                            .frame(width: 72)
-                    }
-                    HStack {
-                        Text("Max Len")
-                        Spacer()
-                        TextField("400", text: $maxLen)
-                            .multilineTextAlignment(.trailing)
-                            .keyboardType(.numberPad)
-                            .frame(width: 72)
-                    }
-                    Button {
-                        startTraining()
-                    } label: {
-                        Text(viewModel.isTraining ? "Running..." : "Start Training")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .disabled(viewModel.isTraining || profileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
+                        TextField("Profile name", text: $profileName)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled(true)
+                            .appInputField()
 
-                if let error = viewModel.errorMessage {
-                    Section("Error") {
-                        Text(error).foregroundStyle(.red)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Profile Type")
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(.secondary)
+
+                            Picker("Type", selection: $profileType) {
+                                Text("Voice").tag(ProfileType.voice)
+                                Text("Avatar").tag(ProfileType.avatar)
+                            }
+                            .pickerStyle(.segmented)
+                        }
+                    }
+
+                    AppCard {
+                        AppSectionHeader(
+                            title: "Stage 1: Preprocess",
+                            subtitle: "Extract audio, segment clips, generate metadata, and bake avatar assets when needed."
+                        )
+
+                        if profileType == .avatar {
+                            AppBanner(
+                                text: "Avatar preprocess uses the default bake settings tuned for the current backend pipeline.",
+                                tone: .neutral
+                            )
+                        }
+
+                        Button {
+                            startPreprocess()
+                        } label: {
+                            AppPrimaryActionLabel(
+                                title: viewModel.isPreprocessing ? "Preprocessing..." : "Start Preprocess",
+                                icon: "wand.and.stars"
+                            )
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(viewModel.isPreprocessing || trimmedProfileName.isEmpty)
+                    }
+
+                    AppCard {
+                        AppSectionHeader(
+                            title: "Stage 2: Train",
+                            subtitle: "Fine-tune the StyleTTS2 profile after preprocess finishes cleanly."
+                        )
+
+                        VStack(spacing: 12) {
+                            trainingNumberField(title: "Batch Size", text: $batchSize)
+                            trainingNumberField(title: "Epochs", text: $epochs)
+                            trainingNumberField(title: "Max Length", text: $maxLen)
+                        }
+
+                        Button {
+                            startTraining()
+                        } label: {
+                            AppPrimaryActionLabel(
+                                title: viewModel.isTraining ? "Training..." : "Start Training",
+                                icon: "bolt.fill"
+                            )
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(viewModel.isTraining || trimmedProfileName.isEmpty)
+
+                        Button {
+                            viewModel.cancelCurrentJob()
+                        } label: {
+                            AppPrimaryActionLabel(title: "Stop Current Job", icon: "stop.fill")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+
+                    if let error = viewModel.errorMessage {
+                        AppBanner(text: error, tone: .error)
+                    }
+
+                    AppCard {
+                        ConsoleLogView(logs: viewModel.logs, title: "Backend Logs")
                     }
                 }
+                .padding(.horizontal, AppSpacing.screenPadding)
+                .padding(.top, 12)
+                .padding(.bottom, AppSpacing.bottomTabClearance)
             }
-
-            ConsoleLogView(logs: viewModel.logs, title: "Backend Logs")
-                .padding(.horizontal)
-
-            Button("Stop Job") {
-                viewModel.cancelCurrentJob()
-            }
-            .buttonStyle(.bordered)
-            .padding(.bottom, 8)
         }
-        .navigationTitle("Pipeline")
+        .toolbar(.hidden, for: .navigationBar)
+        .task {
+            applySelectedProfile()
+        }
+        .onChange(of: appSession.selectedProfile?.id) { _, _ in
+            applySelectedProfile()
+        }
+    }
+
+    private var trimmedProfileName: String {
+        profileName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func trainingNumberField(title: String, text: Binding<String>) -> some View {
+        AppKeyValueRow(title) {
+            TextField("0", text: text)
+                .multilineTextAlignment(.trailing)
+                .keyboardType(.numberPad)
+                .frame(width: 88)
+                .appInputField()
+        }
     }
 
     private func startPreprocess() {
         let req = PreprocessRequest(
-            profile: profileName.trimmingCharacters(in: .whitespacesAndNewlines),
+            profile: trimmedProfileName,
             filename: nil,
             audioFilename: nil,
             profileType: profileType,
@@ -112,7 +161,7 @@ struct PipelineControlView: View {
 
     private func startTraining() {
         let req = TrainRequest(
-            profile: profileName.trimmingCharacters(in: .whitespacesAndNewlines),
+            profile: trimmedProfileName,
             profileType: profileType,
             batchSize: Int(batchSize),
             epochs: Int(epochs),
@@ -125,12 +174,18 @@ struct PipelineControlView: View {
         )
         viewModel.startTraining(baseURL: serverConfig.baseURL, request: req)
     }
+
+    private func applySelectedProfile() {
+        guard let profile = appSession.selectedProfile else { return }
+        profileName = profile.name
+        profileType = profile.profileType
+    }
 }
 
 #Preview {
     NavigationStack {
         PipelineControlView()
             .environmentObject(ServerConfig.shared)
+            .environmentObject(AppSessionViewModel())
     }
 }
-

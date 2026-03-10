@@ -9,6 +9,12 @@ struct CameraView: View {
 
     var body: some View {
         VStack(spacing: 16) {
+#if targetEnvironment(simulator)
+            Text("Video capture is limited in the iOS Simulator. Use a physical iPhone for reliable camera testing.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+#endif
             ZStack(alignment: .topTrailing) {
                 CameraPreviewRepresentable(session: camera.session)
                     .aspectRatio(3.0 / 4.0, contentMode: .fit)
@@ -51,7 +57,7 @@ struct CameraView: View {
                         .padding(.vertical, 12)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!camera.isConfigured)
+                .disabled(!camera.isConfigured || isSimulatorBuild)
             }
         }
         .task {
@@ -68,6 +74,14 @@ struct CameraView: View {
                 onVideoReady(value)
             }
         }
+    }
+
+    private var isSimulatorBuild: Bool {
+#if targetEnvironment(simulator)
+        true
+#else
+        false
+#endif
     }
 }
 
@@ -97,4 +111,3 @@ private final class PreviewView: UIView {
         layer as! AVCaptureVideoPreviewLayer
     }
 }
-

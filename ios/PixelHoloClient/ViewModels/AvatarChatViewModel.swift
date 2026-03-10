@@ -18,6 +18,7 @@ final class AvatarChatViewModel: ObservableObject {
     private var streamTask: Task<Void, Never>?
 
     init(
+        initialProfile: ProfileInfo? = nil,
         player: AvatarPlayer? = nil,
         streamingClient: StreamingClient? = nil,
         apiClient: APIClient? = nil
@@ -25,6 +26,16 @@ final class AvatarChatViewModel: ObservableObject {
         self.player = player ?? AvatarPlayer()
         self.streamingClient = streamingClient ?? StreamingClient()
         self.apiClient = apiClient ?? APIClient()
+        if let initialProfile {
+            self.profileName = initialProfile.name
+            self.profileType = initialProfile.profileType
+        }
+    }
+
+    func applySelectedProfile(_ profile: ProfileInfo?) {
+        guard let profile else { return }
+        profileName = profile.name
+        profileType = profile.profileType
     }
 
     func startStreaming(baseURL: URL?, text: String) {

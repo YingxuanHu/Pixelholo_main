@@ -16,7 +16,7 @@ final class ProfileListViewModel: ObservableObject {
 
     func loadProfiles(baseURL: URL?) async {
         guard let baseURL else {
-            errorMessage = APIError.invalidBaseURL.localizedDescription
+            errorMessage = "Enter the backend URL first. Use your VM or LAN IP, not 127.0.0.1 unless the backend is running on this same Mac."
             voiceProfiles = []
             avatarProfiles = []
             return
@@ -35,9 +35,24 @@ final class ProfileListViewModel: ObservableObject {
                 .filter { $0.profileType == .avatar }
                 .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = Self.errorMessage(for: error, baseURL: baseURL)
             voiceProfiles = []
             avatarProfiles = []
         }
+    }
+
+    private static func errorMessage(for error: Error, baseURL: URL) -> String {
+        let baseMessage = error.localizedDescription
+        guard usesLoopbackHost(baseURL) else {
+            return baseMessage
+        }
+        return "\(baseMessage)\n127.0.0.1 only works when the backend is running on this same machine. For a VM or another computer, enter its reachable LAN IP instead."
+    }
+
+    private static func usesLoopbackHost(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else {
+            return false
+        }
+        return host == "127.0.0.1" || host == "localhost" || host == "::1"
     }
 }

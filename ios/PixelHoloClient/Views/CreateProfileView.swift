@@ -3,7 +3,6 @@ import SwiftUI
 @MainActor
 struct CreateProfileView: View {
     @EnvironmentObject private var serverConfig: ServerConfig
-    @Environment(\.dismiss) private var dismiss
 
     @StateObject private var audioRecorder = AudioRecorderManager()
     private let apiClient = APIClient()
@@ -17,101 +16,156 @@ struct CreateProfileView: View {
     @State private var isUploadingAudio = false
 
     var body: some View {
-        Form {
-            Section("Profile") {
-                TextField("Profile name", text: $profileName)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
+        AppScreen {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: AppSpacing.cardSpacing) {
+                    AppScreenHeader(
+                        title: "Create",
+                        subtitle: "Capture training media on-device and upload it directly to the backend."
+                    )
 
-                Picker("Workflow", selection: $profileType) {
-                    Text("Voice").tag(ProfileType.voice)
-                    Text("Avatar").tag(ProfileType.avatar)
-                }
-                .pickerStyle(.segmented)
-            }
+                    AppCard {
+                        AppSectionHeader(
+                            title: "Step 1: Define the Profile",
+                            subtitle: "Choose the workflow type first so the upload targets match the backend profile structure."
+                        )
 
-            Section("Video Capture (3:4, 10s)") {
-                CameraView(profileName: profileName.isEmpty ? "profile" : profileName) { url in
-                    capturedVideoURL = url
-                    statusMessage = "Video captured: \(url.lastPathComponent)"
-                }
-                if let capturedVideoURL {
-                    Text("Captured: \(capturedVideoURL.lastPathComponent)")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-                Button {
-                    Task {
-                        await uploadVideo()
-                    }
-                } label: {
-                    Text(isUploadingVideo ? "Uploading video..." : "Upload Video")
-                        .frame(maxWidth: .infinity)
-                }
-                .disabled(isUploadingVideo || profileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || capturedVideoURL == nil || serverConfig.baseURL == nil)
-            }
+                        TextField("Profile name", text: $profileName)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled(true)
+                            .appInputField()
 
-            Section("Audio Capture") {
-                Button {
-                    Task {
-                        if audioRecorder.isRecording {
-                            audioRecorder.stopRecording()
-                        } else {
-                            let granted = await audioRecorder.requestMicrophonePermission()
-                            if granted {
-                                await audioRecorder.startRecording(profileName: profileName.isEmpty ? "profile" : profileName)
-                            } else {
-                                statusMessage = "Microphone permission denied."
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Workflow")
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(.secondary)
+
+                            Picker("Workflow", selection: $profileType) {
+                                Text("Voice").tag(ProfileType.voice)
+                                Text("Avatar").tag(ProfileType.avatar)
                             }
+                            .pickerStyle(.segmented)
+                        }
+
+                        if let baseURL = serverConfig.baseURL?.absoluteString {
+                            Text("Uploads will be sent to \(baseURL)")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
                         }
                     }
-                } label: {
-                    Text(audioRecorder.isRecording ? "Stop Recording Audio" : "Record Audio")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
 
-                if let recorded = audioRecorder.recordedURL {
-                    Text("Captured: \(recorded.lastPathComponent)")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .onAppear {
-                            capturedAudioURL = recorded
+                    AppCard {
+                        AppSectionHeader(
+                            title: "Step 2: Capture Video",
+                            subtitle: "Record a 10 second 3:4 clip for avatar workflows. Voice-only profiles can skip this."
+                        )
+
+                        CameraView(profileName: trimmedProfileName.isEmpty ? "profile" : trimmedProfileName) { url in
+                            capturedVideoURL = url
+                            statusMessage = "Video captured: \(url.lastPathComponent)"
                         }
-                }
 
-                Button {
-                    Task {
-                        await uploadAudio()
+                        if let capturedVideoURL {
+                            AppBanner(text: "Video ready: \(capturedVideoURL.lastPathComponent)", tone: .success)
+                        }
+
+                        Button {
+                            Task {
+                                await uploadVideo()
+                            }
+                        } label: {
+                            AppPrimaryActionLabel(
+                                title: isUploadingVideo ? "Uploading Video..." : "Upload Video",
+                                icon: "video.fill.badge.plus"
+                            )
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isUploadingVideo || trimmedProfileName.isEmpty || capturedVideoURL == nil || serverConfig.baseURL == nil)
                     }
-                } label: {
-                    Text(isUploadingAudio ? "Uploading audio..." : "Upload Audio")
-                        .frame(maxWidth: .infinity)
-                }
-                .disabled(isUploadingAudio || profileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || capturedAudioURL == nil || serverConfig.baseURL == nil)
-            }
 
-            if let message = statusMessage {
-                Section("Status") {
-                    Text(message)
-                        .foregroundStyle(message.lowercased().contains("failed") ? .red : .secondary)
+                    AppCard {
+                        AppSectionHeader(
+                            title: "Step 3: Capture Audio",
+                            subtitle: "Record a clean voice sample for training. This is required for both voice and avatar profiles."
+                        )
+
+                        Button {
+                            Task {
+                                if audioRecorder.isRecording {
+                                    audioRecorder.stopRecording()
+                                } else {
+                                    let granted = await audioRecorder.requestMicrophonePermission()
+                                    if granted {
+                                        await audioRecorder.startRecording(profileName: trimmedProfileName.isEmpty ? "profile" : trimmedProfileName)
+                                    } else {
+                                        statusMessage = "Microphone permission denied."
+                                    }
+                                }
+                            }
+                        } label: {
+                            AppPrimaryActionLabel(
+                                title: audioRecorder.isRecording ? "Stop Recording Audio" : "Record Audio",
+                                icon: audioRecorder.isRecording ? "stop.circle.fill" : "mic.fill"
+                            )
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(audioRecorder.isRecording ? .red : .blue)
+
+                        if let recorded = audioRecorder.recordedURL {
+                            AppBanner(text: "Audio ready: \(recorded.lastPathComponent)", tone: .success)
+                                .onAppear {
+                                    capturedAudioURL = recorded
+                                }
+                        }
+
+                        Button {
+                            Task {
+                                await uploadAudio()
+                            }
+                        } label: {
+                            AppPrimaryActionLabel(
+                                title: isUploadingAudio ? "Uploading Audio..." : "Upload Audio",
+                                icon: "waveform.badge.plus"
+                            )
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isUploadingAudio || trimmedProfileName.isEmpty || capturedAudioURL == nil || serverConfig.baseURL == nil)
+                    }
+
+                    if let message = statusMessage {
+                        AppBanner(
+                            text: message,
+                            tone: bannerTone(for: message)
+                        )
+                    }
                 }
+                .padding(.horizontal, AppSpacing.screenPadding)
+                .padding(.top, 12)
+                .padding(.bottom, AppSpacing.bottomTabClearance)
             }
         }
-        .navigationTitle("Create Profile")
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("Done") {
-                    dismiss()
-                }
-            }
-        }
+        .toolbar(.hidden, for: .navigationBar)
         .onChange(of: audioRecorder.recordedURL) { _, value in
             if let value {
                 capturedAudioURL = value
                 statusMessage = "Audio captured: \(value.lastPathComponent)"
             }
         }
+    }
+
+    private var trimmedProfileName: String {
+        profileName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func bannerTone(for message: String) -> AppBannerTone {
+        let lowercased = message.lowercased()
+        if lowercased.contains("failed") || lowercased.contains("denied") || lowercased.contains("invalid") {
+            return .error
+        }
+        if lowercased.contains("uploaded") || lowercased.contains("captured") {
+            return .success
+        }
+        return .neutral
     }
 
     private func uploadVideo() async {
@@ -124,8 +178,7 @@ struct CreateProfileView: View {
             statusMessage = "No video captured yet."
             return
         }
-        let name = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else {
+        guard !trimmedProfileName.isEmpty else {
             statusMessage = "Profile name is required."
             return
         }
@@ -137,7 +190,7 @@ struct CreateProfileView: View {
             let response = try await apiClient.uploadVideo(
                 baseURL: baseURL,
                 fileURL: capturedVideoURL,
-                profile: name,
+                profile: trimmedProfileName,
                 profileType: profileType
             )
             statusMessage = "Video uploaded: \(response.filename)"
@@ -156,8 +209,7 @@ struct CreateProfileView: View {
             statusMessage = "No audio captured yet."
             return
         }
-        let name = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else {
+        guard !trimmedProfileName.isEmpty else {
             statusMessage = "Profile name is required."
             return
         }
@@ -169,7 +221,7 @@ struct CreateProfileView: View {
             let response = try await apiClient.uploadAudio(
                 baseURL: baseURL,
                 fileURL: capturedAudioURL,
-                profile: name,
+                profile: trimmedProfileName,
                 profileType: profileType
             )
             statusMessage = "Audio uploaded: \(response.filename)"
@@ -185,4 +237,3 @@ struct CreateProfileView: View {
             .environmentObject(ServerConfig.shared)
     }
 }
-

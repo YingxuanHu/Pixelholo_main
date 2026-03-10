@@ -11,7 +11,7 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		EA7A00DE2F5F6D81005655EF /* pixelholo_2_ios */ = {
+		EA7A00DE2F5F6D81005655EF /* ios/PixelHoloClient */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = ios/PixelHoloClient;
 			sourceTree = "<group>";
@@ -32,7 +32,7 @@
 		EA7A00D32F5F6D81005655EF = {
 			isa = PBXGroup;
 			children = (
-				EA7A00DE2F5F6D81005655EF /* pixelholo_2_ios */,
+				EA7A00DE2F5F6D81005655EF /* ios/PixelHoloClient */,
 				EA7A00DD2F5F6D81005655EF /* Products */,
 			);
 			sourceTree = "<group>";
@@ -61,7 +61,7 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				EA7A00DE2F5F6D81005655EF /* pixelholo_2_ios */,
+				EA7A00DE2F5F6D81005655EF /* ios/PixelHoloClient */,
 			);
 			name = pixelholo_2_ios;
 			packageProductDependencies = (
@@ -251,17 +251,20 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = BCF9SD6PJT;
 				ENABLE_PREVIEWS = YES;
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "pixelholo_2_ios-Info.plist";
+				INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsArbitraryLoads = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "PixelHolo needs camera access to record avatar training videos.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "PixelHolo needs microphone access to record training audio and voice prompts.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "PixelHolo uses speech recognition for push-to-talk input.";
-				INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsArbitraryLoads = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -286,17 +289,20 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = BCF9SD6PJT;
 				ENABLE_PREVIEWS = YES;
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "pixelholo_2_ios-Info.plist";
+				INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsArbitraryLoads = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "PixelHolo needs camera access to record avatar training videos.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "PixelHolo needs microphone access to record training audio and voice prompts.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "PixelHolo uses speech recognition for push-to-talk input.";
-				INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsArbitraryLoads = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",

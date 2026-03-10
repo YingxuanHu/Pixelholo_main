@@ -247,22 +247,56 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             height: targetHeight
         )
 
-        let filterComposition = AVMutableVideoComposition(asset: asset) { request in
-            let source = request.sourceImage
-            let sourceExtent = source.extent
-            let x = sourceExtent.origin.x + cropRect.origin.x
-            let y = sourceExtent.origin.y + cropRect.origin.y
-            let centeredCrop = CGRect(x: x, y: y, width: cropRect.width, height: cropRect.height)
-            let clamped = source.clampedToExtent()
-            let cropped = clamped.cropped(to: centeredCrop)
-            request.finish(with: cropped, context: nil)
-        }
-        filterComposition.renderSize = CGSize(width: cropRect.width, height: cropRect.height)
         let nominalFPS = try await track.load(.nominalFrameRate)
+        let frameDuration: CMTime
         if nominalFPS > 0 {
-            filterComposition.frameDuration = CMTime(value: 1, timescale: CMTimeScale(nominalFPS))
+            frameDuration = CMTime(value: 1, timescale: CMTimeScale(nominalFPS))
         } else {
-            filterComposition.frameDuration = CMTime(value: 1, timescale: 30)
+            frameDuration = CMTime(value: 1, timescale: 30)
+        }
+
+        let filterComposition: AVVideoComposition
+        if #available(iOS 26.0, *) {
+            let centeredCrop = CGRect(
+                x: transformed.origin.x + cropRect.origin.x,
+                y: transformed.origin.y + cropRect.origin.y,
+                width: cropRect.width,
+                height: cropRect.height
+            )
+
+            var layerConfig = AVVideoCompositionLayerInstruction.Configuration(assetTrack: track)
+            layerConfig.setTransform(
+                preferredTransform.translatedBy(x: -centeredCrop.origin.x, y: -centeredCrop.origin.y),
+                at: .zero
+            )
+            let layerInstruction = AVVideoCompositionLayerInstruction(configuration: layerConfig)
+            let instruction = AVVideoCompositionInstruction(
+                configuration: .init(
+                    layerInstructions: [layerInstruction],
+                    timeRange: CMTimeRange(start: .zero, duration: duration)
+                )
+            )
+
+            var compositionConfig = try await AVVideoComposition.Configuration(for: asset)
+            compositionConfig.instructions = [instruction]
+            compositionConfig.frameDuration = frameDuration
+            compositionConfig.renderSize = CGSize(width: cropRect.width, height: cropRect.height)
+            compositionConfig.sourceTrackIDForFrameTiming = track.trackID
+            filterComposition = AVVideoComposition(configuration: compositionConfig)
+        } else {
+            let legacyComposition = AVMutableVideoComposition(asset: asset) { request in
+                let source = request.sourceImage
+                let sourceExtent = source.extent
+                let x = sourceExtent.origin.x + cropRect.origin.x
+                let y = sourceExtent.origin.y + cropRect.origin.y
+                let centeredCrop = CGRect(x: x, y: y, width: cropRect.width, height: cropRect.height)
+                let clamped = source.clampedToExtent()
+                let cropped = clamped.cropped(to: centeredCrop)
+                request.finish(with: cropped, context: nil)
+            }
+            legacyComposition.renderSize = CGSize(width: cropRect.width, height: cropRect.height)
+            legacyComposition.frameDuration = frameDuration
+            filterComposition = legacyComposition
         }
 
         let outputURL = makeCroppedVideoURL(inputURL: inputURL)
@@ -270,28 +304,32 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
             throw NSError(domain: "CameraManager", code: -22, userInfo: [NSLocalizedDescriptionKey: "Failed to initialize video exporter."])
         }
-        exporter.outputURL = outputURL
-        exporter.outputFileType = .mp4
         exporter.videoComposition = filterComposition
         exporter.timeRange = CMTimeRange(start: .zero, duration: duration)
+        if #available(iOS 18.0, *) {
+            try await exporter.export(to: outputURL, as: .mp4)
+        } else {
+            exporter.outputURL = outputURL
+            exporter.outputFileType = .mp4
 
-        struct ExportBox: @unchecked Sendable {
-            let exporter: AVAssetExportSession
-        }
-        let exportBox = ExportBox(exporter: exporter)
+            struct ExportBox: @unchecked Sendable {
+                let exporter: AVAssetExportSession
+            }
+            let exportBox = ExportBox(exporter: exporter)
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            exportBox.exporter.exportAsynchronously {
-                let exporter = exportBox.exporter
-                switch exporter.status {
-                case .completed:
-                    continuation.resume()
-                case .failed:
-                    continuation.resume(throwing: exporter.error ?? NSError(domain: "CameraManager", code: -23, userInfo: [NSLocalizedDescriptionKey: "Video export failed."]))
-                case .cancelled:
-                    continuation.resume(throwing: NSError(domain: "CameraManager", code: -24, userInfo: [NSLocalizedDescriptionKey: "Video export cancelled."]))
-                default:
-                    continuation.resume(throwing: NSError(domain: "CameraManager", code: -25, userInfo: [NSLocalizedDescriptionKey: "Video export ended with status \(exporter.status.rawValue)."]))
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                exportBox.exporter.exportAsynchronously {
+                    let exporter = exportBox.exporter
+                    switch exporter.status {
+                    case .completed:
+                        continuation.resume()
+                    case .failed:
+                        continuation.resume(throwing: exporter.error ?? NSError(domain: "CameraManager", code: -23, userInfo: [NSLocalizedDescriptionKey: "Video export failed."]))
+                    case .cancelled:
+                        continuation.resume(throwing: NSError(domain: "CameraManager", code: -24, userInfo: [NSLocalizedDescriptionKey: "Video export cancelled."]))
+                    default:
+                        continuation.resume(throwing: NSError(domain: "CameraManager", code: -25, userInfo: [NSLocalizedDescriptionKey: "Video export ended with status \(exporter.status.rawValue)."]))
+                    }
                 }
             }
         }
