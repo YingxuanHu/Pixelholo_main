@@ -86,7 +86,7 @@ private struct BinaryPacketParser {
 
 final class StreamingClient {
     private let binaryStreamer: URLSessionBinaryStreamer
-    private static let maxDecodedFrameDimension: CGFloat = 960
+    private static let maxDecodedFrameDimension: CGFloat = 640
 
     init(binaryStreamer: URLSessionBinaryStreamer = URLSessionBinaryStreamer()) {
         self.binaryStreamer = binaryStreamer
@@ -104,6 +104,7 @@ final class StreamingClient {
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         urlRequest.setValue(pixelHoloBinaryStreamMediaType, forHTTPHeaderField: "Accept")
         urlRequest.setValue("binary", forHTTPHeaderField: "X-PixelHolo-Transport")
+        urlRequest.setValue("ios", forHTTPHeaderField: "X-PixelHolo-Client")
         urlRequest.httpBody = try JSONEncoder().encode(request)
 
         let rawChunks = binaryStreamer.streamData(request: urlRequest)
@@ -207,4 +208,3 @@ final class StreamingClient {
         return UIImage(data: data)
     }
 }
-

@@ -197,6 +197,14 @@ def _binary_stream_requested(request: Request) -> bool:
     return PIXELHOLO_BINARY_STREAM_MEDIA_TYPE in accept
 
 
+def _mobile_stream_requested(request: Request) -> bool:
+    client = (request.headers.get("x-pixelholo-client") or "").strip().lower()
+    if client in {"ios", "iphone", "mobile"}:
+        return True
+    user_agent = (request.headers.get("user-agent") or "").lower()
+    return "iphone" in user_agent or "ipad" in user_agent
+
+
 def _pack_binary_stream_packet(metadata: dict[str, object], payload: bytes = b"") -> bytes:
     meta_bytes = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
     header = _PIXELHOLO_BINARY_MAGIC + struct.pack(">II", len(meta_bytes), len(payload))
@@ -1070,6 +1078,7 @@ def _stream_avatar_from_text_iter(
     req: GenerateRequest,
     text_iter: Iterator[str],
     binary_transport: bool = False,
+    mobile_profile: bool = False,
 ) -> StreamingResponse:
     start_time = time.perf_counter()
     profile = req.avatar_profile or req.speaker
@@ -1095,6 +1104,11 @@ def _stream_avatar_from_text_iter(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     is_musetalk = lipsync.__class__.__name__ == "MuseTalkBridge"
     fps = req.avatar_fps or lipsync.fps
+    if mobile_profile and req.avatar_fps is None:
+        try:
+            fps = min(float(fps), float(os.getenv("IOS_STREAM_AVATAR_FPS", "15")))
+        except (TypeError, ValueError):
+            fps = min(float(fps), 15.0)
 
     profile_defaults = _load_profile_defaults(model_path)
     # Request-time MuseTalk knobs (ignored for Wav2Lip).
@@ -1104,6 +1118,14 @@ def _stream_avatar_from_text_iter(
             lipsync.batch_size = max(1, min(int(req.musetalk_batch_size), 128))
         if req.musetalk_infer_fps is not None:
             lipsync.infer_fps = max(6.0, min(float(req.musetalk_infer_fps), 30.0))
+        elif mobile_profile:
+            try:
+                lipsync.infer_fps = max(
+                    6.0,
+                    min(float(lipsync.infer_fps), float(os.getenv("IOS_STREAM_MUSETALK_INFER_FPS", "15"))),
+                )
+            except (TypeError, ValueError):
+                lipsync.infer_fps = max(6.0, min(float(lipsync.infer_fps), 15.0))
 
         default_face_scale = float(
             profile_defaults.get(
@@ -1221,6 +1243,27 @@ def _stream_avatar_from_text_iter(
                     os.getenv("MUSE_TALK_JPEG_QUALITY", "92"),
                 )
             )
+    if mobile_profile and req.musetalk_jpeg_quality is None:
+        try:
+            jpeg_quality = max(50, min(int(jpeg_quality), int(os.getenv("IOS_STREAM_JPEG_QUALITY", "72"))))
+        except (TypeError, ValueError):
+            jpeg_quality = max(50, min(int(jpeg_quality), 72))
+    mobile_max_frame_edge = 0
+    if mobile_profile:
+        try:
+            mobile_max_frame_edge = max(256, min(int(os.getenv("IOS_STREAM_MAX_FRAME_EDGE", "640")), 1280))
+        except (TypeError, ValueError):
+            mobile_max_frame_edge = 640
+
+    logger.info(
+        "component=stream op=avatar_stream_config profile=%s backend=%s mobile=%s fps=%.2f jpeg_quality=%s max_frame_edge=%s",
+        profile,
+        req.lipsync_backend or "default",
+        mobile_profile,
+        float(fps),
+        jpeg_quality,
+        mobile_max_frame_edge or "full",
+    )
 
     def _generator() -> Iterator[str]:
         stop_event = threading.Event()
@@ -1479,6 +1522,14 @@ def _stream_avatar_from_text_iter(
             frame_payloads: list[str] = []
             frame_blobs: list[bytes] = []
             for frame in frames:
+                if mobile_max_frame_edge > 0:
+                    h, w = frame.shape[:2]
+                    max_dim = max(h, w)
+                    if max_dim > mobile_max_frame_edge:
+                        scale = float(mobile_max_frame_edge) / float(max_dim)
+                        new_w = max(1, int(round(w * scale)))
+                        new_h = max(1, int(round(h * scale)))
+                        frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
                 ok, buf = cv2.imencode(
                     ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
                 )
@@ -1608,6 +1659,7 @@ def _stream_voice_from_text_iter(
     req: GenerateRequest,
     text_iter: Iterator[str],
     binary_transport: bool = False,
+    mobile_profile: bool = False,
 ) -> StreamingResponse:
     start_time = time.perf_counter()
     profile_type = req.profile_type or PROFILE_TYPE_VOICE
@@ -3096,9 +3148,20 @@ def chat(req: GenerateRequest, request: Request):
         req.smart_trim_pad_ms = 0.0
     profile_type = req.profile_type or PROFILE_TYPE_VOICE
     binary_transport = _binary_stream_requested(request)
+    mobile_profile = _mobile_stream_requested(request)
     if profile_type == PROFILE_TYPE_AVATAR or req.avatar_profile:
-        return _stream_avatar_from_text_iter(req, llm_stream, binary_transport=binary_transport)
-    return _stream_voice_from_text_iter(req, llm_stream, binary_transport=binary_transport)
+        return _stream_avatar_from_text_iter(
+            req,
+            llm_stream,
+            binary_transport=binary_transport,
+            mobile_profile=mobile_profile,
+        )
+    return _stream_voice_from_text_iter(
+        req,
+        llm_stream,
+        binary_transport=binary_transport,
+        mobile_profile=mobile_profile,
+    )
 
 
 @app.post("/speak")
@@ -3107,14 +3170,17 @@ def speak(req: GenerateRequest, request: Request):
         raise HTTPException(status_code=400, detail="Text is empty.")
     profile_type = req.profile_type or PROFILE_TYPE_VOICE
     binary_transport = _binary_stream_requested(request)
+    mobile_profile = _mobile_stream_requested(request)
     if profile_type == PROFILE_TYPE_AVATAR or req.avatar_profile:
         return _stream_avatar_from_text_iter(
             req,
             iter([req.text]),
             binary_transport=binary_transport,
+            mobile_profile=mobile_profile,
         )
     return _stream_voice_from_text_iter(
         req,
         iter([req.text]),
         binary_transport=binary_transport,
+        mobile_profile=mobile_profile,
     )

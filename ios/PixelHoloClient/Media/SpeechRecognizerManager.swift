@@ -25,6 +25,7 @@ private enum SpeechRecognitionFailure: LocalizedError {
 final class SpeechRecognizerManager: NSObject, ObservableObject {
     @Published private(set) var isAuthorized = false
     @Published private(set) var isRecording = false
+    @Published private(set) var isStarting = false
     @Published var transcript = ""
     @Published var errorMessage: String?
 
@@ -58,7 +59,8 @@ final class SpeechRecognizerManager: NSObject, ObservableObject {
             errorMessage = SpeechRecognitionFailure.recognizerUnavailable.localizedDescription
             return
         }
-        guard !isRecording else { return }
+        guard !isRecording, !isStarting else { return }
+        isStarting = true
         errorMessage = nil
         transcript = ""
 
@@ -100,13 +102,14 @@ final class SpeechRecognizerManager: NSObject, ObservableObject {
             }
             if let error {
                 Task { @MainActor in
-                    self.errorMessage = "Speech recognition error: \(error.localizedDescription)"
+                    self.errorMessage = Self.describeSpeechRecognitionError(error)
                     self.stopTranscribing(commitResult: false)
                 }
             }
         }
 
         isRecording = true
+        isStarting = false
     }
 
     @discardableResult
@@ -121,6 +124,7 @@ final class SpeechRecognizerManager: NSObject, ObservableObject {
         recognitionRequest = nil
 
         isRecording = false
+        isStarting = false
         deactivateAudioSessionIfPossible()
         let final = commitResult ? transcript.trimmingCharacters(in: .whitespacesAndNewlines) : nil
         return final?.isEmpty == false ? final : nil
@@ -158,5 +162,13 @@ final class SpeechRecognizerManager: NSObject, ObservableObject {
 
     private func isValidRecordingFormat(_ format: AVAudioFormat) -> Bool {
         format.sampleRate > 0 && format.channelCount > 0
+    }
+
+    private static func describeSpeechRecognitionError(_ error: Error) -> String {
+        let nsError = error as NSError
+        if nsError.domain == "kAFAssistantErrorDomain", nsError.code == 216 {
+            return "Speech recognition error: Apple speech recognition could not start cleanly. This usually happens when recording was triggered more than once for the same press, or the speech service was not ready yet. Release and try again."
+        }
+        return "Speech recognition error: \(error.localizedDescription)"
     }
 }

@@ -129,11 +129,11 @@ final class AvatarPlayer: ObservableObject {
     }
 
     private func trimFramesIfNeeded(currentFrameIndex: Int) {
-        guard frameTimeline.count > 180 else { return }
+        guard frameTimeline.count > 120 else { return }
         let framesBehindCurrent = currentFrameIndex - trimmedFrameCount
-        guard framesBehindCurrent > 90 else { return }
+        guard framesBehindCurrent > 60 else { return }
 
-        let removableCount = min(framesBehindCurrent - 45, frameTimeline.count - 90)
+        let removableCount = min(framesBehindCurrent - 30, frameTimeline.count - 60)
         guard removableCount > 0 else { return }
 
         frameTimeline.removeFirst(removableCount)

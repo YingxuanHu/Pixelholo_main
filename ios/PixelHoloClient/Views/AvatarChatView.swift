@@ -6,6 +6,7 @@ struct AvatarChatView: View {
     @StateObject private var viewModel: AvatarChatViewModel
     @StateObject private var speech = SpeechRecognizerManager()
     @State private var inputText = ""
+    @State private var speechPressIsActive = false
 
     init(initialProfile: ProfileInfo? = nil) {
         _viewModel = StateObject(wrappedValue: AvatarChatViewModel(initialProfile: initialProfile))
@@ -44,6 +45,7 @@ struct AvatarChatView: View {
         .toolbar(.hidden, for: .navigationBar)
         .onDisappear {
             viewModel.stopStreaming()
+            speechPressIsActive = false
             _ = speech.stopTranscribing(commitResult: false)
         }
         .task {
@@ -69,10 +71,7 @@ struct AvatarChatView: View {
                     .fill(Color.black)
 
                 if let frame = viewModel.player.currentFrame {
-                    Image(uiImage: frame)
-                        .resizable()
-                        .scaledToFill()
-                        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    AvatarFrameView(image: frame, cornerRadius: 20)
                 } else {
                     VStack(spacing: 10) {
                         Image(systemName: viewModel.profileType == .avatar ? "person.crop.rectangle" : "speaker.wave.3.fill")
@@ -208,9 +207,12 @@ struct AvatarChatView: View {
             .simultaneousGesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { _ in
+                        guard !speechPressIsActive else { return }
+                        speechPressIsActive = true
                         Task { await startSpeechIfNeeded() }
                     }
                     .onEnded { _ in
+                        speechPressIsActive = false
                         finishSpeechAndSend()
                     }
             )
@@ -222,7 +224,7 @@ struct AvatarChatView: View {
     }
 
     private func startSpeechIfNeeded() async {
-        guard !speech.isRecording else { return }
+        guard !speech.isRecording, !speech.isStarting else { return }
         if !speech.isAuthorized {
             _ = await speech.requestPermissions()
         }
