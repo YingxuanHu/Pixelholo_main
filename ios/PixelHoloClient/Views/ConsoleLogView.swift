@@ -30,9 +30,7 @@ struct ConsoleLogView: View {
                 }
                 .onChange(of: logs.count) { _, _ in
                     if let lastID = logs.last?.id {
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            proxy.scrollTo(lastID, anchor: .bottom)
-                        }
+                        proxy.scrollTo(lastID, anchor: .bottom)
                     }
                 }
             }
@@ -55,4 +53,3 @@ struct ConsoleLogView: View {
     )
     .padding()
 }
-

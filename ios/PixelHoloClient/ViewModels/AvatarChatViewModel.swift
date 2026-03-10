@@ -3,6 +3,8 @@ import Foundation
 
 @MainActor
 final class AvatarChatViewModel: ObservableObject {
+    private static let maxLogLines = 120
+
     @Published var profileName: String = ""
     @Published var profileType: ProfileType = .avatar
     @Published var endpoint: StreamEndpoint = .chat
@@ -142,5 +144,8 @@ final class AvatarChatViewModel: ObservableObject {
                 isError: isError
             )
         )
+        if logs.count > Self.maxLogLines {
+            logs.removeFirst(logs.count - Self.maxLogLines)
+        }
     }
 }

@@ -14,6 +14,7 @@ import os
 import random
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -182,6 +183,24 @@ def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
         wf.writeframes(pcm16.tobytes())
 
     return buffer.getvalue()
+
+
+PIXELHOLO_BINARY_STREAM_MEDIA_TYPE = "application/vnd.pixelholo.stream-v1"
+_PIXELHOLO_BINARY_MAGIC = b"PHS1"
+
+
+def _binary_stream_requested(request: Request) -> bool:
+    transport = (request.headers.get("x-pixelholo-transport") or "").strip().lower()
+    if transport == "binary":
+        return True
+    accept = (request.headers.get("accept") or "").lower()
+    return PIXELHOLO_BINARY_STREAM_MEDIA_TYPE in accept
+
+
+def _pack_binary_stream_packet(metadata: dict[str, object], payload: bytes = b"") -> bytes:
+    meta_bytes = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
+    header = _PIXELHOLO_BINARY_MAGIC + struct.pack(">II", len(meta_bytes), len(payload))
+    return header + meta_bytes + payload
 
 
 def _split_text(text: str, max_chars: int, max_words: int) -> list[str]:
@@ -1047,7 +1066,11 @@ def _resolve_inference_params(
     return params
 
 
-def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]) -> StreamingResponse:
+def _stream_avatar_from_text_iter(
+    req: GenerateRequest,
+    text_iter: Iterator[str],
+    binary_transport: bool = False,
+) -> StreamingResponse:
     start_time = time.perf_counter()
     profile = req.avatar_profile or req.speaker
     if not profile:
@@ -1403,7 +1426,7 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
             sub_audio: np.ndarray,
             sub_audio_16k: np.ndarray,
             lookahead_16k: np.ndarray | None = None,
-        ) -> Iterator[str]:
+        ) -> Iterator[str | bytes]:
             nonlocal last_frame, emit_index, musetalk_prev_tail_frames
             rms = (
                 float(np.sqrt(np.mean(np.square(sub_audio))))
@@ -1453,25 +1476,45 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
                             f.copy() for f in frames[-musetalk_frame_crossfade:]
                         ]
                     last_frame = frames[-1].copy()
-            frame_payloads = []
+            frame_payloads: list[str] = []
+            frame_blobs: list[bytes] = []
             for frame in frames:
                 ok, buf = cv2.imencode(
                     ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
                 )
                 if ok:
-                    frame_payloads.append(base64.b64encode(buf).decode("ascii"))
+                    encoded = bytes(buf)
+                    if binary_transport:
+                        frame_blobs.append(encoded)
+                    else:
+                        frame_payloads.append(base64.b64encode(encoded).decode("ascii"))
 
             wav_bytes = _audio_to_wav_bytes(sub_audio, engine.sample_rate)
-            payload = base64.b64encode(wav_bytes).decode("ascii")
-            yield json.dumps(
-                {
+            duration_sec = float(len(sub_audio) / engine.sample_rate) if sub_audio.size else 0.0
+            if binary_transport:
+                metadata = {
+                    "event": "chunk",
                     "chunk_index": emit_index,
-                    "audio_base64": payload,
                     "sample_rate": engine.sample_rate,
                     "fps": fps,
-                    "frames_base64": frame_payloads,
+                    "duration_sec": round(duration_sec, 6),
+                    "audio_bytes_len": len(wav_bytes),
+                    "frame_lengths": [len(blob) for blob in frame_blobs],
                 }
-            ) + "\n"
+                payload = wav_bytes + b"".join(frame_blobs)
+                yield _pack_binary_stream_packet(metadata, payload)
+            else:
+                payload = base64.b64encode(wav_bytes).decode("ascii")
+                yield json.dumps(
+                    {
+                        "chunk_index": emit_index,
+                        "audio_base64": payload,
+                        "sample_rate": engine.sample_rate,
+                        "fps": fps,
+                        "frames_base64": frame_payloads,
+                        "duration_sec": round(duration_sec, 6),
+                    }
+                ) + "\n"
             emit_index += 1
 
         try:
@@ -1486,7 +1529,10 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
                     detail = "Audio worker failed."
                     if audio is not None and audio.size > 0:
                         detail = str(audio[0])
-                    yield json.dumps({"event": "error", "detail": detail}) + "\n"
+                    if binary_transport:
+                        yield _pack_binary_stream_packet({"event": "error", "detail": detail})
+                    else:
+                        yield json.dumps({"event": "error", "detail": detail}) + "\n"
                     break
                 if kind == "done":
                     if is_musetalk and pending_audio.size and pending_audio_16k.size:
@@ -1524,7 +1570,10 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
                     yield from _emit_one(audio, audio_16k)
         except Exception:
             logger.exception("Avatar stream failed")
-            yield json.dumps({"event": "error", "detail": traceback.format_exc()}) + "\n"
+            if binary_transport:
+                yield _pack_binary_stream_packet({"event": "error", "detail": traceback.format_exc()})
+            else:
+                yield json.dumps({"event": "error", "detail": traceback.format_exc()}) + "\n"
         finally:
             stop_event.set()
             with contextlib.suppress(Exception):
@@ -1538,12 +1587,28 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
             _unregister_stream_stop_event(stop_event)
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-        yield json.dumps({"event": "done", "inference_ms": round(elapsed_ms, 2)}) + "\n"
+        if binary_transport:
+            yield _pack_binary_stream_packet(
+                {"event": "done", "inference_ms": round(elapsed_ms, 2)}
+            )
+        else:
+            yield json.dumps({"event": "done", "inference_ms": round(elapsed_ms, 2)}) + "\n"
 
-    return StreamingResponse(_generator(), media_type="application/x-ndjson")
+    return StreamingResponse(
+        _generator(),
+        media_type=(
+            PIXELHOLO_BINARY_STREAM_MEDIA_TYPE
+            if binary_transport
+            else "application/x-ndjson"
+        ),
+    )
 
 
-def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]) -> StreamingResponse:
+def _stream_voice_from_text_iter(
+    req: GenerateRequest,
+    text_iter: Iterator[str],
+    binary_transport: bool = False,
+) -> StreamingResponse:
     start_time = time.perf_counter()
     profile_type = req.profile_type or PROFILE_TYPE_VOICE
     model_path = _resolve_model_path(req.model_path, req.speaker, profile_type)
@@ -1599,7 +1664,7 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
     if seed is None:
         seed = 1234
 
-    def _generator() -> Iterator[str]:
+    def _generator() -> Iterator[str | bytes]:
         stop_event = threading.Event()
         _register_stream_stop_event(stop_event)
         idx = 0
@@ -1677,30 +1742,65 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
                     stitched = stitcher.process(audio)
                     if stitched.size:
                         wav_bytes = _audio_to_wav_bytes(stitched, engine.sample_rate)
-                        payload = base64.b64encode(wav_bytes).decode("ascii")
-                        yield json.dumps(
-                            {
-                                "chunk_index": idx,
-                                "audio_base64": payload,
-                                "sample_rate": engine.sample_rate,
-                            }
-                        ) + "\n"
+                        duration_sec = (
+                            float(len(stitched) / engine.sample_rate) if stitched.size else 0.0
+                        )
+                        if binary_transport:
+                            yield _pack_binary_stream_packet(
+                                {
+                                    "event": "chunk",
+                                    "chunk_index": idx,
+                                    "sample_rate": engine.sample_rate,
+                                    "duration_sec": round(duration_sec, 6),
+                                    "audio_bytes_len": len(wav_bytes),
+                                    "frame_lengths": [],
+                                },
+                                wav_bytes,
+                            )
+                        else:
+                            payload = base64.b64encode(wav_bytes).decode("ascii")
+                            yield json.dumps(
+                                {
+                                    "chunk_index": idx,
+                                    "audio_base64": payload,
+                                    "sample_rate": engine.sample_rate,
+                                    "duration_sec": round(duration_sec, 6),
+                                }
+                            ) + "\n"
                         idx += 1
             tail = stitcher.flush()
             if tail.size:
                 wav_bytes = _audio_to_wav_bytes(tail, engine.sample_rate)
-                payload = base64.b64encode(wav_bytes).decode("ascii")
-                yield json.dumps(
-                    {
-                        "chunk_index": idx,
-                        "audio_base64": payload,
-                        "sample_rate": engine.sample_rate,
-                    }
-                ) + "\n"
+                duration_sec = float(len(tail) / engine.sample_rate) if tail.size else 0.0
+                if binary_transport:
+                    yield _pack_binary_stream_packet(
+                        {
+                            "event": "chunk",
+                            "chunk_index": idx,
+                            "sample_rate": engine.sample_rate,
+                            "duration_sec": round(duration_sec, 6),
+                            "audio_bytes_len": len(wav_bytes),
+                            "frame_lengths": [],
+                        },
+                        wav_bytes,
+                    )
+                else:
+                    payload = base64.b64encode(wav_bytes).decode("ascii")
+                    yield json.dumps(
+                        {
+                            "chunk_index": idx,
+                            "audio_base64": payload,
+                            "sample_rate": engine.sample_rate,
+                            "duration_sec": round(duration_sec, 6),
+                        }
+                    ) + "\n"
                 idx += 1
         except Exception:
             logger.exception("Voice stream failed")
-            yield json.dumps({"event": "error", "detail": traceback.format_exc()}) + "\n"
+            if binary_transport:
+                yield _pack_binary_stream_packet({"event": "error", "detail": traceback.format_exc()})
+            else:
+                yield json.dumps({"event": "error", "detail": traceback.format_exc()}) + "\n"
             return
         finally:
             stop_event.set()
@@ -1711,9 +1811,21 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
             _unregister_stream_stop_event(stop_event)
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-        yield json.dumps({"event": "done", "inference_ms": round(elapsed_ms, 2)}) + "\n"
+        if binary_transport:
+            yield _pack_binary_stream_packet(
+                {"event": "done", "inference_ms": round(elapsed_ms, 2)}
+            )
+        else:
+            yield json.dumps({"event": "done", "inference_ms": round(elapsed_ms, 2)}) + "\n"
 
-    return StreamingResponse(_generator(), media_type="application/x-ndjson")
+    return StreamingResponse(
+        _generator(),
+        media_type=(
+            PIXELHOLO_BINARY_STREAM_MEDIA_TYPE
+            if binary_transport
+            else "application/x-ndjson"
+        ),
+    )
 
 
 class GenerateRequest(BaseModel):
@@ -2960,7 +3072,7 @@ def generate(req: GenerateRequest):
 
 
 @app.post("/chat")
-def chat(req: GenerateRequest):
+def chat(req: GenerateRequest, request: Request):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Text is empty.")
     llm = _get_llm_service()
@@ -2983,16 +3095,26 @@ def chat(req: GenerateRequest):
     if req.smart_trim_pad_ms is None:
         req.smart_trim_pad_ms = 0.0
     profile_type = req.profile_type or PROFILE_TYPE_VOICE
+    binary_transport = _binary_stream_requested(request)
     if profile_type == PROFILE_TYPE_AVATAR or req.avatar_profile:
-        return _stream_avatar_from_text_iter(req, llm_stream)
-    return _stream_voice_from_text_iter(req, llm_stream)
+        return _stream_avatar_from_text_iter(req, llm_stream, binary_transport=binary_transport)
+    return _stream_voice_from_text_iter(req, llm_stream, binary_transport=binary_transport)
 
 
 @app.post("/speak")
-def speak(req: GenerateRequest):
+def speak(req: GenerateRequest, request: Request):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Text is empty.")
     profile_type = req.profile_type or PROFILE_TYPE_VOICE
+    binary_transport = _binary_stream_requested(request)
     if profile_type == PROFILE_TYPE_AVATAR or req.avatar_profile:
-        return _stream_avatar_from_text_iter(req, iter([req.text]))
-    return _stream_voice_from_text_iter(req, iter([req.text]))
+        return _stream_avatar_from_text_iter(
+            req,
+            iter([req.text]),
+            binary_transport=binary_transport,
+        )
+    return _stream_voice_from_text_iter(
+        req,
+        iter([req.text]),
+        binary_transport=binary_transport,
+    )

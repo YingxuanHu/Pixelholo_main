@@ -16,6 +16,7 @@ final class AvatarPlayer: ObservableObject {
     private var frameTimeline: [UIImage] = []
     private var streamFPS: Double = 25
     private var trimmedFrameCount = 0
+    private var lastPresentedAbsoluteFrameIndex = -1
     private var connectedFormatSignature: String?
 
     init() {
@@ -37,6 +38,7 @@ final class AvatarPlayer: ObservableObject {
             try ensureEngineReady(for: chunk.audioBuffer.format)
             if let fps = chunk.fps, fps > 0 {
                 streamFPS = fps
+                updateDisplayLinkRateIfNeeded()
             }
             if !chunk.frames.isEmpty {
                 frameTimeline.append(contentsOf: chunk.frames)
@@ -60,6 +62,7 @@ final class AvatarPlayer: ObservableObject {
         }
         frameTimeline.removeAll()
         trimmedFrameCount = 0
+        lastPresentedAbsoluteFrameIndex = -1
         currentFrame = nil
         isPlaying = false
         errorMessage = nil
@@ -85,6 +88,7 @@ final class AvatarPlayer: ObservableObject {
     private func startDisplayLinkIfNeeded() {
         guard displayLink == nil else { return }
         let link = CADisplayLink(target: self, selector: #selector(handleDisplayLink))
+        applyPreferredRate(to: link)
         link.add(to: .main, forMode: .common)
         displayLink = link
     }
@@ -106,9 +110,15 @@ final class AvatarPlayer: ObservableObject {
         let localFrameIndex = absoluteFrameIndex - trimmedFrameCount
 
         if localFrameIndex >= 0 && localFrameIndex < frameTimeline.count {
-            currentFrame = frameTimeline[localFrameIndex]
+            if absoluteFrameIndex != lastPresentedAbsoluteFrameIndex {
+                currentFrame = frameTimeline[localFrameIndex]
+                lastPresentedAbsoluteFrameIndex = absoluteFrameIndex
+            }
         } else if localFrameIndex >= frameTimeline.count, let last = frameTimeline.last {
-            currentFrame = last
+            if absoluteFrameIndex != lastPresentedAbsoluteFrameIndex {
+                currentFrame = last
+                lastPresentedAbsoluteFrameIndex = absoluteFrameIndex
+            }
         }
 
         trimFramesIfNeeded(currentFrameIndex: absoluteFrameIndex)
@@ -128,5 +138,24 @@ final class AvatarPlayer: ObservableObject {
 
         frameTimeline.removeFirst(removableCount)
         trimmedFrameCount += removableCount
+    }
+
+    private func updateDisplayLinkRateIfNeeded() {
+        guard let displayLink else { return }
+        applyPreferredRate(to: displayLink)
+    }
+
+    private func applyPreferredRate(to displayLink: CADisplayLink) {
+        let clampedRate = max(15, min(60, Int(streamFPS.rounded())))
+        if #available(iOS 15.0, *) {
+            let rate = Float(clampedRate)
+            displayLink.preferredFrameRateRange = CAFrameRateRange(
+                minimum: rate,
+                maximum: rate,
+                preferred: rate
+            )
+        } else {
+            displayLink.preferredFramesPerSecond = clampedRate
+        }
     }
 }
