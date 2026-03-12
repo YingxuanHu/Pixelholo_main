@@ -18,6 +18,36 @@ class LLMService:
         self.client = Groq(api_key=api_key)
         self.system_prompt = system_prompt
         self.history: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        self._stream_warmed = False
+
+    @property
+    def stream_warmed(self) -> bool:
+        return self._stream_warmed
+
+    def warmup(self) -> bool:
+        if self._stream_warmed:
+            return False
+
+        try:
+            stream = self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": "Reply with exactly one short word."},
+                ],
+                stream=True,
+                temperature=0.7,
+            )
+            for chunk in stream:
+                token = chunk.choices[0].delta.content
+                if token:
+                    break
+            self._stream_warmed = True
+            logger.info("component=llm op=warmup status=ok")
+            return True
+        except Exception:
+            logger.exception("component=llm op=warmup status=error")
+            raise
 
     def stream_response(
         self,

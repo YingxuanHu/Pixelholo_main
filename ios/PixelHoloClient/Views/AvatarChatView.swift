@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 struct AvatarChatView: View {
     private let contentHorizontalInset: CGFloat = 14
@@ -12,7 +15,6 @@ struct AvatarChatView: View {
     @State private var speechPressIsActive = false
     @State private var showsSessionOptions = false
     @State private var showsDiagnostics = false
-    @FocusState private var inputFocused: Bool
 
     var body: some View {
         AppScreen {
@@ -57,6 +59,10 @@ struct AvatarChatView: View {
             viewModel.applySelectedProfile(appSession.selectedProfile)
             viewModel.prepareSelectedProfileWarmup(baseURL: serverConfig.baseURL)
         }
+        .onChange(of: viewModel.isStreaming) { _, isStreaming in
+            guard !isStreaming else { return }
+            viewModel.prepareSelectedProfileWarmup(baseURL: serverConfig.baseURL)
+        }
         .onChange(of: speech.transcript) { _, newValue in
             guard speech.isRecording || speech.isStarting else { return }
             inputText = newValue
@@ -97,9 +103,10 @@ struct AvatarChatView: View {
         let stageHeight = viewModel.profileType == .avatar
             ? stageWidth * (4.0 / 3.0)
             : stageWidth * (9.0 / 16.0)
+        let stageShape = RoundedRectangle(cornerRadius: previewCornerRadius, style: .continuous)
 
         return ZStack {
-            RoundedRectangle(cornerRadius: previewCornerRadius, style: .continuous)
+            stageShape
                 .fill(
                     LinearGradient(
                         colors: [
@@ -111,13 +118,21 @@ struct AvatarChatView: View {
                     )
                 )
 
-            AvatarFrameView(player: viewModel.player, cornerRadius: previewCornerRadius)
-
-            previewStatusOverlay
+            PreviewStageContent(
+                player: viewModel.player,
+                cornerRadius: previewCornerRadius,
+                shouldDisplayFrame: !viewModel.isStreamingDifferentProfile,
+                isWarmingCurrentProfile: viewModel.isWarmingCurrentProfile,
+                isAwaitingFirstChunkForCurrentProfile: viewModel.isAwaitingFirstChunkForCurrentProfile,
+                previewStatusPrimaryColor: previewStatusPrimaryColor,
+                previewStatusSecondaryColor: previewStatusSecondaryColor,
+                stageEmptyTitle: stageEmptyTitle,
+                stageEmptySubtitle: stageEmptySubtitle
+            )
         }
         .frame(width: stageWidth, height: stageHeight)
         .frame(maxWidth: .infinity, alignment: .center)
-        .clipShape(RoundedRectangle(cornerRadius: previewCornerRadius, style: .continuous))
+        .clipShape(stageShape)
         .overlay(alignment: .topLeading) {
             if let banner = currentBanner {
                 AppBanner(text: banner.text, tone: banner.tone)
@@ -127,65 +142,24 @@ struct AvatarChatView: View {
         }
     }
 
-    @ViewBuilder
-    private var previewStatusOverlay: some View {
-        if viewModel.player.currentFrame != nil {
-            EmptyView()
-        } else if viewModel.isWarmingUp && !viewModel.isStreaming {
-            ZStack {
-                Rectangle()
-                    .fill(Color.black.opacity(0.18))
+    private var previewStatusPrimaryColor: Color {
+        viewModel.isWarmingCurrentProfile ? .white : .primary
+    }
 
-                VStack(spacing: 12) {
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .tint(.white)
-                        .scaleEffect(1.15)
-
-                    Text("Preparing \(viewModel.profileName.isEmpty ? "profile" : viewModel.profileName)")
-                        .font(.headline.weight(.semibold))
-                        .foregroundStyle(.white)
-
-                    Text("Warming the backend so the first response starts at normal speed.")
-                        .font(.footnote)
-                        .multilineTextAlignment(.center)
-                        .foregroundStyle(.white.opacity(0.9))
-                        .padding(.horizontal, 28)
-                }
-                .padding(.horizontal, 24)
-            }
-        } else {
-            VStack {
-                Spacer()
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(stageEmptyTitle)
-                        .font(.headline.weight(.semibold))
-                        .foregroundStyle(.primary)
-
-                    Text(stageEmptySubtitle)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: 320, alignment: .leading)
-                .padding(.horizontal, 18)
-                .padding(.vertical, 16)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
-                )
-                .padding(.horizontal, 20)
-                .padding(.bottom, 20)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-        }
+    private var previewStatusSecondaryColor: Color {
+        viewModel.isWarmingCurrentProfile ? .white.opacity(0.9) : .secondary
     }
 
     private var stageEmptyTitle: String {
-        if viewModel.isStreaming {
-            return "Generating the first chunk"
+        if viewModel.isWarmingCurrentProfile {
+            let trimmed = viewModel.profileName.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? "Preparing profile" : "Preparing \(trimmed)"
+        }
+        if viewModel.isAwaitingFirstChunkForCurrentProfile {
+            return "Generating"
+        }
+        if viewModel.isStreamingDifferentProfile {
+            return "Another response is playing"
         }
         if viewModel.profileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return "Pick a profile to begin"
@@ -194,8 +168,14 @@ struct AvatarChatView: View {
     }
 
     private var stageEmptySubtitle: String {
-        if viewModel.isStreaming {
-            return "Audio and avatar frames will appear here as soon as the stream starts."
+        if viewModel.isWarmingCurrentProfile {
+            return "Warming the backend so the first response starts at normal speed."
+        }
+        if viewModel.isAwaitingFirstChunkForCurrentProfile {
+            return "The response is starting. Audio and avatar frames will appear here shortly."
+        }
+        if viewModel.isStreamingDifferentProfile {
+            return "The current audio belongs to a different profile. Stop it or wait for it to finish before switching."
         }
         if viewModel.profileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return "Select a profile from Profiles or enter one in Session Options."
@@ -205,25 +185,13 @@ struct AvatarChatView: View {
 
     private func composerDock(contentWidth: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 14) {
-            TextField(
-                "",
+            FixedTwoLinePromptField(
                 text: $inputText,
-                prompt: Text(speech.isRecording ? "Listening..." : "Type something like: Introduce yourself in one sentence.")
-                    .foregroundStyle(.secondary),
-                axis: .vertical
+                placeholder: speech.isRecording
+                    ? "Listening..."
+                    : "Type something like: Introduce yourself in one sentence."
             )
-            .focused($inputFocused)
-            .lineLimit(2)
-            .textInputAutocapitalization(.sentences)
-            .autocorrectionDisabled(false)
-            .font(.body)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 14)
             .frame(minHeight: 72, alignment: .topLeading)
-            .background(
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(Color(uiColor: .tertiarySystemBackground))
-            )
 
             holdToTalkControl
 
@@ -233,13 +201,13 @@ struct AvatarChatView: View {
                     viewModel.startStreaming(baseURL: serverConfig.baseURL, text: inputText)
                 } label: {
                     AppPrimaryActionLabel(
-                        title: viewModel.isWarmingUp && !viewModel.isStreaming ? "Preparing..." : (viewModel.isStreaming ? "Streaming..." : "Send"),
+                        title: viewModel.isWarmingCurrentProfile ? "Preparing..." : (viewModel.isStreaming ? "Streaming..." : "Send"),
                         icon: "paperplane.fill"
                     )
                     .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(viewModel.isStreaming || (viewModel.isWarmingUp && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                .disabled(viewModel.isStreaming || (viewModel.isWarmingCurrentProfile && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
                 .frame(maxWidth: .infinity)
 
                 Button {
@@ -262,19 +230,6 @@ struct AvatarChatView: View {
         .padding(.top, 10)
         .padding(.bottom, 12)
         .frame(width: contentWidth, alignment: .top)
-        .background(
-            UnevenRoundedRectangle(
-                cornerRadii: .init(
-                    topLeading: 28,
-                    bottomLeading: 0,
-                    bottomTrailing: 0,
-                    topTrailing: 28
-                ),
-                style: .continuous
-            )
-            .fill(Color(uiColor: .systemBackground))
-            .shadow(color: Color.black.opacity(0.08), radius: 20, x: 0, y: -8)
-        )
         .frame(maxWidth: .infinity, alignment: .center)
     }
 
@@ -411,7 +366,6 @@ struct AvatarChatView: View {
     }
 
     private func dismissKeyboard() {
-        inputFocused = false
 #if canImport(UIKit)
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
 #endif
@@ -436,6 +390,57 @@ struct AvatarChatView: View {
                     finishSpeechAndSend()
                 }
         )
+    }
+}
+
+private struct PreviewStageContent: View {
+    @ObservedObject var player: AvatarPlayer
+    let cornerRadius: CGFloat
+    let shouldDisplayFrame: Bool
+    let isWarmingCurrentProfile: Bool
+    let isAwaitingFirstChunkForCurrentProfile: Bool
+    let previewStatusPrimaryColor: Color
+    let previewStatusSecondaryColor: Color
+    let stageEmptyTitle: String
+    let stageEmptySubtitle: String
+
+    var body: some View {
+        ZStack {
+            if shouldDisplayFrame, player.currentFrame != nil {
+                AvatarFrameView(player: player, cornerRadius: cornerRadius)
+            }
+
+            if !shouldDisplayFrame || player.currentFrame == nil {
+                ZStack(alignment: .center) {
+                    if isWarmingCurrentProfile {
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .fill(Color.black.opacity(0.18))
+                    }
+
+                    VStack(spacing: 12) {
+                        if isWarmingCurrentProfile || isAwaitingFirstChunkForCurrentProfile {
+                            ProgressView()
+                                .progressViewStyle(.circular)
+                                .tint(previewStatusPrimaryColor)
+                                .scaleEffect(1.15)
+                        }
+
+                        Text(stageEmptyTitle)
+                            .font(.headline.weight(.semibold))
+                            .foregroundStyle(previewStatusPrimaryColor)
+
+                        Text(stageEmptySubtitle)
+                            .font(.footnote)
+                            .multilineTextAlignment(.center)
+                            .foregroundStyle(previewStatusSecondaryColor)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 28)
+                    }
+                    .padding(.horizontal, 24)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+            }
+        }
     }
 }
 
@@ -472,3 +477,99 @@ private struct HoldToTalkControl: View {
         .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 }
+
+private struct FixedTwoLinePromptField: View {
+    @Binding var text: String
+    let placeholder: String
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color(uiColor: .tertiarySystemBackground))
+
+            AutoScrollingPromptTextView(text: $text)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+
+            if text.isEmpty {
+                Text(placeholder)
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 17)
+                    .padding(.vertical, 15)
+                    .allowsHitTesting(false)
+            }
+        }
+        .frame(height: 72)
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+}
+
+#if canImport(UIKit)
+private struct AutoScrollingPromptTextView: UIViewRepresentable {
+    @Binding var text: String
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text)
+    }
+
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView()
+        textView.delegate = context.coordinator
+        textView.backgroundColor = .clear
+        textView.font = UIFont.preferredFont(forTextStyle: .body)
+        textView.adjustsFontForContentSizeCategory = true
+        textView.textColor = UIColor.label
+        textView.textContainerInset = .zero
+        textView.textContainer.lineFragmentPadding = 0
+        textView.textContainer.maximumNumberOfLines = 2
+        textView.textContainer.lineBreakMode = .byWordWrapping
+        textView.isScrollEnabled = true
+        textView.showsVerticalScrollIndicator = false
+        textView.showsHorizontalScrollIndicator = false
+        textView.keyboardDismissMode = .interactive
+        textView.autocapitalizationType = .sentences
+        textView.autocorrectionType = .yes
+        textView.returnKeyType = .default
+        textView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        textView.text = text
+        return textView
+    }
+
+    func updateUIView(_ textView: UITextView, context: Context) {
+        if textView.text != text {
+            context.coordinator.isProgrammaticUpdate = true
+            textView.text = text
+            context.coordinator.isProgrammaticUpdate = false
+        }
+        scrollToLatestVisibleText(in: textView)
+    }
+
+    private func scrollToLatestVisibleText(in textView: UITextView) {
+        guard !textView.text.isEmpty else {
+            textView.setContentOffset(.zero, animated: false)
+            return
+        }
+        let lastCharacter = NSRange(location: max(textView.text.utf16.count - 1, 0), length: 1)
+        textView.layoutIfNeeded()
+        textView.scrollRangeToVisible(lastCharacter)
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        @Binding var text: String
+        var isProgrammaticUpdate = false
+
+        init(text: Binding<String>) {
+            _text = text
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            guard !isProgrammaticUpdate else { return }
+            text = textView.text
+            guard !textView.text.isEmpty else { return }
+            let lastCharacter = NSRange(location: max(textView.text.utf16.count - 1, 0), length: 1)
+            textView.scrollRangeToVisible(lastCharacter)
+        }
+    }
+}
+#endif

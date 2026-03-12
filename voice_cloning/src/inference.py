@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import warnings
 from pathlib import Path
 from typing import Iterator, Protocol
@@ -45,6 +46,7 @@ SILENCE_CULLING_ENABLED = True
 SILENCE_RMS_THRESHOLD = 0.003
 
 _AI_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+_RUNTIME_INSTANCE_ID = uuid.uuid4().hex
 
 _llm_service: LLMService | None = None
 
@@ -859,9 +861,14 @@ def _rewrite_profile_refs_in_dir(
 
 def _drop_warmup_cache_for_profile(profile_name: str, profile_type: str) -> None:
     ptype = _normalize_profile_type(profile_type)
-    global _warmed_tts_profiles, _warmed_lipsync_profiles
+    global _warmed_tts_profiles, _warmed_tts_engine_keys, _warmed_lipsync_profiles
     _warmed_tts_profiles = {
         key for key in _warmed_tts_profiles if not (key[0] == profile_name and key[1] == ptype)
+    }
+    _warmed_tts_engine_keys = {
+        key: value
+        for key, value in _warmed_tts_engine_keys.items()
+        if not (key[0] == profile_name and key[1] == ptype)
     }
     _warmed_lipsync_profiles = {
         key
@@ -2074,6 +2081,7 @@ class WarmupRequest(BaseModel):
     profile_type: str | None = None
     lipsync_backend: str | None = None
     force: bool = False
+    include_llm: bool = False
 
 
 class ProfileRenameRequest(BaseModel):
@@ -2513,6 +2521,17 @@ def _evict_idle_tts_engines(keep_key: tuple[str, str] | None = None) -> None:
         if stale_engine is None:
             continue
         _dispose_tts_engine(stale_engine)
+        warmed = globals().get("_warmed_tts_profiles")
+        warmed_engine_keys = globals().get("_warmed_tts_engine_keys")
+        if isinstance(warmed, set) and isinstance(warmed_engine_keys, dict):
+            stale_profiles = [
+                profile_key
+                for profile_key, mapped_engine_key in list(warmed_engine_keys.items())
+                if mapped_engine_key == engine_key
+            ]
+            for profile_key in stale_profiles:
+                warmed.discard(profile_key)
+                warmed_engine_keys.pop(profile_key, None)
         logger.info(
             "component=tts op=engine_evict status=ok model=%s config=%s",
             Path(engine_key[0]).name,
@@ -2696,18 +2715,57 @@ def _start_runtime_cleanup_thread() -> None:
     thread.start()
 
 
-def _warmup_engine(model_path: Path, config_path: Path) -> None:
+def _tts_engine_is_hot(
+    model_path: Path,
+    config_path: Path,
+    ref_wav_path: Path | None,
+) -> bool:
+    if ref_wav_path is None:
+        return False
+    key = (str(model_path), str(config_path))
+    with _engine_lock:
+        engine = _engines.get(key)
+        if engine is None:
+            return False
+        return str(ref_wav_path) in getattr(engine, "style_cache", {})
+
+
+def _lipsync_profile_is_hot(
+    profile: str,
+    profile_type: str,
+    requested_backend: str | None = None,
+) -> bool:
+    backend = _resolve_lipsync_backend(requested_backend)
+    cache_dir = avatar_cache_dir(profile, profile_type)
+    with _lipsync_lock:
+        engine = _lipsync_engines.get(backend)
+        if engine is None:
+            return False
+        if getattr(engine, "_loaded_cache_dir", None) != cache_dir:
+            return False
+        if getattr(engine, "frames", None) is None:
+            return False
+        if engine.__class__.__name__ == "MuseTalkBridge" and not getattr(engine, "_latents", None):
+            return False
+        if engine.__class__.__name__ == "LipSyncBridge" and getattr(engine, "coords", None) is None:
+            return False
+        return True
+
+
+def _warmup_engine(
+    model_path: Path,
+    config_path: Path,
+    speaker: str | None = None,
+    profile_type: str | None = None,
+) -> tuple[bool, np.ndarray | None, int | None]:
     if os.getenv("STYLE_TTS2_DISABLE_WARMUP") == "1":
-        return
-    profile = _load_profile_defaults(model_path)
-    ref_path = os.getenv("STYLE_TTS2_REF_WAV") or profile.get("ref_wav_path")
-    if not ref_path:
+        return False, None, None
+    profile = _load_profile_defaults_for_speaker(model_path, speaker, profile_type)
+    try:
+        ref_wav = _resolve_ref_wav(None, speaker, profile_type, model_path)
+    except HTTPException:
         print("Warmup skipped: no reference wav available.")
-        return
-    ref_wav = Path(ref_path).expanduser()
-    if not ref_wav.exists():
-        print(f"Warmup skipped: ref wav not found: {ref_wav}")
-        return
+        return False, None, None
 
     try:
         params = {
@@ -2717,26 +2775,36 @@ def _warmup_engine(model_path: Path, config_path: Path) -> None:
             "embedding_scale": profile.get("embedding_scale", DEFAULT_EMBEDDING_SCALE),
             "f0_scale": profile.get("f0_scale", DEFAULT_F0_SCALE),
         }
-        text = os.getenv("STYLE_TTS2_WARMUP_TEXT", "warmup")
+        text = os.getenv(
+            "STYLE_TTS2_WARMUP_TEXT",
+            "This is a quick warmup for streaming speech.",
+        )
         with _acquire_engine(model_path, config_path) as engine:
-            engine.generate(
-                text=text,
-                ref_wav_path=ref_wav,
-                alpha=float(params["alpha"]),
-                beta=float(params["beta"]),
-                diffusion_steps=int(params["diffusion_steps"]),
-                embedding_scale=float(params["embedding_scale"]),
-                f0_scale=float(params["f0_scale"]),
-                phonemizer_lang=profile.get("phonemizer_lang"),
-                lexicon=None,
-                seed=1234,
+            future = _AI_EXECUTOR.submit(
+                _generate_with_seed,
+                engine,
+                1234,
+                text,
+                ref_wav,
+                float(params["alpha"]),
+                float(params["beta"]),
+                int(params["diffusion_steps"]),
+                float(params["embedding_scale"]),
+                float(params["f0_scale"]),
+                profile.get("phonemizer_lang"),
+                None,
+                profile_type == PROFILE_TYPE_AVATAR,
             )
+            audio = future.result()
         print("Warmup completed.")
+        return True, audio, engine.sample_rate
     except Exception as exc:
         print(f"Warmup failed: {exc}")
+        raise
 
 
 _warmed_tts_profiles: set[tuple[str, str]] = set()
+_warmed_tts_engine_keys: dict[tuple[str, str], tuple[str, str]] = {}
 _warmed_lipsync_profiles: set[tuple[str, str, str]] = set()
 
 
@@ -2744,14 +2812,17 @@ def _warmup_lipsync(
     profile: str,
     profile_type: str,
     requested_backend: str | None = None,
+    warmup_audio_16k: np.ndarray | None = None,
 ) -> str:
     backend = _resolve_lipsync_backend(requested_backend)
     try:
         with _acquire_lipsync_engine(backend) as lipsync:
             with _lipsync_lock:
                 lipsync.load_profile(profile, profile_type)
-                dummy = np.zeros(int(0.4 * 16000), dtype=np.float32)
-                lipsync.sync_chunk(dummy, fps=lipsync.fps)
+                audio_16k = warmup_audio_16k
+                if audio_16k is None or audio_16k.size == 0:
+                    audio_16k = np.zeros(int(0.45 * 16000), dtype=np.float32)
+                lipsync.sync_chunk(audio_16k.astype(np.float32, copy=False), fps=lipsync.fps)
         print(f"Lipsync warmup completed ({backend}).")
         return backend
     except Exception as exc:
@@ -2764,38 +2835,90 @@ def _warmup_profile(
     profile_type: str,
     requested_backend: str | None = None,
     force: bool = False,
-) -> str | None:
+) -> dict[str, object]:
     with _warmup_profile_lock:
         tts_key = (profile, profile_type)
-        if force or tts_key not in _warmed_tts_profiles:
-            try:
-                model_path = _resolve_model_path(None, profile, profile_type)
-                config_path = _resolve_config_path(model_path, None, profile, profile_type)
-                _warmup_engine(model_path, config_path)
+        warmup_audio_16k: np.ndarray | None = None
+        warmed_tts = False
+        tts_hot_before = False
+        resolved_backend: str | None = None
+        lipsync_hot_before = False
+        warmed_lipsync = False
+        try:
+            model_path = _resolve_model_path(None, profile, profile_type)
+            config_path = _resolve_config_path(model_path, None, profile, profile_type)
+            ref_wav_path = _resolve_ref_wav(None, profile, profile_type, model_path)
+            tts_hot = _tts_engine_is_hot(model_path, config_path, ref_wav_path)
+            tts_hot_before = tts_hot
+            if force or tts_key not in _warmed_tts_profiles or not tts_hot:
+                warmed, warmup_audio, sample_rate = _warmup_engine(
+                    model_path,
+                    config_path,
+                    speaker=profile,
+                    profile_type=profile_type,
+                )
+                if warmed:
+                    warmed_tts = True
+                    _warmed_tts_profiles.add(tts_key)
+                    _warmed_tts_engine_keys[tts_key] = (str(model_path), str(config_path))
+                    if warmup_audio is not None and warmup_audio.size > 0:
+                        if sample_rate and sample_rate != 16000:
+                            warmup_audio_16k = librosa.resample(
+                                warmup_audio, orig_sr=sample_rate, target_sr=16000
+                            ).astype(np.float32, copy=False)
+                        else:
+                            warmup_audio_16k = warmup_audio.astype(np.float32, copy=False)
+                else:
+                    _warmed_tts_profiles.discard(tts_key)
+                    _warmed_tts_engine_keys.pop(tts_key, None)
+            else:
                 _warmed_tts_profiles.add(tts_key)
-            except HTTPException:
-                logger.info(
-                    "component=backend op=warmup_profile skip=tts profile=%s profile_type=%s reason=model_unset",
-                    profile,
-                    profile_type,
-                )
-            except Exception:
-                logger.exception(
-                    "component=backend op=warmup_profile skip=tts profile=%s profile_type=%s reason=error",
-                    profile,
-                    profile_type,
-                )
+                _warmed_tts_engine_keys[tts_key] = (str(model_path), str(config_path))
+        except HTTPException:
+            logger.info(
+                "component=backend op=warmup_profile skip=tts profile=%s profile_type=%s reason=model_unset",
+                profile,
+                profile_type,
+            )
+        except Exception:
+            logger.exception(
+                "component=backend op=warmup_profile skip=tts profile=%s profile_type=%s reason=error",
+                profile,
+                profile_type,
+            )
 
         warmed_backend: str | None = None
         if profile_type == PROFILE_TYPE_AVATAR:
             backend = _resolve_lipsync_backend(requested_backend)
+            resolved_backend = backend
             lipsync_key = (profile, profile_type, backend)
-            if force or lipsync_key not in _warmed_lipsync_profiles:
-                warmed_backend = _warmup_lipsync(profile, profile_type, backend)
+            lipsync_hot_before = _lipsync_profile_is_hot(
+                profile,
+                profile_type,
+                backend,
+            )
+            if force or lipsync_key not in _warmed_lipsync_profiles or not lipsync_hot_before:
+                warmed_backend = _warmup_lipsync(
+                    profile,
+                    profile_type,
+                    backend,
+                    warmup_audio_16k=warmup_audio_16k,
+                )
+                warmed_lipsync = True
                 _warmed_lipsync_profiles.add(lipsync_key)
             else:
                 warmed_backend = backend
-        return warmed_backend
+        return {
+            "lipsync_backend": warmed_backend,
+            "tts_hot_before": tts_hot_before,
+            "tts_warmed": warmed_tts,
+            "lipsync_hot_before": lipsync_hot_before,
+            "lipsync_warmed": warmed_lipsync,
+            "runtime_instance_id": _RUNTIME_INSTANCE_ID,
+            "profile": profile,
+            "profile_type": profile_type,
+            "resolved_lipsync_backend": resolved_backend or warmed_backend,
+        }
 
 
 @app.on_event("startup")
@@ -2819,6 +2942,7 @@ def _startup() -> None:
 def lipsync_backend_status():
     return {
         "backend": _runtime_lipsync_backend(),
+        "runtime_instance_id": _RUNTIME_INSTANCE_ID,
     }
 
 
@@ -2828,17 +2952,54 @@ def warmup(req: WarmupRequest):
     if not profile:
         raise HTTPException(status_code=400, detail="profile is required")
     profile_type = req.profile_type or PROFILE_TYPE_VOICE
-    warmed_backend = _warmup_profile(
+    started = time.perf_counter()
+    warmup_state = _warmup_profile(
         profile,
         profile_type,
         requested_backend=req.lipsync_backend,
         force=bool(req.force),
     )
+    llm_hot_before = None
+    llm_warmed = False
+    if req.include_llm:
+        try:
+            llm = _get_llm_service()
+            llm_hot_before = llm.stream_warmed
+            if not llm_hot_before or bool(req.force):
+                llm_warmed = llm.warmup()
+        except Exception:
+            logger.exception(
+                "component=backend op=warmup_llm status=error profile=%s profile_type=%s",
+                profile,
+                profile_type,
+            )
+    elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
+    logger.info(
+        "component=backend op=warmup status=ok profile=%s profile_type=%s runtime=%s tts_hot_before=%s tts_warmed=%s lipsync_hot_before=%s lipsync_warmed=%s llm_hot_before=%s llm_warmed=%s elapsed_ms=%s",
+        profile,
+        profile_type,
+        warmup_state.get("runtime_instance_id"),
+        warmup_state.get("tts_hot_before"),
+        warmup_state.get("tts_warmed"),
+        warmup_state.get("lipsync_hot_before"),
+        warmup_state.get("lipsync_warmed"),
+        llm_hot_before,
+        llm_warmed,
+        elapsed_ms,
+    )
     return {
         "status": "ok",
         "profile": profile,
         "profile_type": profile_type,
-        "lipsync_backend": warmed_backend,
+        "lipsync_backend": warmup_state.get("lipsync_backend"),
+        "runtime_instance_id": warmup_state.get("runtime_instance_id"),
+        "tts_hot_before": warmup_state.get("tts_hot_before"),
+        "tts_warmed": warmup_state.get("tts_warmed"),
+        "lipsync_hot_before": warmup_state.get("lipsync_hot_before"),
+        "lipsync_warmed": warmup_state.get("lipsync_warmed"),
+        "llm_hot_before": llm_hot_before,
+        "llm_warmed": llm_warmed,
+        "elapsed_ms": elapsed_ms,
     }
 
 

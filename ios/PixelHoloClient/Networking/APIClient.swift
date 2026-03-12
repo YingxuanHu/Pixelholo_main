@@ -227,7 +227,7 @@ final class APIClient {
         let endpointURL = baseURL.appendingPathComponent("warmup")
         var request = URLRequest(url: endpointURL)
         request.httpMethod = "POST"
-        request.timeoutInterval = 60
+        request.timeoutInterval = 190
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(warmupRequest)
 

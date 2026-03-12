@@ -4,6 +4,7 @@ import Foundation
 @MainActor
 final class AvatarChatViewModel: ObservableObject {
     private static let maxLogLines = 120
+    private static let warmupTimeoutSeconds: UInt64 = 180
 
     private enum MobileAvatarStreamProfile {
         static let wav2lipFPS = 20.0
@@ -29,15 +30,32 @@ final class AvatarChatViewModel: ObservableObject {
     @Published var isWarmingUp = false
     @Published var logs: [ConsoleLogLine] = []
     @Published var errorMessage: String?
+    @Published private(set) var warmingProfileStateKey: String?
+    @Published private(set) var activeStreamProfileStateKey: String?
+    @Published private(set) var awaitingFirstChunkProfileStateKey: String?
 
     let player: AvatarPlayer
 
     private let streamingClient: StreamingClient
     private let apiClient: APIClient
     private var streamTask: Task<Void, Never>?
+    private var streamTaskID: UUID?
     private var warmupTask: Task<Void, Never>?
+    private var warmupTaskID: UUID?
     private var activeWarmupKey: String?
-    private var warmedProfileKeys: Set<String> = []
+    private var preparedWarmupKey: String?
+    private var preparedRuntimeInstanceID: String?
+
+    private enum WarmupFailure: LocalizedError {
+        case timedOut(profile: String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .timedOut(profile):
+                return "Preparing \(profile) timed out. The backend may still be building cache data for this profile."
+            }
+        }
+    }
 
     init(
         initialProfile: ProfileInfo? = nil,
@@ -56,8 +74,27 @@ final class AvatarChatViewModel: ObservableObject {
 
     func applySelectedProfile(_ profile: ProfileInfo?) {
         guard let profile else { return }
+        let previousStateKey = currentProfileStateKey
         profileName = profile.name
         profileType = profile.profileType
+        let nextStateKey = currentProfileStateKey
+        guard nextStateKey != previousStateKey else { return }
+
+        errorMessage = nil
+
+        if !isStreaming {
+            player.stop()
+            activeStreamProfileStateKey = nil
+            awaitingFirstChunkProfileStateKey = nil
+        }
+
+        if warmingProfileStateKey != nextStateKey {
+            warmupTask?.cancel()
+            warmupTask = nil
+            activeWarmupKey = nil
+            warmingProfileStateKey = nil
+            isWarmingUp = false
+        }
     }
 
     func prepareSelectedProfileWarmup(baseURL: URL?) {
@@ -66,8 +103,16 @@ final class AvatarChatViewModel: ObservableObject {
         let cleanedProfile = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanedProfile.isEmpty else { return }
 
-        let key = warmupKey(profile: cleanedProfile, profileType: profileType, backend: effectiveWarmupBackend)
-        if warmedProfileKeys.contains(key) || activeWarmupKey == key {
+        let key = warmupKey(
+            baseURL: baseURL,
+            profile: cleanedProfile,
+            profileType: profileType,
+            backend: effectiveWarmupBackend
+        )
+        if preparedWarmupKey == key {
+            return
+        }
+        if activeWarmupKey == key, warmupTask != nil {
             return
         }
 
@@ -133,6 +178,14 @@ final class AvatarChatViewModel: ObservableObject {
             }
         }
 
+        let streamStateKey = profileStateKey(
+            profile: cleanedProfile,
+            profileType: profileType,
+            backend: request.lipsyncBackend
+        )
+        let taskID = UUID()
+        streamTaskID = taskID
+
         streamTask = Task {
             await ensureWarmupReady(
                 baseURL: baseURL,
@@ -142,15 +195,18 @@ final class AvatarChatViewModel: ObservableObject {
             )
 
             if Task.isCancelled {
-                await MainActor.run {
+                if self.streamTaskID == taskID {
                     self.isStreaming = false
+                    self.streamTask = nil
                 }
                 return
             }
 
-            await MainActor.run {
+            if self.streamTaskID == taskID {
                 self.isWarmingUp = false
                 self.isStreaming = true
+                self.activeStreamProfileStateKey = streamStateKey
+                self.awaitingFirstChunkProfileStateKey = streamStateKey
             }
 
             do {
@@ -161,8 +217,14 @@ final class AvatarChatViewModel: ObservableObject {
                 )
 
                 for try await event in eventStream {
+                    if self.streamTaskID != taskID {
+                        break
+                    }
                     switch event {
                     case let .chunk(chunk):
+                        if self.awaitingFirstChunkProfileStateKey == streamStateKey {
+                            self.awaitingFirstChunkProfileStateKey = nil
+                        }
                         player.enqueue(chunk)
                         appendLog("chunk \(chunk.chunkIndex) audio=\(Int(chunk.durationSec * 1000))ms frames=\(chunk.framePayloads.count)")
                     case let .done(inferenceMS):
@@ -181,20 +243,34 @@ final class AvatarChatViewModel: ObservableObject {
                 appendLog("stream error: \(error.localizedDescription)", isError: true)
             }
 
-            isStreaming = false
-            streamTask = nil
+            if self.streamTaskID == taskID {
+                isStreaming = false
+                if self.activeStreamProfileStateKey == streamStateKey {
+                    self.activeStreamProfileStateKey = nil
+                }
+                if self.awaitingFirstChunkProfileStateKey == streamStateKey {
+                    self.awaitingFirstChunkProfileStateKey = nil
+                }
+                streamTask = nil
+                streamTaskID = nil
+            }
         }
     }
 
     func stopStreaming(clearLogs: Bool = false, cancelWarmup: Bool = true) {
         streamTask?.cancel()
         streamTask = nil
+        streamTaskID = nil
         if cancelWarmup {
             warmupTask?.cancel()
             warmupTask = nil
+            warmupTaskID = nil
             activeWarmupKey = nil
+            warmingProfileStateKey = nil
         }
         isStreaming = false
+        activeStreamProfileStateKey = nil
+        awaitingFirstChunkProfileStateKey = nil
         if cancelWarmup {
             isWarmingUp = false
         }
@@ -237,9 +313,67 @@ final class AvatarChatViewModel: ObservableObject {
         profileType == .avatar ? lipsyncBackend : nil
     }
 
-    private func warmupKey(profile: String, profileType: ProfileType, backend: LipsyncBackend?) -> String {
+    private var currentProfileStateKey: String? {
+        let cleanedProfile = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedProfile.isEmpty else { return nil }
+        return profileStateKey(
+            profile: cleanedProfile,
+            profileType: profileType,
+            backend: effectiveWarmupBackend
+        )
+    }
+
+    var isWarmingCurrentProfile: Bool {
+        guard let currentProfileStateKey else { return false }
+        return warmingProfileStateKey == currentProfileStateKey
+    }
+
+    var isAwaitingFirstChunkForCurrentProfile: Bool {
+        guard let currentProfileStateKey else { return false }
+        return awaitingFirstChunkProfileStateKey == currentProfileStateKey
+    }
+
+    var isStreamingDifferentProfile: Bool {
+        guard isStreaming else { return false }
+        guard let activeStreamProfileStateKey else { return false }
+        guard let currentProfileStateKey else { return true }
+        return activeStreamProfileStateKey != currentProfileStateKey
+    }
+
+    private func profileStateKey(
+        profile: String,
+        profileType: ProfileType,
+        backend: LipsyncBackend?
+    ) -> String {
         let backendValue = backend?.rawValue ?? "-"
         return "\(profileType.rawValue):\(profile):\(backendValue)"
+    }
+
+    private func warmupKey(
+        baseURL: URL,
+        profile: String,
+        profileType: ProfileType,
+        backend: LipsyncBackend?
+    ) -> String {
+        let backendValue = backend?.rawValue ?? "-"
+        return "\(baseURL.absoluteString)|\(profileType.rawValue):\(profile):\(backendValue)"
+    }
+
+    private func performWarmup(baseURL: URL, request: WarmupRequest) async throws -> WarmupResponse {
+        try await withThrowingTaskGroup(of: WarmupResponse.self) { group in
+            group.addTask { [apiClient] in
+                try await apiClient.warmup(baseURL: baseURL, request: request)
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: Self.warmupTimeoutSeconds * 1_000_000_000)
+                throw WarmupFailure.timedOut(profile: request.profile)
+            }
+            guard let response = try await group.next() else {
+                throw WarmupFailure.timedOut(profile: request.profile)
+            }
+            group.cancelAll()
+            return response
+        }
     }
 
     private func ensureWarmupReady(
@@ -248,11 +382,10 @@ final class AvatarChatViewModel: ObservableObject {
         profileType: ProfileType,
         backend: LipsyncBackend?
     ) async {
-        let key = warmupKey(profile: profile, profileType: profileType, backend: backend)
-        if warmedProfileKeys.contains(key) {
+        let key = warmupKey(baseURL: baseURL, profile: profile, profileType: profileType, backend: backend)
+        if preparedWarmupKey == key {
             return
         }
-
         if activeWarmupKey == key, let warmupTask {
             await warmupTask.value
             return
@@ -275,9 +408,13 @@ final class AvatarChatViewModel: ObservableObject {
         backend: LipsyncBackend?,
         clearErrors: Bool
     ) {
-        let key = warmupKey(profile: profile, profileType: profileType, backend: backend)
+        let key = warmupKey(baseURL: baseURL, profile: profile, profileType: profileType, backend: backend)
+        let stateKey = profileStateKey(profile: profile, profileType: profileType, backend: backend)
         warmupTask?.cancel()
+        let taskID = UUID()
+        warmupTaskID = taskID
         activeWarmupKey = key
+        warmingProfileStateKey = stateKey
         isWarmingUp = true
         if clearErrors {
             errorMessage = nil
@@ -294,36 +431,37 @@ final class AvatarChatViewModel: ObservableObject {
         warmupTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let response = try await self.apiClient.warmup(baseURL: baseURL, request: request)
+                let response = try await self.performWarmup(baseURL: baseURL, request: request)
                 if Task.isCancelled { return }
-                await MainActor.run {
-                    self.warmedProfileKeys.insert(key)
+                if self.warmupTaskID == taskID {
                     if let backendRaw = response.lipsyncBackend,
                        let resolvedBackend = LipsyncBackend(rawValue: backendRaw) {
                         self.lipsyncBackend = resolvedBackend
                     }
+                    self.preparedWarmupKey = key
+                    self.preparedRuntimeInstanceID = response.runtimeInstanceID
                     self.appendLog("warmup ready \(profile)")
                 }
             } catch is CancellationError {
                 return
             } catch {
                 if Task.isCancelled { return }
-                await MainActor.run {
-                    if clearErrors {
+                if self.warmupTaskID == taskID {
+                    if self.warmingProfileStateKey == stateKey {
                         self.errorMessage = "Warmup failed: \(error.localizedDescription)"
                     }
-                    self.appendLog("warmup error: \(error.localizedDescription)", isError: clearErrors)
+                    self.appendLog("warmup error: \(error.localizedDescription)", isError: true)
                 }
             }
 
-            await MainActor.run {
+            if self.warmupTaskID == taskID {
                 if self.activeWarmupKey == key {
                     self.activeWarmupKey = nil
-                    if !self.isStreaming {
-                        self.isWarmingUp = false
-                    }
+                    self.warmingProfileStateKey = nil
+                    self.isWarmingUp = false
                 }
                 self.warmupTask = nil
+                self.warmupTaskID = nil
             }
         }
     }

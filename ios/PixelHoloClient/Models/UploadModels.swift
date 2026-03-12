@@ -39,11 +39,23 @@ struct WarmupResponse: Codable, Hashable {
     let profile: String
     let profileType: ProfileType
     let lipsyncBackend: String?
+    let runtimeInstanceID: String?
+    let ttsHotBefore: Bool?
+    let ttsWarmed: Bool?
+    let lipsyncHotBefore: Bool?
+    let lipsyncWarmed: Bool?
+    let elapsedMS: Double?
 
     enum CodingKeys: String, CodingKey {
         case status
         case profile
         case profileType = "profile_type"
         case lipsyncBackend = "lipsync_backend"
+        case runtimeInstanceID = "runtime_instance_id"
+        case ttsHotBefore = "tts_hot_before"
+        case ttsWarmed = "tts_warmed"
+        case lipsyncHotBefore = "lipsync_hot_before"
+        case lipsyncWarmed = "lipsync_warmed"
+        case elapsedMS = "elapsed_ms"
     }
 }
