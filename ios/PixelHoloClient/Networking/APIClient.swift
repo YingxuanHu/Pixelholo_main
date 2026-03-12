@@ -251,6 +251,33 @@ final class APIClient {
             throw APIError.transport(error)
         }
     }
+
+    func lipsyncBackendStatus(baseURL: URL) async throws -> LipsyncBackendStatusResponse {
+        let endpointURL = baseURL.appendingPathComponent("lipsync_backend")
+        var request = URLRequest(url: endpointURL)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 15
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw APIError.invalidResponse
+            }
+            guard (200...299).contains(http.statusCode) else {
+                let message = String(data: data, encoding: .utf8) ?? "Unknown server error"
+                throw APIError.server(statusCode: http.statusCode, message: message)
+            }
+            do {
+                return try decoder.decode(LipsyncBackendStatusResponse.self, from: data)
+            } catch {
+                throw APIError.decoding(error)
+            }
+        } catch let error as APIError {
+            throw error
+        } catch {
+            throw APIError.transport(error)
+        }
+    }
 }
 
 private extension Data {

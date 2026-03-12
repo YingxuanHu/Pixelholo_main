@@ -37,6 +37,7 @@ const BLUR_KERNEL_BY_LEVEL = { low: 60, medium: 75, high: 90 } as const;
 const DEFAULT_AVATAR_BLUR_LEVEL: keyof typeof BLUR_KERNEL_BY_LEVEL = 'medium';
 const DEFAULT_VIDEO_FPS = 25;
 const DEFAULT_AUDIO_START_DELAY_SEC = 0.05;
+const WARMUP_CACHE_MAX_AGE_MS = 120_000;
 const formatBytes = (value: number) => {
   if (!Number.isFinite(value) || value <= 0) return '0 MB';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -140,7 +141,7 @@ const App: React.FC = () => {
   const streamRunningRef = useRef(false);
   const streamSessionRef = useRef<number>(0);
   const isBusy = Object.values(stepStatuses).some(status => status === 'running');
-  const warmedProfilesRef = useRef<Set<string>>(new Set());
+  const warmedProfilesRef = useRef<Map<string, number>>(new Map());
   const warmupInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
   const backendRuntimeIdRef = useRef<string | null>(null);
   const activeWarmupKeyRef = useRef<string | null>(null);
@@ -244,6 +245,20 @@ const App: React.FC = () => {
     }
   }, []);
 
+  const invalidateWarmupEntriesForProfile = useCallback((profileName: string) => {
+    const markers = [`|voice|${profileName}|`, `|avatar|${profileName}|`];
+    for (const key of Array.from(warmedProfilesRef.current.keys())) {
+      if (markers.some((marker) => key.includes(marker))) {
+        warmedProfilesRef.current.delete(key);
+      }
+    }
+    for (const key of Array.from(warmupInFlightRef.current.keys())) {
+      if (markers.some((marker) => key.includes(marker))) {
+        warmupInFlightRef.current.delete(key);
+      }
+    }
+  }, []);
+
   const handleRenameProfile = useCallback(
     async (item: ProfileInfo) => {
       if (isBusy) {
@@ -268,14 +283,14 @@ const App: React.FC = () => {
         if (profile.name === item.name && profileType === currentType) {
           setProfile(prev => ({ ...prev, name: nextName }));
         }
-        warmedProfilesRef.current.delete(item.name);
-        warmedProfilesRef.current.delete(nextName);
+        invalidateWarmupEntriesForProfile(item.name);
+        invalidateWarmupEntriesForProfile(nextName);
         await loadProfiles();
       } catch (err) {
         setUiNotice(`Rename failed: ${String(err)}`);
       }
     },
-    [apiBase, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
+    [apiBase, invalidateWarmupEntriesForProfile, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
   );
 
   const handleDeleteProfile = useCallback(
@@ -304,13 +319,13 @@ const App: React.FC = () => {
           setLastUploadedAudioFilename(null);
           setActiveStep(1);
         }
-        warmedProfilesRef.current.delete(item.name);
+        invalidateWarmupEntriesForProfile(item.name);
         await loadProfiles();
       } catch (err) {
         setUiNotice(`Delete failed: ${String(err)}`);
       }
     },
-    [apiBase, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
+    [apiBase, invalidateWarmupEntriesForProfile, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
   );
 
   const warmupKeyFor = useCallback(
@@ -319,11 +334,28 @@ const App: React.FC = () => {
     [apiBase],
   );
 
+  const hasFreshWarmup = useCallback((key: string) => {
+    const warmedAt = warmedProfilesRef.current.get(key);
+    if (!warmedAt) return false;
+    if (Date.now() - warmedAt > WARMUP_CACHE_MAX_AGE_MS) {
+      warmedProfilesRef.current.delete(key);
+      return false;
+    }
+    return true;
+  }, []);
+
+  const isWarmupSatisfied = useCallback((data: any, type: ProfileType) => {
+    const ttsReady = data?.tts_hot_before === true || data?.tts_warmed === true;
+    const lipsyncReady = type !== 'avatar' || data?.lipsync_hot_before === true || data?.lipsync_warmed === true;
+    const llmReady = data?.llm_hot_before === true || data?.llm_warmed === true;
+    return ttsReady && lipsyncReady && llmReady;
+  }, []);
+
   const warmupProfile = useCallback(async (profileName: string, type: ProfileType) => {
     if (!profileName) return;
     const runtimeId = backendRuntimeIdRef.current;
     const key = warmupKeyFor(profileName, type, avatarBackend, runtimeId);
-    if (warmedProfilesRef.current.has(key)) return;
+    if (hasFreshWarmup(key)) return;
 
     const inFlight = warmupInFlightRef.current.get(key);
     if (inFlight) {
@@ -358,7 +390,12 @@ const App: React.FC = () => {
           type === 'avatar' && (data?.lipsync_backend === 'wav2lip' || data?.lipsync_backend === 'musetalk')
             ? data.lipsync_backend
             : avatarBackend;
-        warmedProfilesRef.current.add(warmupKeyFor(profileName, type, resolvedBackend, resolvedRuntimeId ?? backendRuntimeIdRef.current));
+        if (isWarmupSatisfied(data, type)) {
+          warmedProfilesRef.current.set(
+            warmupKeyFor(profileName, type, resolvedBackend, resolvedRuntimeId ?? backendRuntimeIdRef.current),
+            Date.now(),
+          );
+        }
       } finally {
         warmupInFlightRef.current.delete(key);
         if (activeWarmupKeyRef.current === key) {
@@ -371,7 +408,7 @@ const App: React.FC = () => {
 
     warmupInFlightRef.current.set(key, promise);
     await promise;
-  }, [apiBase, avatarBackend, warmupKeyFor]);
+  }, [apiBase, avatarBackend, hasFreshWarmup, isWarmupSatisfied, warmupKeyFor]);
 
   useEffect(() => {
     loadProfiles();

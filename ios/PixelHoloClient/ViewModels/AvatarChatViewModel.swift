@@ -4,6 +4,7 @@ import Foundation
 @MainActor
 final class AvatarChatViewModel: ObservableObject {
     private static let maxLogLines = 120
+    private static let warmupCacheMaxAgeSeconds: TimeInterval = 120
     private static let warmupTimeoutSeconds: UInt64 = 180
 
     private enum MobileAvatarStreamProfile {
@@ -45,6 +46,7 @@ final class AvatarChatViewModel: ObservableObject {
     private var activeWarmupKey: String?
     private var preparedWarmupKey: String?
     private var preparedRuntimeInstanceID: String?
+    private var preparedWarmupAt: Date?
 
     private enum WarmupFailure: LocalizedError {
         case timedOut(profile: String)
@@ -109,7 +111,19 @@ final class AvatarChatViewModel: ObservableObject {
             profileType: profileType,
             backend: effectiveWarmupBackend
         )
-        if preparedWarmupKey == key {
+        if hasFreshPreparedWarmup(for: key) {
+            Task { [weak self] in
+                guard let self else { return }
+                if !(await self.hasValidPreparedWarmup(for: key, baseURL: baseURL)) {
+                    self.startWarmupTask(
+                        baseURL: baseURL,
+                        profile: cleanedProfile,
+                        profileType: profileType,
+                        backend: effectiveWarmupBackend,
+                        clearErrors: false
+                    )
+                }
+            }
             return
         }
         if activeWarmupKey == key, warmupTask != nil {
@@ -359,6 +373,45 @@ final class AvatarChatViewModel: ObservableObject {
         return "\(baseURL.absoluteString)|\(profileType.rawValue):\(profile):\(backendValue)"
     }
 
+    private func clearPreparedWarmup() {
+        preparedWarmupKey = nil
+        preparedRuntimeInstanceID = nil
+        preparedWarmupAt = nil
+    }
+
+    private func hasFreshPreparedWarmup(for key: String) -> Bool {
+        guard preparedWarmupKey == key, let preparedWarmupAt else { return false }
+        if Date().timeIntervalSince(preparedWarmupAt) > Self.warmupCacheMaxAgeSeconds {
+            clearPreparedWarmup()
+            return false
+        }
+        return true
+    }
+
+    private func hasValidPreparedWarmup(for key: String, baseURL: URL) async -> Bool {
+        guard hasFreshPreparedWarmup(for: key) else { return false }
+        guard let preparedRuntimeInstanceID else {
+            clearPreparedWarmup()
+            return false
+        }
+        do {
+            let status = try await apiClient.lipsyncBackendStatus(baseURL: baseURL)
+            if status.runtimeInstanceID == preparedRuntimeInstanceID {
+                return true
+            }
+        } catch {
+            appendLog("warmup status check failed: \(error.localizedDescription)", isError: true)
+        }
+        clearPreparedWarmup()
+        return false
+    }
+
+    private func isWarmupComplete(_ response: WarmupResponse, profileType: ProfileType) -> Bool {
+        let ttsReady = response.ttsHotBefore == true || response.ttsWarmed == true
+        let lipsyncReady = profileType != .avatar || response.lipsyncHotBefore == true || response.lipsyncWarmed == true
+        return ttsReady && lipsyncReady
+    }
+
     private func performWarmup(baseURL: URL, request: WarmupRequest) async throws -> WarmupResponse {
         try await withThrowingTaskGroup(of: WarmupResponse.self) { group in
             group.addTask { [apiClient] in
@@ -383,7 +436,7 @@ final class AvatarChatViewModel: ObservableObject {
         backend: LipsyncBackend?
     ) async {
         let key = warmupKey(baseURL: baseURL, profile: profile, profileType: profileType, backend: backend)
-        if preparedWarmupKey == key {
+        if await hasValidPreparedWarmup(for: key, baseURL: baseURL) {
             return
         }
         if activeWarmupKey == key, let warmupTask {
@@ -438,9 +491,15 @@ final class AvatarChatViewModel: ObservableObject {
                        let resolvedBackend = LipsyncBackend(rawValue: backendRaw) {
                         self.lipsyncBackend = resolvedBackend
                     }
-                    self.preparedWarmupKey = key
-                    self.preparedRuntimeInstanceID = response.runtimeInstanceID
-                    self.appendLog("warmup ready \(profile)")
+                    if self.isWarmupComplete(response, profileType: profileType) {
+                        self.preparedWarmupKey = key
+                        self.preparedRuntimeInstanceID = response.runtimeInstanceID
+                        self.preparedWarmupAt = Date()
+                        self.appendLog("warmup ready \(profile)")
+                    } else {
+                        self.clearPreparedWarmup()
+                        self.appendLog("warmup incomplete \(profile)", isError: true)
+                    }
                 }
             } catch is CancellationError {
                 return

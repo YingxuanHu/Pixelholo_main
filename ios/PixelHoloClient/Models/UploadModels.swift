@@ -44,6 +44,8 @@ struct WarmupResponse: Codable, Hashable {
     let ttsWarmed: Bool?
     let lipsyncHotBefore: Bool?
     let lipsyncWarmed: Bool?
+    let llmHotBefore: Bool?
+    let llmWarmed: Bool?
     let elapsedMS: Double?
 
     enum CodingKeys: String, CodingKey {
@@ -56,6 +58,18 @@ struct WarmupResponse: Codable, Hashable {
         case ttsWarmed = "tts_warmed"
         case lipsyncHotBefore = "lipsync_hot_before"
         case lipsyncWarmed = "lipsync_warmed"
+        case llmHotBefore = "llm_hot_before"
+        case llmWarmed = "llm_warmed"
         case elapsedMS = "elapsed_ms"
+    }
+}
+
+struct LipsyncBackendStatusResponse: Codable, Hashable {
+    let backend: String
+    let runtimeInstanceID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case backend
+        case runtimeInstanceID = "runtime_instance_id"
     }
 }
