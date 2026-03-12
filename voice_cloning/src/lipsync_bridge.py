@@ -250,3 +250,15 @@ class LipSyncBridge:
                 f[y1:y2, x1:x2] = blended.astype(np.uint8)
                 output_frames.append(f)
         return output_frames
+
+    def close(self) -> None:
+        self.frames = None
+        self.coords = None
+        self._loaded_cache_dir = None
+        self._mask_cache.clear()
+        for attr in ("model", "_wav_audio"):
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except Exception:
+                    pass

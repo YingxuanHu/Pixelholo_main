@@ -647,7 +647,7 @@ def main() -> None:
         face_crop_scale=args.face_crop_scale,
         device=args.device,
     )
-    print(f"✅ Avatar successfully cached at: {cache_dir}")
+    print(f"Avatar successfully cached at: {cache_dir}")
 
 if __name__ == "__main__":
     main()
