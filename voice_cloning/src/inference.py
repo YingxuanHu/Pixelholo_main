@@ -88,6 +88,7 @@ from config import (  # noqa: E402
     PROFILE_TYPE_AVATAR,
     PROFILE_TYPE_VOICE,
     OUTPUTS_DIR,
+    avatar_cache_dir,
     profile_data_root,
     processed_wavs_dir,
     raw_audio_dir,
