@@ -33,6 +33,12 @@ node_modules/
 .DS_Store
 Thumbs.db
 
+# Xcode user state
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
 # Data + outputs (generated)
 voice_cloning/data/
 voice_cloning/outputs/
