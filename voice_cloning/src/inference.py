@@ -132,11 +132,16 @@ app.add_middleware(
 )
 _engine_lock = threading.Lock()
 _engines: dict[tuple[str, str], "StyleTTS2RepoEngine"] = {}
+_engine_refcounts: dict[tuple[str, str], int] = {}
+_engine_last_used: dict[tuple[str, str], float] = {}
 _lipsync_lock = threading.Lock()
 _lipsync_engines: dict[str, "_LipSyncEngineProtocol"] = {}
+_lipsync_refcounts: dict[str, int] = {}
+_lipsync_last_used: dict[str, float] = {}
 _active_stream_lock = threading.Lock()
 _active_stream_stop_events: set[threading.Event] = set()
 _warmup_profile_lock = threading.Lock()
+_runtime_cleanup_thread_started = False
 
 
 def _register_stream_stop_event(stop_event: threading.Event) -> None:
@@ -291,9 +296,19 @@ def _split_text_staircase(
     return chunks
 
 
-def _split_text_prosody(text: str, max_chars: int, first_chunk_max_chars: int | None = None) -> list[str]:
+def _split_text_prosody(
+    text: str,
+    max_chars: int,
+    max_words: int | None = None,
+    first_chunk_max_chars: int | None = None,
+) -> list[str]:
     limit = first_chunk_max_chars or max(60, int(max_chars * 0.5))
-    return prosody_split(text, max_chars=max_chars, first_chunk_max_chars=limit)
+    return prosody_split(
+        text,
+        max_chars=max_chars,
+        first_chunk_max_chars=limit,
+        max_words=max_words,
+    )
 
 
 def _plan_stream_tts_chunks(
@@ -303,6 +318,7 @@ def _plan_stream_tts_chunks(
     *,
     first_chunk_max_chars: int | None = None,
     is_first_global_chunk: bool = False,
+    prefer_prosody_fallback: bool = False,
 ) -> list[str]:
     text = sentence.strip()
     if not text:
@@ -333,11 +349,19 @@ def _plan_stream_tts_chunks(
         return _split_text_prosody(
             text,
             max_chars=max_chars,
+            max_words=max_words,
             first_chunk_max_chars=int(first_chunk_max_chars),
         )
 
     if len(text) <= single_max_chars and len(text.split()) <= single_max_words:
         return [text]
+
+    if prefer_prosody_fallback:
+        return _split_text_prosody(
+            text,
+            max_chars=max_chars,
+            max_words=max_words,
+        )
 
     return _split_text(text, max_chars=max_chars, max_words=max_words)
 
@@ -1095,20 +1119,26 @@ def _stream_avatar_from_text_iter(
     lexicon_path = _resolve_lexicon_path(model_path, req, profile, profile_type)
     lexicon = _load_lexicon(lexicon_path)
 
-    engine = _get_engine(model_path, config_path)
+    lipsync_cm = _acquire_lipsync_engine(req.lipsync_backend)
     try:
-        lipsync = _get_lipsync_engine(req.lipsync_backend)
+        lipsync = lipsync_cm.__enter__()
         with _lipsync_lock:
             lipsync.load_profile(profile, profile_type)
     except FileNotFoundError as exc:
+        with contextlib.suppress(Exception):
+            lipsync_cm.__exit__(None, None, None)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        with contextlib.suppress(Exception):
+            lipsync_cm.__exit__(None, None, None)
+        raise
     is_musetalk = lipsync.__class__.__name__ == "MuseTalkBridge"
     fps = req.avatar_fps or lipsync.fps
     if mobile_profile and req.avatar_fps is None:
         try:
-            fps = min(float(fps), float(os.getenv("IOS_STREAM_AVATAR_FPS", "15")))
+            fps = min(float(fps), float(os.getenv("IOS_STREAM_AVATAR_FPS", "20")))
         except (TypeError, ValueError):
-            fps = min(float(fps), 15.0)
+            fps = min(float(fps), 20.0)
 
     profile_defaults = _load_profile_defaults(model_path)
     # Request-time MuseTalk knobs (ignored for Wav2Lip).
@@ -1122,10 +1152,10 @@ def _stream_avatar_from_text_iter(
             try:
                 lipsync.infer_fps = max(
                     6.0,
-                    min(float(lipsync.infer_fps), float(os.getenv("IOS_STREAM_MUSETALK_INFER_FPS", "15"))),
+                    min(float(lipsync.infer_fps), float(os.getenv("IOS_STREAM_MUSETALK_INFER_FPS", "20"))),
                 )
             except (TypeError, ValueError):
-                lipsync.infer_fps = max(6.0, min(float(lipsync.infer_fps), 15.0))
+                lipsync.infer_fps = max(6.0, min(float(lipsync.infer_fps), 20.0))
 
         default_face_scale = float(
             profile_defaults.get(
@@ -1152,8 +1182,30 @@ def _stream_avatar_from_text_iter(
                 os.getenv("MUSE_TALK_MAX_CHUNK_CHARS", "120"),
             )
         )
+        if mobile_profile:
+            try:
+                max_chars = max(
+                    16,
+                    min(
+                        int(max_chars),
+                        int(os.getenv("IOS_STREAM_MUSETALK_MAX_CHUNK_CHARS", "84")),
+                    ),
+                )
+            except (TypeError, ValueError):
+                max_chars = max(16, min(int(max_chars), 84))
     else:
         max_chars = profile_defaults.get("max_chunk_chars", DEFAULT_MAX_CHUNK_CHARS)
+        if mobile_profile and req.max_chunk_chars is None:
+            try:
+                max_chars = max(
+                    16,
+                    min(
+                        int(max_chars),
+                        int(os.getenv("IOS_STREAM_MAX_CHUNK_CHARS", "96")),
+                    ),
+                )
+            except (TypeError, ValueError):
+                max_chars = max(16, min(int(max_chars), 96))
     max_words = (
         req.max_chunk_words
         if req.max_chunk_words is not None
@@ -1196,9 +1248,6 @@ def _stream_avatar_from_text_iter(
     seed = req.seed if req.seed is not None else profile_defaults.get("seed")
     if seed is None:
         seed = 1234
-    pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
-    comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
-    comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
     first_chunk_max_chars: int | None = None
     if is_musetalk:
         if req.musetalk_first_chunk_chars is not None:
@@ -1210,6 +1259,17 @@ def _stream_avatar_from_text_iter(
                     os.getenv("MUSE_TALK_FIRST_CHUNK_CHARS", "72"),
                 )
             )
+        if mobile_profile and req.musetalk_first_chunk_chars is None:
+            try:
+                first_chunk_max_chars = max(
+                    8,
+                    min(
+                        int(first_chunk_max_chars),
+                        int(os.getenv("IOS_STREAM_MUSETALK_FIRST_CHUNK_CHARS", "48")),
+                    ),
+                )
+            except (TypeError, ValueError):
+                first_chunk_max_chars = max(8, min(int(first_chunk_max_chars), 48))
     musetalk_window_sec = 0.0
     if is_musetalk:
         if req.musetalk_stream_window_sec is not None:
@@ -1221,6 +1281,17 @@ def _stream_avatar_from_text_iter(
                     os.getenv("MUSE_TALK_STREAM_WINDOW_SEC", "1.2"),
                 )
             )
+        if mobile_profile and req.musetalk_stream_window_sec is None:
+            try:
+                musetalk_window_sec = max(
+                    0.2,
+                    min(
+                        float(musetalk_window_sec),
+                        float(os.getenv("IOS_STREAM_MUSETALK_WINDOW_SEC", "0.55")),
+                    ),
+                )
+            except (TypeError, ValueError):
+                musetalk_window_sec = max(0.2, min(float(musetalk_window_sec), 0.55))
     musetalk_lookahead_sec = 0.0
     if is_musetalk:
         if req.musetalk_lookahead_sec is not None:
@@ -1232,6 +1303,17 @@ def _stream_avatar_from_text_iter(
                     os.getenv("MUSE_TALK_LOOKAHEAD_SEC", "0.16"),
                 )
             )
+        if mobile_profile and req.musetalk_lookahead_sec is None:
+            try:
+                musetalk_lookahead_sec = max(
+                    0.0,
+                    min(
+                        float(musetalk_lookahead_sec),
+                        float(os.getenv("IOS_STREAM_MUSETALK_LOOKAHEAD_SEC", "0.08")),
+                    ),
+                )
+            except (TypeError, ValueError):
+                musetalk_lookahead_sec = max(0.0, min(float(musetalk_lookahead_sec), 0.08))
     jpeg_quality = 80
     if is_musetalk:
         if req.musetalk_jpeg_quality is not None:
@@ -1245,22 +1327,30 @@ def _stream_avatar_from_text_iter(
             )
     if mobile_profile and req.musetalk_jpeg_quality is None:
         try:
-            jpeg_quality = max(50, min(int(jpeg_quality), int(os.getenv("IOS_STREAM_JPEG_QUALITY", "72"))))
+            jpeg_quality = max(50, min(int(jpeg_quality), int(os.getenv("IOS_STREAM_JPEG_QUALITY", "68"))))
         except (TypeError, ValueError):
-            jpeg_quality = max(50, min(int(jpeg_quality), 72))
+            jpeg_quality = max(50, min(int(jpeg_quality), 68))
     mobile_max_frame_edge = 0
-    if mobile_profile:
+    if req.avatar_max_frame_edge is not None:
+        mobile_max_frame_edge = max(256, min(int(req.avatar_max_frame_edge), 1280))
+    elif mobile_profile:
         try:
-            mobile_max_frame_edge = max(256, min(int(os.getenv("IOS_STREAM_MAX_FRAME_EDGE", "640")), 1280))
+            mobile_max_frame_edge = max(256, min(int(os.getenv("IOS_STREAM_MAX_FRAME_EDGE", "384")), 1280))
         except (TypeError, ValueError):
-            mobile_max_frame_edge = 640
+            mobile_max_frame_edge = 384
 
     logger.info(
-        "component=stream op=avatar_stream_config profile=%s backend=%s mobile=%s fps=%.2f jpeg_quality=%s max_frame_edge=%s",
+        "component=stream op=avatar_stream_config profile=%s backend=%s mobile=%s fps=%.2f max_chars=%s max_words=%s infer_fps=%s window_sec=%s lookahead_sec=%s first_chunk_chars=%s jpeg_quality=%s max_frame_edge=%s",
         profile,
         req.lipsync_backend or "default",
         mobile_profile,
         float(fps),
+        max_chars,
+        max_words,
+        getattr(lipsync, "infer_fps", None) if is_musetalk else "n/a",
+        round(float(musetalk_window_sec), 3) if is_musetalk else "n/a",
+        round(float(musetalk_lookahead_sec), 3) if is_musetalk else "n/a",
+        first_chunk_max_chars if is_musetalk else "n/a",
         jpeg_quality,
         mobile_max_frame_edge or "full",
     )
@@ -1272,7 +1362,9 @@ def _stream_avatar_from_text_iter(
             maxsize=3
         )
         sentence_queue: queue.Queue[str | None] = queue.Queue(maxsize=10)
-        stitcher = AudioStitcher(sample_rate=engine.sample_rate, fade_len_ms=15.0)
+        engine_cm = _acquire_engine(model_path, config_path)
+        engine: StyleTTS2RepoEngine | None = None
+        stitcher: AudioStitcher | None = None
 
         def _sentence_reader() -> None:
             try:
@@ -1312,6 +1404,8 @@ def _stream_avatar_from_text_iter(
             idx = 0
             tts_chunk_index = 0
             try:
+                if engine is None or stitcher is None:
+                    raise RuntimeError("TTS engine is not ready.")
                 if seed is not None:
                     _seed_everything(seed)
                 while not stop_event.is_set():
@@ -1331,6 +1425,7 @@ def _stream_avatar_from_text_iter(
                         max_words=max_words,
                         first_chunk_max_chars=first_chunk_max_chars,
                         is_first_global_chunk=(tts_chunk_index == 0),
+                        prefer_prosody_fallback=mobile_profile,
                     )
                     for chunk in sentence_chunks:
                         if stop_event.is_set():
@@ -1427,10 +1522,8 @@ def _stream_avatar_from_text_iter(
             except Exception as exc:
                 _put_result("error", -1, np.array([str(exc)], dtype=object), None)
 
-        sentence_reader_thread = threading.Thread(target=_sentence_reader, daemon=True)
-        audio_worker_thread = threading.Thread(target=_audio_worker, daemon=True)
-        sentence_reader_thread.start()
-        audio_worker_thread.start()
+        sentence_reader_thread: threading.Thread | None = None
+        audio_worker_thread: threading.Thread | None = None
 
         last_frame: np.ndarray | None = None
         musetalk_prev_tail_frames: list[np.ndarray] = []
@@ -1458,12 +1551,6 @@ def _stream_avatar_from_text_iter(
         lookahead_tgt_samples = 0
         pending_audio = np.zeros(0, dtype=np.float32)
         pending_audio_16k = np.zeros(0, dtype=np.float32)
-        if is_musetalk and musetalk_window_sec > 0:
-            window_src_samples = max(1, int(round(engine.sample_rate * musetalk_window_sec)))
-            window_tgt_samples = max(1, int(round(16000.0 * musetalk_window_sec)))
-        if is_musetalk and musetalk_lookahead_sec > 0:
-            lookahead_src_samples = max(0, int(round(engine.sample_rate * musetalk_lookahead_sec)))
-            lookahead_tgt_samples = max(0, int(round(16000.0 * musetalk_lookahead_sec)))
 
         def _emit_one(
             sub_audio: np.ndarray,
@@ -1569,6 +1656,21 @@ def _stream_avatar_from_text_iter(
             emit_index += 1
 
         try:
+            engine = engine_cm.__enter__()
+            pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
+            comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
+            comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
+            stitcher = AudioStitcher(sample_rate=engine.sample_rate, fade_len_ms=15.0)
+            if is_musetalk and musetalk_window_sec > 0:
+                window_src_samples = max(1, int(round(engine.sample_rate * musetalk_window_sec)))
+                window_tgt_samples = max(1, int(round(16000.0 * musetalk_window_sec)))
+            if is_musetalk and musetalk_lookahead_sec > 0:
+                lookahead_src_samples = max(0, int(round(engine.sample_rate * musetalk_lookahead_sec)))
+                lookahead_tgt_samples = max(0, int(round(16000.0 * musetalk_lookahead_sec)))
+            sentence_reader_thread = threading.Thread(target=_sentence_reader, daemon=True)
+            audio_worker_thread = threading.Thread(target=_audio_worker, daemon=True)
+            sentence_reader_thread.start()
+            audio_worker_thread.start()
             while True:
                 try:
                     kind, idx, audio, audio_16k = result_queue.get(timeout=0.2)
@@ -1626,15 +1728,22 @@ def _stream_avatar_from_text_iter(
             else:
                 yield json.dumps({"event": "error", "detail": traceback.format_exc()}) + "\n"
         finally:
+            with contextlib.suppress(Exception):
+                lipsync_cm.__exit__(None, None, None)
+            if engine is not None:
+                with contextlib.suppress(Exception):
+                    engine_cm.__exit__(None, None, None)
             stop_event.set()
             with contextlib.suppress(Exception):
                 close_text_iter = getattr(text_iter, "close", None)
                 if callable(close_text_iter):
                     close_text_iter()
             with contextlib.suppress(Exception):
-                sentence_reader_thread.join(timeout=0.5)
+                if sentence_reader_thread is not None:
+                    sentence_reader_thread.join(timeout=0.5)
             with contextlib.suppress(Exception):
-                audio_worker_thread.join(timeout=0.5)
+                if audio_worker_thread is not None:
+                    audio_worker_thread.join(timeout=0.5)
             _unregister_stream_stop_event(stop_event)
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
@@ -1672,7 +1781,6 @@ def _stream_voice_from_text_iter(
     lexicon_path = _resolve_lexicon_path(model_path, req, req.speaker, profile_type)
     lexicon = _load_lexicon(lexicon_path)
 
-    engine = _get_engine(model_path, config_path)
     profile = _load_profile_defaults(model_path)
     max_chars = (
         req.max_chunk_chars
@@ -1709,9 +1817,6 @@ def _stream_voice_from_text_iter(
         if req.smart_trim_pad_ms is not None
         else profile.get("stream_smart_trim_pad_ms", 30.0)
     )
-    pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
-    comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
-    comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
     seed = req.seed if req.seed is not None else profile.get("seed")
     if seed is None:
         seed = 1234
@@ -1721,8 +1826,14 @@ def _stream_voice_from_text_iter(
         _register_stream_stop_event(stop_event)
         idx = 0
         tts_chunk_index = 0
-        stitcher = AudioStitcher(sample_rate=engine.sample_rate, fade_len_ms=15.0)
+        engine_cm = _acquire_engine(model_path, config_path)
+        engine: StyleTTS2RepoEngine | None = None
         try:
+            engine = engine_cm.__enter__()
+            pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
+            comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
+            comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
+            stitcher = AudioStitcher(sample_rate=engine.sample_rate, fade_len_ms=15.0)
             if seed is not None:
                 _seed_everything(seed)
             for sentence in text_iter:
@@ -1735,6 +1846,7 @@ def _stream_voice_from_text_iter(
                     max_chars=max_chars,
                     max_words=max_words,
                     is_first_global_chunk=(tts_chunk_index == 0),
+                    prefer_prosody_fallback=mobile_profile,
                 )
                 for chunk in sentence_chunks:
                     if stop_event.is_set():
@@ -1855,6 +1967,9 @@ def _stream_voice_from_text_iter(
                 yield json.dumps({"event": "error", "detail": traceback.format_exc()}) + "\n"
             return
         finally:
+            if engine is not None:
+                with contextlib.suppress(Exception):
+                    engine_cm.__exit__(None, None, None)
             stop_event.set()
             with contextlib.suppress(Exception):
                 close_text_iter = getattr(text_iter, "close", None)
@@ -1909,6 +2024,7 @@ class GenerateRequest(BaseModel):
     crossfade_ms: float | None = None
     avatar_profile: str | None = None
     avatar_fps: float | None = None
+    avatar_max_frame_edge: int | None = None
     musetalk_batch_size: int | None = None
     musetalk_infer_fps: float | None = None
     musetalk_stream_window_sec: float | None = None
@@ -2085,6 +2201,27 @@ class StyleTTS2RepoEngine:
             clamp=False,
         )
 
+    def close(self) -> None:
+        self.style_cache.clear()
+        for attr in (
+            "sampler",
+            "model",
+            "_to_mel",
+            "_phonemizers",
+            "_text_cleaner",
+            "_phonemizer_backend",
+            "_word_tokenize",
+            "_length_to_mask",
+            "_text_symbols",
+            "_librosa",
+            "model_params",
+        ):
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except Exception:
+                    pass
+
     def _tokenize(self, text: str) -> list[str]:
         if self._word_tokenize is None:
             return text.split()
@@ -2137,7 +2274,7 @@ class StyleTTS2RepoEngine:
     def _compute_style(self, wav_path: Path) -> torch.Tensor:
         cache_key = str(wav_path)
         if cache_key in self.style_cache:
-            return self.style_cache[cache_key]
+            return self.style_cache[cache_key].to(self.device)
 
         wave, sr = self._librosa.load(str(wav_path), sr=self.sample_rate)
         audio, _index = self._librosa.effects.trim(wave, top_db=30)
@@ -2149,9 +2286,9 @@ class StyleTTS2RepoEngine:
             ref_s = self.model.style_encoder(mel_tensor.unsqueeze(1))
             ref_p = self.model.predictor_encoder(mel_tensor.unsqueeze(1))
 
-        style = torch.cat([ref_s, ref_p], dim=1)
+        style = torch.cat([ref_s, ref_p], dim=1).detach().cpu()
         self.style_cache[cache_key] = style
-        return style
+        return style.to(self.device)
 
     def generate(
         self,
@@ -2329,6 +2466,87 @@ def _dispose_lipsync_engine(engine: object) -> None:
             )
 
 
+def _dispose_tts_engine(engine: object) -> None:
+    for method_name in ("close", "shutdown"):
+        method = getattr(engine, method_name, None)
+        if callable(method):
+            try:
+                method()
+            except Exception:
+                logger.debug(
+                    "component=tts op=engine_dispose status=close_error method=%s",
+                    method_name,
+                    exc_info=True,
+                )
+    del engine
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            logger.debug(
+                "component=tts op=engine_dispose status=cuda_empty_cache_error",
+                exc_info=True,
+            )
+
+
+def _runtime_cache_timeout_seconds(env_name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.getenv(env_name, str(default))))
+    except (TypeError, ValueError):
+        return max(0.0, float(default))
+
+
+def _evict_idle_tts_engines(keep_key: tuple[str, str] | None = None) -> None:
+    timeout = _runtime_cache_timeout_seconds("STYLE_TTS2_IDLE_EVICT_SEC", 180.0)
+    now = time.monotonic()
+    for engine_key in list(_engines.keys()):
+        if keep_key is not None and engine_key == keep_key:
+            continue
+        if _engine_refcounts.get(engine_key, 0) > 0:
+            continue
+        if timeout > 0 and (now - _engine_last_used.get(engine_key, now)) < timeout:
+            continue
+        stale_engine = _engines.pop(engine_key, None)
+        _engine_refcounts.pop(engine_key, None)
+        _engine_last_used.pop(engine_key, None)
+        if stale_engine is None:
+            continue
+        _dispose_tts_engine(stale_engine)
+        logger.info(
+            "component=tts op=engine_evict status=ok model=%s config=%s",
+            Path(engine_key[0]).name,
+            Path(engine_key[1]).name,
+        )
+
+
+def _evict_idle_lipsync_engines(keep_backend: str | None = None) -> None:
+    timeout = _runtime_cache_timeout_seconds("LIPSYNC_IDLE_EVICT_SEC", 180.0)
+    now = time.monotonic()
+    for backend_name in list(_lipsync_engines.keys()):
+        if keep_backend is not None and backend_name == keep_backend:
+            continue
+        if _lipsync_refcounts.get(backend_name, 0) > 0:
+            continue
+        if timeout > 0 and (now - _lipsync_last_used.get(backend_name, now)) < timeout:
+            continue
+        stale_engine = _lipsync_engines.pop(backend_name, None)
+        _lipsync_refcounts.pop(backend_name, None)
+        _lipsync_last_used.pop(backend_name, None)
+        if stale_engine is None:
+            continue
+        _dispose_lipsync_engine(stale_engine)
+        logger.info(
+            "component=lipsync op=engine_evict status=idle backend=%s",
+            backend_name,
+        )
+        warmed = globals().get("_warmed_lipsync_profiles")
+        if isinstance(warmed, set):
+            stale_keys = [k for k in warmed if isinstance(k, tuple) and len(k) == 3 and k[2] == backend_name]
+            for key in stale_keys:
+                warmed.discard(key)
+
+
 def _evict_lipsync_engines(keep_backend: str) -> None:
     for backend_name in list(_lipsync_engines.keys()):
         if backend_name == keep_backend:
@@ -2355,6 +2573,8 @@ def _get_lipsync_engine(requested_backend: str | None = None) -> _LipSyncEngineP
         strict_isolation = os.getenv("LIPSYNC_STRICT_ISOLATION", "1") == "1"
         if strict_isolation:
             _evict_lipsync_engines(keep_backend=desired_backend)
+        else:
+            _evict_idle_lipsync_engines(keep_backend=desired_backend)
         if desired_backend not in _lipsync_engines:
             try:
                 _lipsync_engines[desired_backend] = _build_lipsync_engine(desired_backend)
@@ -2368,15 +2588,112 @@ def _get_lipsync_engine(requested_backend: str | None = None) -> _LipSyncEngineP
                     desired_backend,
                 )
                 raise
+        _lipsync_last_used[desired_backend] = time.monotonic()
         return _lipsync_engines[desired_backend]
 
 
 def _get_engine(model_path: Path, config_path: Path) -> StyleTTS2RepoEngine:
     key = (str(model_path), str(config_path))
     with _engine_lock:
+        _evict_idle_tts_engines(keep_key=key)
         if key not in _engines:
             _engines[key] = StyleTTS2RepoEngine(model_path=model_path, config_path=config_path)
+            logger.info(
+                "component=tts op=engine_init status=ok model=%s config=%s",
+                model_path.name,
+                config_path.name,
+            )
+        _engine_last_used[key] = time.monotonic()
         return _engines[key]
+
+
+@contextlib.contextmanager
+def _acquire_engine(model_path: Path, config_path: Path) -> Iterator[StyleTTS2RepoEngine]:
+    key = (str(model_path), str(config_path))
+    strict_isolation = os.getenv("STYLE_TTS2_STRICT_ISOLATION", "1") == "1"
+    with _engine_lock:
+        if strict_isolation:
+            _evict_idle_tts_engines(keep_key=key)
+        if key not in _engines:
+            _engines[key] = StyleTTS2RepoEngine(model_path=model_path, config_path=config_path)
+            logger.info(
+                "component=tts op=engine_init status=ok model=%s config=%s",
+                model_path.name,
+                config_path.name,
+            )
+        _engine_refcounts[key] = _engine_refcounts.get(key, 0) + 1
+        _engine_last_used[key] = time.monotonic()
+        engine = _engines[key]
+    try:
+        yield engine
+    finally:
+        with _engine_lock:
+            current = _engine_refcounts.get(key, 0)
+            if current <= 1:
+                _engine_refcounts.pop(key, None)
+            else:
+                _engine_refcounts[key] = current - 1
+            _engine_last_used[key] = time.monotonic()
+            _evict_idle_tts_engines(keep_key=key if strict_isolation else None)
+
+
+@contextlib.contextmanager
+def _acquire_lipsync_engine(requested_backend: str | None = None) -> Iterator[_LipSyncEngineProtocol]:
+    desired_backend = _resolve_lipsync_backend(requested_backend)
+    strict_isolation = os.getenv("LIPSYNC_STRICT_ISOLATION", "1") == "1"
+    with _lipsync_lock:
+        if strict_isolation:
+            _evict_lipsync_engines(keep_backend=desired_backend)
+        else:
+            _evict_idle_lipsync_engines(keep_backend=desired_backend)
+        if desired_backend not in _lipsync_engines:
+            try:
+                _lipsync_engines[desired_backend] = _build_lipsync_engine(desired_backend)
+                logger.info(
+                    "component=lipsync op=engine_init status=ok backend=%s",
+                    desired_backend,
+                )
+            except Exception:
+                logger.exception(
+                    "component=lipsync op=engine_init status=error backend=%s",
+                    desired_backend,
+                )
+                raise
+        _lipsync_refcounts[desired_backend] = _lipsync_refcounts.get(desired_backend, 0) + 1
+        _lipsync_last_used[desired_backend] = time.monotonic()
+        engine = _lipsync_engines[desired_backend]
+    try:
+        yield engine
+    finally:
+        with _lipsync_lock:
+            current = _lipsync_refcounts.get(desired_backend, 0)
+            if current <= 1:
+                _lipsync_refcounts.pop(desired_backend, None)
+            else:
+                _lipsync_refcounts[desired_backend] = current - 1
+            _lipsync_last_used[desired_backend] = time.monotonic()
+            _evict_idle_lipsync_engines(keep_backend=desired_backend if strict_isolation else None)
+
+
+def _runtime_cleanup_loop() -> None:
+    interval = _runtime_cache_timeout_seconds("PIXELHOLO_IDLE_CLEANUP_INTERVAL_SEC", 30.0)
+    if interval <= 0:
+        interval = 30.0
+    while True:
+        time.sleep(interval)
+        with _engine_lock:
+            _evict_idle_tts_engines()
+        with _lipsync_lock:
+            _evict_idle_lipsync_engines()
+
+
+def _start_runtime_cleanup_thread() -> None:
+    global _runtime_cleanup_thread_started
+    if _runtime_cleanup_thread_started:
+        return
+    _runtime_cleanup_thread_started = True
+    thread = threading.Thread(target=_runtime_cleanup_loop, name="pixelholo-idle-cleanup", daemon=True)
+    thread.start()
 
 
 def _warmup_engine(model_path: Path, config_path: Path) -> None:
@@ -2393,7 +2710,6 @@ def _warmup_engine(model_path: Path, config_path: Path) -> None:
         return
 
     try:
-        engine = _get_engine(model_path, config_path)
         params = {
             "alpha": profile.get("alpha", DEFAULT_ALPHA),
             "beta": profile.get("beta", DEFAULT_BETA),
@@ -2402,18 +2718,19 @@ def _warmup_engine(model_path: Path, config_path: Path) -> None:
             "f0_scale": profile.get("f0_scale", DEFAULT_F0_SCALE),
         }
         text = os.getenv("STYLE_TTS2_WARMUP_TEXT", "warmup")
-        engine.generate(
-            text=text,
-            ref_wav_path=ref_wav,
-            alpha=float(params["alpha"]),
-            beta=float(params["beta"]),
-            diffusion_steps=int(params["diffusion_steps"]),
-            embedding_scale=float(params["embedding_scale"]),
-            f0_scale=float(params["f0_scale"]),
-            phonemizer_lang=profile.get("phonemizer_lang"),
-            lexicon=None,
-            seed=1234,
-        )
+        with _acquire_engine(model_path, config_path) as engine:
+            engine.generate(
+                text=text,
+                ref_wav_path=ref_wav,
+                alpha=float(params["alpha"]),
+                beta=float(params["beta"]),
+                diffusion_steps=int(params["diffusion_steps"]),
+                embedding_scale=float(params["embedding_scale"]),
+                f0_scale=float(params["f0_scale"]),
+                phonemizer_lang=profile.get("phonemizer_lang"),
+                lexicon=None,
+                seed=1234,
+            )
         print("Warmup completed.")
     except Exception as exc:
         print(f"Warmup failed: {exc}")
@@ -2430,11 +2747,11 @@ def _warmup_lipsync(
 ) -> str:
     backend = _resolve_lipsync_backend(requested_backend)
     try:
-        lipsync = _get_lipsync_engine(backend)
-        with _lipsync_lock:
-            lipsync.load_profile(profile, profile_type)
-            dummy = np.zeros(int(0.4 * 16000), dtype=np.float32)
-            lipsync.sync_chunk(dummy, fps=lipsync.fps)
+        with _acquire_lipsync_engine(backend) as lipsync:
+            with _lipsync_lock:
+                lipsync.load_profile(profile, profile_type)
+                dummy = np.zeros(int(0.4 * 16000), dtype=np.float32)
+                lipsync.sync_chunk(dummy, fps=lipsync.fps)
         print(f"Lipsync warmup completed ({backend}).")
         return backend
     except Exception as exc:
@@ -2483,6 +2800,7 @@ def _warmup_profile(
 
 @app.on_event("startup")
 def _startup() -> None:
+    _start_runtime_cleanup_thread()
     try:
         warmup_text_normalizer()
         print("Text normalizer warmup completed.")
@@ -2844,7 +3162,6 @@ def stream(req: GenerateRequest):
     lexicon_path = _resolve_lexicon_path(model_path, req, req.speaker, profile_type)
     lexicon = _load_lexicon(lexicon_path)
 
-    engine = _get_engine(model_path, config_path)
     profile = _load_profile_defaults(model_path)
     max_chars = (
         req.max_chunk_chars
@@ -2893,75 +3210,76 @@ def stream(req: GenerateRequest):
     seed = req.seed if req.seed is not None else profile.get("seed")
     if seed is None and len(chunks) > 1:
         seed = 1234
-    pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
-    comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
-    comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
     def _generator() -> Iterator[str]:
-        tts_chunk_index = 0
-        if seed is not None:
-            _seed_everything(seed)
-        for idx, chunk in enumerate(chunks):
-            ref_for_chunk = ref_wav_path
-            if pad_text:
-                chunk = f"{pad_text_token} {chunk} {pad_text_token}"
-            chunk_seed = seed
-            audio = engine.generate(
-                chunk,
-                ref_wav_path=ref_for_chunk,
-                alpha=params["alpha"],
-                beta=params["beta"],
-                diffusion_steps=params["diffusion_steps"],
-                embedding_scale=params["embedding_scale"],
-                f0_scale=params["f0_scale"],
-                phonemizer_lang=phonemizer_lang,
-                lexicon=lexicon,
-                seed=chunk_seed,
-            )
-            tts_chunk_index += 1
-            if smart_trim_db and smart_trim_db > 0:
-                audio = _smart_vad_trim(
-                    audio,
-                    engine.sample_rate,
-                    top_db=float(smart_trim_db),
-                    pad_ms=float(smart_trim_pad_ms),
+        with _acquire_engine(model_path, config_path) as engine:
+            pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
+            comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
+            comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
+            tts_chunk_index = 0
+            if seed is not None:
+                _seed_everything(seed)
+            for idx, chunk in enumerate(chunks):
+                ref_for_chunk = ref_wav_path
+                if pad_text:
+                    chunk = f"{pad_text_token} {chunk} {pad_text_token}"
+                chunk_seed = seed
+                audio = engine.generate(
+                    chunk,
+                    ref_wav_path=ref_for_chunk,
+                    alpha=params["alpha"],
+                    beta=params["beta"],
+                    diffusion_steps=params["diffusion_steps"],
+                    embedding_scale=params["embedding_scale"],
+                    f0_scale=params["f0_scale"],
+                    phonemizer_lang=phonemizer_lang,
+                    lexicon=lexicon,
+                    seed=chunk_seed,
                 )
-            audio = _remove_dc(audio.astype(np.float32, copy=False))
-            if idx < len(chunks) - 1:
-                suffix = chunk.rstrip()
-                if suffix.endswith((".", "!", "?")) and pause.size:
-                    audio = np.concatenate([audio, pause])
-                elif suffix.endswith((",", ";", ":")) and comma_pause.size:
-                    audio = np.concatenate([audio, comma_pause])
-            pitch_shift = (
-                req.pitch_shift
-                if req.pitch_shift is not None
-                else profile.get("pitch_shift", 0.0)
-            )
-            if pitch_shift:
-                audio = _apply_pitch_shift(audio, engine.sample_rate, pitch_shift)
-            de_esser_cutoff = (
-                req.de_esser_cutoff
-                if req.de_esser_cutoff is not None
-                else profile.get("de_esser_cutoff", 0.0)
-            )
-            de_esser_order = (
-                req.de_esser_order
-                if req.de_esser_order is not None
-                else profile.get("de_esser_order", 2)
-            )
-            if de_esser_cutoff:
-                audio = _apply_de_esser(audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order))
-            audio = _soft_clip(audio)
-            audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
-            wav_bytes = _audio_to_wav_bytes(audio, engine.sample_rate)
-            payload = base64.b64encode(wav_bytes).decode("ascii")
-            yield json.dumps(
-                {
-                    "chunk_index": idx,
-                    "audio_base64": payload,
-                    "sample_rate": engine.sample_rate,
-                }
-            ) + "\n"
+                tts_chunk_index += 1
+                if smart_trim_db and smart_trim_db > 0:
+                    audio = _smart_vad_trim(
+                        audio,
+                        engine.sample_rate,
+                        top_db=float(smart_trim_db),
+                        pad_ms=float(smart_trim_pad_ms),
+                    )
+                audio = _remove_dc(audio.astype(np.float32, copy=False))
+                if idx < len(chunks) - 1:
+                    suffix = chunk.rstrip()
+                    if suffix.endswith((".", "!", "?")) and pause.size:
+                        audio = np.concatenate([audio, pause])
+                    elif suffix.endswith((",", ";", ":")) and comma_pause.size:
+                        audio = np.concatenate([audio, comma_pause])
+                pitch_shift = (
+                    req.pitch_shift
+                    if req.pitch_shift is not None
+                    else profile.get("pitch_shift", 0.0)
+                )
+                if pitch_shift:
+                    audio = _apply_pitch_shift(audio, engine.sample_rate, pitch_shift)
+                de_esser_cutoff = (
+                    req.de_esser_cutoff
+                    if req.de_esser_cutoff is not None
+                    else profile.get("de_esser_cutoff", 0.0)
+                )
+                de_esser_order = (
+                    req.de_esser_order
+                    if req.de_esser_order is not None
+                    else profile.get("de_esser_order", 2)
+                )
+                if de_esser_cutoff:
+                    audio = _apply_de_esser(audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order))
+                audio = _soft_clip(audio)
+                audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
+                wav_bytes = _audio_to_wav_bytes(audio, engine.sample_rate)
+                payload = base64.b64encode(wav_bytes).decode("ascii")
+                yield json.dumps(
+                    {
+                        "chunk_index": idx,
+                        "audio_base64": payload,
+                        "sample_rate": engine.sample_rate,
+                    }
+                ) + "\n"
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
         yield json.dumps({"event": "done", "inference_ms": round(elapsed_ms, 2)}) + "\n"
 
@@ -2989,7 +3307,6 @@ def generate(req: GenerateRequest):
     lexicon = _load_lexicon(lexicon_path)
 
     try:
-        engine = _get_engine(model_path, config_path)
         profile = _load_profile_defaults(model_path)
         max_chars = (
             req.max_chunk_chars
@@ -3035,77 +3352,79 @@ def generate(req: GenerateRequest):
         chunks = _split_text(clean_text, max_chars, max_words)
         if not chunks:
             raise HTTPException(status_code=400, detail="Text is empty.")
-        parts: list[np.ndarray] = []
-        pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
-        comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
-        comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
-        seed = req.seed if req.seed is not None else profile.get("seed")
-        if seed is None and len(chunks) > 1:
-            seed = 1234
-        if seed is not None:
-            _seed_everything(seed)
-        tts_chunk_index = 0
-        for idx, chunk in enumerate(chunks):
-            ref_for_chunk = ref_wav_path
-            if pad_text:
-                chunk = f"{pad_text_token} {chunk} {pad_text_token}"
-            chunk_seed = seed
-            audio = engine.generate(
-                chunk,
-                ref_wav_path=ref_for_chunk,
-                alpha=params["alpha"],
-                beta=params["beta"],
-                diffusion_steps=params["diffusion_steps"],
-                embedding_scale=params["embedding_scale"],
-                f0_scale=params["f0_scale"],
-                phonemizer_lang=phonemizer_lang,
-                lexicon=lexicon,
-                seed=chunk_seed,
-            )
-            tts_chunk_index += 1
-            if smart_trim_db and smart_trim_db > 0:
-                audio = _smart_vad_trim(
-                    audio,
-                    engine.sample_rate,
-                    top_db=float(smart_trim_db),
-                    pad_ms=float(smart_trim_pad_ms),
+        with _acquire_engine(model_path, config_path) as engine:
+            parts: list[np.ndarray] = []
+            pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
+            comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
+            comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
+            seed = req.seed if req.seed is not None else profile.get("seed")
+            if seed is None and len(chunks) > 1:
+                seed = 1234
+            if seed is not None:
+                _seed_everything(seed)
+            tts_chunk_index = 0
+            for idx, chunk in enumerate(chunks):
+                ref_for_chunk = ref_wav_path
+                if pad_text:
+                    chunk = f"{pad_text_token} {chunk} {pad_text_token}"
+                chunk_seed = seed
+                audio = engine.generate(
+                    chunk,
+                    ref_wav_path=ref_for_chunk,
+                    alpha=params["alpha"],
+                    beta=params["beta"],
+                    diffusion_steps=params["diffusion_steps"],
+                    embedding_scale=params["embedding_scale"],
+                    f0_scale=params["f0_scale"],
+                    phonemizer_lang=phonemizer_lang,
+                    lexicon=lexicon,
+                    seed=chunk_seed,
                 )
-            audio = _remove_dc(audio.astype(np.float32, copy=False))
-            parts.append(audio)
-            if idx < len(chunks) - 1:
-                suffix = chunk.rstrip()
-                if suffix.endswith((".", "!", "?")) and pause.size:
-                    parts.append(pause)
-                elif suffix.endswith((",", ";", ":")) and comma_pause.size:
-                    parts.append(comma_pause)
-        audio = _apply_crossfade(parts, engine.sample_rate, crossfade_ms)
-        pitch_shift = (
-            req.pitch_shift
-            if req.pitch_shift is not None
-            else profile.get("pitch_shift", 0.0)
-        )
-        if pitch_shift:
-            audio = _apply_pitch_shift(audio, engine.sample_rate, pitch_shift)
-        de_esser_cutoff = (
-            req.de_esser_cutoff
-            if req.de_esser_cutoff is not None
-            else profile.get("de_esser_cutoff", 0.0)
-        )
-        de_esser_order = (
-            req.de_esser_order
-            if req.de_esser_order is not None
-            else profile.get("de_esser_order", 2)
-        )
-        if de_esser_cutoff:
-            audio = _apply_de_esser(audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order))
-        audio = _soft_clip(audio)
-        audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
+                tts_chunk_index += 1
+                if smart_trim_db and smart_trim_db > 0:
+                    audio = _smart_vad_trim(
+                        audio,
+                        engine.sample_rate,
+                        top_db=float(smart_trim_db),
+                        pad_ms=float(smart_trim_pad_ms),
+                    )
+                audio = _remove_dc(audio.astype(np.float32, copy=False))
+                parts.append(audio)
+                if idx < len(chunks) - 1:
+                    suffix = chunk.rstrip()
+                    if suffix.endswith((".", "!", "?")) and pause.size:
+                        parts.append(pause)
+                    elif suffix.endswith((",", ";", ":")) and comma_pause.size:
+                        parts.append(comma_pause)
+            audio = _apply_crossfade(parts, engine.sample_rate, crossfade_ms)
+            pitch_shift = (
+                req.pitch_shift
+                if req.pitch_shift is not None
+                else profile.get("pitch_shift", 0.0)
+            )
+            if pitch_shift:
+                audio = _apply_pitch_shift(audio, engine.sample_rate, pitch_shift)
+            de_esser_cutoff = (
+                req.de_esser_cutoff
+                if req.de_esser_cutoff is not None
+                else profile.get("de_esser_cutoff", 0.0)
+            )
+            de_esser_order = (
+                req.de_esser_order
+                if req.de_esser_order is not None
+                else profile.get("de_esser_order", 2)
+            )
+            if de_esser_cutoff:
+                audio = _apply_de_esser(audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order))
+            audio = _soft_clip(audio)
+            audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
+            sample_rate = engine.sample_rate
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    wav_bytes = _audio_to_wav_bytes(audio, engine.sample_rate)
+    wav_bytes = _audio_to_wav_bytes(audio, sample_rate)
 
     if req.return_base64:
         payload = base64.b64encode(wav_bytes).decode("ascii")

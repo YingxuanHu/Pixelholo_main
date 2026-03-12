@@ -391,7 +391,7 @@ const App: React.FC = () => {
     ...(profileType === 'avatar' ? ['Bake avatar frames (Wav2Lip cache)'] : []),
     'Extract audio track',
     'Loudness normalize + filter',
-    'Split on silence (2–10s)',
+    'Split on silence (2-10s)',
     'Transcribe with Whisper',
     'Write metadata.csv',
   ];
@@ -614,11 +614,11 @@ const App: React.FC = () => {
         } else if (line.includes('Extracting audio')) {
           stageUpdate('Extract audio track');
         } else if (line.includes('Loaded audio')) {
-          stageUpdate('Split on silence (2–10s)');
+          stageUpdate('Split on silence (2-10s)');
         } else if (line.includes('Transcribing full audio')) {
           stageUpdate('Transcribe with Whisper');
         } else if (line.includes('Segments: raw=')) {
-          stageUpdate('Split on silence (2–10s)');
+          stageUpdate('Split on silence (2-10s)');
         } else if (line.includes('Exporting') || (line.includes('Wrote') && line.includes('.wav'))) {
           stageUpdate('Write metadata.csv');
         } else if (line.includes('Metadata written')) {
@@ -630,10 +630,10 @@ const App: React.FC = () => {
           const merged = Number(match[2]);
           const kept = Number(match[3]);
           setPreprocessStats({
-            duration: '—',
+            duration: '-',
             segmentsKept: kept,
             segmentsFiltered: merged - kept,
-            avgClipLength: '—',
+            avgClipLength: '-',
             sampleRate: '24 kHz',
           });
         }
@@ -1129,10 +1129,10 @@ const App: React.FC = () => {
         </div>
         <div className="grid grid-cols-2 gap-4 text-xs font-bold">
           <div className="bg-white p-2 rounded border border-amber-100">
-            Kept: {preprocessStats?.segmentsKept ?? '—'}
+            Kept: {preprocessStats?.segmentsKept ?? '-'}
           </div>
           <div className="bg-white p-2 rounded border border-amber-100">
-            Filtered: {preprocessStats?.segmentsFiltered ?? '—'}
+            Filtered: {preprocessStats?.segmentsFiltered ?? '-'}
           </div>
         </div>
       </div>
@@ -1319,7 +1319,7 @@ const App: React.FC = () => {
                               <div className="min-w-0">
                                 <p className="text-xs font-bold truncate">{item.name}</p>
                                 <p className="text-[10px] text-slate-400 truncate">
-                                  {item.processed_wavs} clips · {(item.raw_audio_files ?? 0)} audio · {item.raw_files} video · {item.profile_type || profileType}
+                                  {item.processed_wavs} clips | {(item.raw_audio_files ?? 0)} audio | {item.raw_files} video | {item.profile_type || profileType}
                                 </p>
                               </div>
                               <div className="text-[10px] font-bold ml-2">
@@ -1338,7 +1338,7 @@ const App: React.FC = () => {
                                   setProfileMenuKey(prev => (prev === key ? null : key));
                                 }}
                               >
-                                ⋯
+                                ...
                               </button>
                               {profileMenuKey === `${item.profile_type || profileType}:${item.name}` && (
                                 <div className="absolute right-0 mt-1 min-w-[120px] rounded-lg border border-slate-200 bg-white shadow-lg z-20 py-1">
@@ -1430,7 +1430,7 @@ const App: React.FC = () => {
                           </div>
                           {uploadPhaseVideo === 'uploading' && (
                             <span className="text-[11px] font-semibold text-slate-600">
-                              {formatBytes(uploadBytesVideo.loaded)} / {formatBytes(uploadBytesVideo.total)} · {uploadProgressVideo}%
+                                {formatBytes(uploadBytesVideo.loaded)} / {formatBytes(uploadBytesVideo.total)} | {uploadProgressVideo}%
                             </span>
                           )}
                         </div>
@@ -1497,7 +1497,7 @@ const App: React.FC = () => {
                             </div>
                             {uploadPhaseAudio === 'uploading' && (
                               <span className="text-[11px] font-semibold text-slate-600">
-                                {formatBytes(uploadBytesAudio.loaded)} / {formatBytes(uploadBytesAudio.total)} · {uploadProgressAudio}%
+                                {formatBytes(uploadBytesAudio.loaded)} / {formatBytes(uploadBytesAudio.total)} | {uploadProgressAudio}%
                               </span>
                             )}
                           </div>
@@ -1543,7 +1543,7 @@ const App: React.FC = () => {
               <div className="space-y-6">
                 <div className="bg-slate-50 border border-slate-100 rounded-xl p-4 text-xs text-slate-600">
                   <p className="uppercase tracking-widest text-[9px] font-bold text-slate-400">Input</p>
-                  <p>Profile: <span className="font-semibold">{profile.name || '—'}</span></p>
+                  <p>Profile: <span className="font-semibold">{profile.name || '-'}</span></p>
                   <p>File: <span className="font-semibold">{profile.lastUploadedFile || 'Upload a file first'}</span></p>
                 </div>
                 {profileType === 'avatar' && (
@@ -1738,17 +1738,17 @@ const App: React.FC = () => {
                 <div className="space-y-6">
                 {isWarmingUp && (
                   <div className="bg-amber-50 border border-amber-200 text-amber-800 text-xs font-semibold px-4 py-3 rounded-xl">
-                    Warming up {outputMode === 'avatar' ? (avatarBackend === 'wav2lip' ? 'Wav2Lip' : 'MuseTalk') : 'model'} for selected profile…
+                    Warming up {outputMode === 'avatar' ? (avatarBackend === 'wav2lip' ? 'Wav2Lip' : 'MuseTalk') : 'model'} for selected profile...
                   </div>
                 )}
                 <div className="bg-slate-50 border border-slate-100 rounded-xl px-4 py-3 text-sm text-slate-700">
-                  <span className="font-semibold">Profile:</span> {profile.name || '—'}
+                  <span className="font-semibold">Profile:</span> {profile.name || '-'}
                 </div>
                 <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
                   <div className={`xl:col-span-7 bg-slate-950 border border-slate-900 rounded-2xl p-4 flex flex-col ${outputMode === 'avatar' ? '' : 'opacity-40'}`}>
                     <div className="flex items-center justify-between text-xs text-slate-300">
                       <span className="uppercase tracking-widest text-[9px] font-bold text-slate-400">Avatar Preview</span>
-                      <span className="text-[10px] font-bold text-teal-300">{outputMode === 'avatar' ? `${videoFps} FPS · ${videoQueue} queued` : 'disabled'}</span>
+                      <span className="text-[10px] font-bold text-teal-300">{outputMode === 'avatar' ? `${videoFps} FPS | ${videoQueue} queued` : 'disabled'}</span>
                     </div>
                     <div className="mt-3 bg-black rounded-xl overflow-hidden border border-slate-800 w-full max-w-[720px] mx-auto min-h-[720px]">
                       <canvas ref={videoCanvasRef} width={640} height={853} className="w-full h-full" />

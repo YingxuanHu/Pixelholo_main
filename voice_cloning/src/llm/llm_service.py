@@ -13,7 +13,7 @@ class LLMService:
         load_dotenv()
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
-            print("⚠️ WARNING: GROQ_API_KEY not found in environment variables.")
+            print("WARNING: GROQ_API_KEY not found in environment variables.")
 
         self.client = Groq(api_key=api_key)
         self.system_prompt = system_prompt
@@ -50,7 +50,7 @@ class LLMService:
         buffer = ""
         min_chunk_size = max(min_chars, min_words * 2)
 
-        print("🧠 Llama 3 Thinking...", end="", flush=True)
+        print("Llama 3 Thinking...", end="", flush=True)
 
         for chunk in stream:
             if chunk.choices[0].delta.content:

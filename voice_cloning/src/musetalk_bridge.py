@@ -892,3 +892,31 @@ class MuseTalkBridge:
             output_frames = [output_frames[i] for i in idx.tolist()]
 
         return output_frames
+
+    def close(self) -> None:
+        self.frames = None
+        self.coords_xyxy = None
+        self._latents = []
+        self._mask_arrays = []
+        self._mask_crop_boxes = []
+        self._blend_alphas = []
+        self.audio_history = np.array([], dtype=np.float32)
+        self._loaded_cache_dir = None
+        self._coord_sha1 = None
+        self._vignette_cache.clear()
+        for attr in (
+            "face_parser",
+            "whisper",
+            "whisper_feature_extractor",
+            "timesteps",
+            "pe",
+            "unet",
+            "vae",
+            "_datagen",
+            "_get_image_prepare_material",
+        ):
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except Exception:
+                    pass

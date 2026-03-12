@@ -87,7 +87,7 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
       <textarea
         value={mode === 'chat' ? (transcript || chatText) : text}
         onChange={(e) => (mode === 'chat' ? setChatText(e.target.value) : setText(e.target.value))}
-        placeholder={mode === 'chat' ? 'Ask the assistant…' : 'Type what to say…'}
+        placeholder={mode === 'chat' ? 'Ask the assistant...' : 'Type what to say...'}
         className={inputClass}
         onKeyDown={(e) => {
           if (e.key === 'Enter' && !e.shiftKey) {
@@ -108,7 +108,7 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
                 isListening ? 'bg-rose-500 text-white' : 'bg-slate-800 text-slate-200'
               }`}
             >
-              {isListening ? 'Listening…' : 'Voice Input'}
+              {isListening ? 'Listening...' : 'Voice Input'}
             </button>
           )}
           <button
@@ -116,7 +116,7 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
             disabled={isDisabled}
             className="rounded-lg bg-teal-600 px-4 py-2 text-xs font-bold text-white"
           >
-            {isSending ? 'Processing…' : mode === 'chat' ? 'Send to LLM' : 'Generate'}
+            {isSending ? 'Processing...' : mode === 'chat' ? 'Send to LLM' : 'Generate'}
           </button>
         </div>
       </div>
