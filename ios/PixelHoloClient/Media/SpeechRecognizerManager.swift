@@ -34,6 +34,7 @@ final class SpeechRecognizerManager: NSObject, ObservableObject {
 
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    private var recognitionSessionID: UInt64 = 0
 
     func requestPermissions() async -> Bool {
         let speechAuth = await withCheckedContinuation { continuation in
@@ -63,8 +64,9 @@ final class SpeechRecognizerManager: NSObject, ObservableObject {
         isStarting = true
         errorMessage = nil
         transcript = ""
-
-        stopTranscribing(commitResult: false)
+        recognitionSessionID &+= 1
+        let sessionID = recognitionSessionID
+        _ = stopTranscribingInternal(commitResult: false)
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
@@ -90,20 +92,25 @@ final class SpeechRecognizerManager: NSObject, ObservableObject {
 
         recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
             guard let self else { return }
+            guard self.recognitionSessionID == sessionID else { return }
             if let result {
                 Task { @MainActor in
                     self.transcript = result.bestTranscription.formattedString
                 }
                 if result.isFinal {
                     Task { @MainActor in
-                        self.stopTranscribing(commitResult: true)
+                        self.completeSession(sessionID: sessionID, commitResult: true)
                     }
                 }
             }
             if let error {
                 Task { @MainActor in
+                    guard self.recognitionSessionID == sessionID else { return }
+                    if Self.shouldIgnoreSpeechRecognitionError(error, transcript: self.transcript) {
+                        return
+                    }
                     self.errorMessage = Self.describeSpeechRecognitionError(error)
-                    self.stopTranscribing(commitResult: false)
+                    self.completeSession(sessionID: sessionID, commitResult: false)
                 }
             }
         }
@@ -114,6 +121,25 @@ final class SpeechRecognizerManager: NSObject, ObservableObject {
 
     @discardableResult
     func stopTranscribing(commitResult: Bool = true) -> String? {
+        recognitionSessionID &+= 1
+        return stopTranscribingInternal(commitResult: commitResult)
+    }
+
+    @discardableResult
+    private func stopTranscribingInternal(commitResult: Bool) -> String? {
+        let hadActiveRecognition =
+            isRecording ||
+            isStarting ||
+            recognitionTask != nil ||
+            recognitionRequest != nil ||
+            audioEngine.isRunning
+
+        guard hadActiveRecognition else {
+            isRecording = false
+            isStarting = false
+            return nil
+        }
+
         if audioEngine.isRunning {
             audioEngine.stop()
         }
@@ -128,6 +154,16 @@ final class SpeechRecognizerManager: NSObject, ObservableObject {
         deactivateAudioSessionIfPossible()
         let final = commitResult ? transcript.trimmingCharacters(in: .whitespacesAndNewlines) : nil
         return final?.isEmpty == false ? final : nil
+    }
+
+    @discardableResult
+    private func completeSession(sessionID: UInt64, commitResult: Bool) -> String? {
+        guard recognitionSessionID == sessionID else { return nil }
+        recognitionSessionID &+= 1
+        if commitResult {
+            errorMessage = nil
+        }
+        return stopTranscribingInternal(commitResult: commitResult)
     }
 
     private func configureAudioSession() throws {
@@ -169,6 +205,23 @@ final class SpeechRecognizerManager: NSObject, ObservableObject {
         if nsError.domain == "kAFAssistantErrorDomain", nsError.code == 216 {
             return "Speech recognition error: Apple speech recognition could not start cleanly. This usually happens when recording was triggered more than once for the same press, or the speech service was not ready yet. Release and try again."
         }
+        if nsError.domain == "kAFAssistantErrorDomain", nsError.code == 203 {
+            return "Speech recognition error: Apple speech recognition asked to retry. This is usually a transient Siri speech service issue. Release and try again."
+        }
         return "Speech recognition error: \(error.localizedDescription)"
+    }
+
+    private static func shouldIgnoreSpeechRecognitionError(_ error: Error, transcript: String) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorCancelled {
+            return true
+        }
+        if nsError.domain == "kAFAssistantErrorDomain", nsError.code == 216 {
+            return !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if nsError.domain == "kAFAssistantErrorDomain", nsError.code == 203 {
+            return !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return false
     }
 }

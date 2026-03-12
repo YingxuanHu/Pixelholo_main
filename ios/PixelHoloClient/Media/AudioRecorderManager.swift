@@ -48,12 +48,18 @@ final class AudioRecorderManager: NSObject, ObservableObject {
         recorder?.stop()
         recorder = nil
         isRecording = false
+        deactivateAudioSessionIfPossible()
     }
 
     private func configureAudioSessionForRecording() throws {
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothHFP])
         try session.setActive(true)
+    }
+
+    private func deactivateAudioSessionIfPossible() {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     private static func makeAudioURL(profileName: String) -> URL {
@@ -69,6 +75,7 @@ extension AudioRecorderManager: AVAudioRecorderDelegate {
     nonisolated func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
         Task { @MainActor in
             self.isRecording = false
+            self.deactivateAudioSessionIfPossible()
             if flag {
                 self.recordedURL = recorder.url
             } else {

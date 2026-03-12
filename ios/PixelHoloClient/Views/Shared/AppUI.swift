@@ -78,6 +78,30 @@ struct AppCard<Content: View>: View {
     }
 }
 
+struct AppPrimarySurface<Content: View>: View {
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            content
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .stroke(Color.black.opacity(0.04), lineWidth: 1)
+        )
+    }
+}
+
 struct AppScreen<Content: View>: View {
     let content: Content
 
@@ -253,6 +277,32 @@ struct AppPrimaryActionLabel: View {
         }
         .frame(maxWidth: .infinity)
         .frame(minHeight: 44)
+    }
+}
+
+struct AppSectionDivider: View {
+    var body: some View {
+        Divider()
+            .overlay(Color.black.opacity(0.05))
+            .padding(.vertical, 2)
+    }
+}
+
+struct AppIconCircleButton: View {
+    let icon: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 16, weight: .semibold))
+                .frame(width: 42, height: 42)
+                .background(
+                    Circle()
+                        .fill(Color(uiColor: .secondarySystemGroupedBackground))
+                )
+        }
+        .buttonStyle(.plain)
     }
 }
 

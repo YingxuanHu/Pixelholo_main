@@ -8,6 +8,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     @Published private(set) var isConfigured = false
     @Published private(set) var isRunning = false
     @Published private(set) var isRecording = false
+    @Published private(set) var isProcessing = false
     @Published private(set) var remainingSeconds = 10
     @Published private(set) var recordedURL: URL?
     @Published var errorMessage: String?
@@ -96,6 +97,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         guard !movieOutput.isRecording else { return }
         errorMessage = nil
         recordedURL = nil
+        isProcessing = false
         maxDuration = duration
         remainingSeconds = Int(duration)
 
@@ -190,8 +192,11 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
         if let error {
             errorMessage = error.localizedDescription
+            isProcessing = false
             return
         }
+
+        isProcessing = true
 
         Task.detached(priority: .userInitiated) {
             do {
@@ -199,9 +204,11 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
                 try? FileManager.default.removeItem(at: tempURL)
                 await MainActor.run {
                     self.recordedURL = outputURL
+                    self.isProcessing = false
                 }
             } catch {
                 await MainActor.run {
+                    self.isProcessing = false
                     self.errorMessage = "Video crop failed: \(error.localizedDescription)"
                 }
             }

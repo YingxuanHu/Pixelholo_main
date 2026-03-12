@@ -222,6 +222,35 @@ final class APIClient {
             throw APIError.transport(error)
         }
     }
+
+    func warmup(baseURL: URL, request warmupRequest: WarmupRequest) async throws -> WarmupResponse {
+        let endpointURL = baseURL.appendingPathComponent("warmup")
+        var request = URLRequest(url: endpointURL)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 60
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(warmupRequest)
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw APIError.invalidResponse
+            }
+            guard (200...299).contains(http.statusCode) else {
+                let message = String(data: data, encoding: .utf8) ?? "Unknown server error"
+                throw APIError.server(statusCode: http.statusCode, message: message)
+            }
+            do {
+                return try decoder.decode(WarmupResponse.self, from: data)
+            } catch {
+                throw APIError.decoding(error)
+            }
+        } catch let error as APIError {
+            throw error
+        } catch {
+            throw APIError.transport(error)
+        }
+    }
 }
 
 private extension Data {

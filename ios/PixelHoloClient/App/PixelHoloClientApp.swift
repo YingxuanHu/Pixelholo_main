@@ -45,6 +45,7 @@ struct PixelHoloClientApp: App {
             .toolbarBackground(Color(uiColor: .systemBackground), for: .tabBar)
             .environmentObject(serverConfig)
             .environmentObject(appSession)
+            .environmentObject(appSession.streamSession)
         }
     }
 }

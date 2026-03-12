@@ -1,26 +1,86 @@
+import Combine
 import SwiftUI
 import UIKit
 
 struct AvatarFrameView: UIViewRepresentable {
-    let image: UIImage?
+    let player: AvatarPlayer
     var cornerRadius: CGFloat = 20
 
-    func makeUIView(context: Context) -> UIImageView {
-        let imageView = UIImageView()
-        imageView.backgroundColor = .clear
-        imageView.contentMode = .scaleAspectFill
-        imageView.clipsToBounds = true
-        imageView.layer.cornerRadius = cornerRadius
-        imageView.layer.cornerCurve = .continuous
-        return imageView
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
     }
 
-    func updateUIView(_ uiView: UIImageView, context: Context) {
-        if uiView.image !== image {
-            uiView.image = image
+    func makeUIView(context: Context) -> FrameContainerView {
+        let view = FrameContainerView()
+        view.update(cornerRadius: cornerRadius)
+        context.coordinator.bind(player: player, view: view)
+        return view
+    }
+
+    func updateUIView(_ uiView: FrameContainerView, context: Context) {
+        uiView.update(cornerRadius: cornerRadius)
+        context.coordinator.bind(player: player, view: uiView)
+    }
+
+    final class Coordinator {
+        private var cancellable: AnyCancellable?
+        private weak var boundView: FrameContainerView?
+        private weak var boundPlayer: AvatarPlayer?
+
+        func bind(player: AvatarPlayer, view: FrameContainerView) {
+            guard boundPlayer !== player || boundView !== view else { return }
+            cancellable?.cancel()
+            boundPlayer = player
+            boundView = view
+            view.setImage(player.currentFrame)
+            cancellable = player.$currentFrame
+                .receive(on: DispatchQueue.main)
+                .sink { [weak view] image in
+                    view?.setImage(image)
+                }
         }
-        if uiView.layer.cornerRadius != cornerRadius {
-            uiView.layer.cornerRadius = cornerRadius
+    }
+}
+
+final class FrameContainerView: UIView {
+    private let imageView = UIImageView()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        clipsToBounds = true
+        addSubview(imageView)
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.backgroundColor = .clear
+        imageView.contentMode = .scaleAspectFit
+        imageView.clipsToBounds = true
+
+        NSLayoutConstraint.activate([
+            imageView.topAnchor.constraint(equalTo: topAnchor),
+            imageView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            imageView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            imageView.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func update(cornerRadius: CGFloat) {
+        if layer.cornerRadius != cornerRadius {
+            layer.cornerRadius = cornerRadius
+            layer.cornerCurve = .continuous
+        }
+        if imageView.layer.cornerRadius != 0 {
+            imageView.layer.cornerRadius = 0
+        }
+    }
+
+    func setImage(_ image: UIImage?) {
+        if imageView.image !== image {
+            imageView.image = image
         }
     }
 }

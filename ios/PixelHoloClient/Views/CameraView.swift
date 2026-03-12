@@ -51,13 +51,13 @@ struct CameraView: View {
                         camera.startRecording(profileName: profileName, duration: 10)
                     }
                 } label: {
-                    Text(camera.isRecording ? "Stop Recording" : "Record 10s Video")
+                    Text(camera.isProcessing ? "Processing Video..." : (camera.isRecording ? "Stop Recording" : "Record 10s Video"))
                         .fontWeight(.semibold)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 12)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!camera.isConfigured || isSimulatorBuild)
+                .disabled(!camera.isConfigured || isSimulatorBuild || camera.isProcessing)
             }
         }
         .task {

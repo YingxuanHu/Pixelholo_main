@@ -1,7 +1,5 @@
 import AVFoundation
 import Foundation
-import ImageIO
-import UIKit
 
 private let pixelHoloBinaryStreamMagic = Data("PHS1".utf8)
 private let pixelHoloBinaryStreamHeaderLength = 12
@@ -86,7 +84,6 @@ private struct BinaryPacketParser {
 
 final class StreamingClient {
     private let binaryStreamer: URLSessionBinaryStreamer
-    private static let maxDecodedFrameDimension: CGFloat = 640
 
     init(binaryStreamer: URLSessionBinaryStreamer = URLSessionBinaryStreamer()) {
         self.binaryStreamer = binaryStreamer
@@ -146,8 +143,7 @@ final class StreamingClient {
     }
 
     private func decodeChunk(_ packet: BinaryStreamPacket) async throws -> DecodedStreamChunk {
-        let maxDecodedFrameDimension = Self.maxDecodedFrameDimension
-        return try await Task.detached(priority: .utility) {
+        return try await Task.detached(priority: .userInitiated) {
             let metadata = packet.metadata
             let audioLength = metadata.audioBytesLen ?? 0
             guard audioLength >= 0, packet.payload.count >= audioLength else {
@@ -160,7 +156,7 @@ final class StreamingClient {
             let sampleRate = metadata.sampleRate.map(Double.init) ?? pcmBuffer.format.sampleRate
             let duration = metadata.durationSec ?? (Double(pcmBuffer.frameLength) / pcmBuffer.format.sampleRate)
 
-            var frames: [UIImage] = []
+            var framePayloads: [Data] = []
             var cursor = 0
             for frameLength in metadata.frameLengths ?? [] {
                 guard frameLength >= 0, cursor + frameLength <= framePayload.count else {
@@ -168,9 +164,7 @@ final class StreamingClient {
                 }
                 let frameData = framePayload.subdata(in: cursor..<(cursor + frameLength))
                 cursor += frameLength
-                if let image = Self.decodeFrameImage(from: frameData, maxPixelSize: maxDecodedFrameDimension) {
-                    frames.append(image)
-                }
+                framePayloads.append(frameData)
             }
 
             return DecodedStreamChunk(
@@ -178,33 +172,9 @@ final class StreamingClient {
                 audioBuffer: pcmBuffer,
                 sampleRate: sampleRate,
                 fps: metadata.fps,
-                frames: frames,
+                framePayloads: framePayloads,
                 durationSec: duration
             )
         }.value
-    }
-
-    nonisolated private static func decodeFrameImage(from data: Data, maxPixelSize: CGFloat) -> UIImage? {
-        let options: [CFString: Any] = [
-            kCGImageSourceShouldCache: false,
-        ]
-        guard let source = CGImageSourceCreateWithData(data as CFData, options as CFDictionary) else {
-            return UIImage(data: data)
-        }
-
-        let thumbnailOptions: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
-        ]
-        if let cgImage = CGImageSourceCreateThumbnailAtIndex(
-            source,
-            0,
-            thumbnailOptions as CFDictionary
-        ) {
-            return UIImage(cgImage: cgImage)
-        }
-        return UIImage(data: data)
     }
 }
