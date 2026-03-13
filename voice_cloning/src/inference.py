@@ -1106,6 +1106,30 @@ def _resolve_inference_params(
     return params
 
 
+def _resolve_voice_controls_for_profile(
+    profile: str,
+    profile_type: str | None,
+) -> dict[str, float]:
+    ptype = _normalize_profile_type(profile_type)
+    model_path = _resolve_model_path(None, profile, ptype)
+    config_path = _resolve_config_path(model_path, None, profile, ptype)
+    req = GenerateRequest(text="", speaker=profile, profile_type=ptype)
+    params = _resolve_inference_params(model_path, config_path, req, profile, ptype)
+    profile_defaults = _load_profile_defaults_for_speaker(model_path, profile, ptype)
+
+    def _coerce_float(value, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    return {
+        "pitch_shift": _coerce_float(profile_defaults.get("pitch_shift", 0.0), 0.0),
+        "f0_scale": _coerce_float(params["f0_scale"], DEFAULT_F0_SCALE),
+        "embedding_scale": _coerce_float(params["embedding_scale"], DEFAULT_EMBEDDING_SCALE),
+    }
+
+
 def _stream_avatar_from_text_iter(
     req: GenerateRequest,
     text_iter: Iterator[str],
@@ -3013,6 +3037,23 @@ def interrupt_active_generation():
 @app.get("/profiles")
 def profiles(profile_type: str | None = None):
     return {"profiles": _list_profiles(profile_type)}
+
+
+@app.get("/profiles/{profile_name}/voice-controls")
+def profile_voice_controls(profile_name: str, profile_type: str | None = None):
+    profile = _sanitize_profile_name(profile_name, "profile_name")
+    ptype = _normalize_profile_type(profile_type)
+    try:
+        controls = _resolve_voice_controls_for_profile(profile, ptype)
+    except HTTPException as exc:
+        if exc.status_code == 400 and exc.detail == "model_path is required":
+            raise HTTPException(status_code=404, detail="Profile model not found") from exc
+        raise
+    return {
+        "profile": profile,
+        "profile_type": ptype,
+        "controls": controls,
+    }
 
 
 @app.delete("/profiles/{profile_name}")

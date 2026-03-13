@@ -3,6 +3,7 @@ import ControlPanel from './components/ControlPanel';
 import Header from './components/Header';
 import StepCard from './components/StepCard';
 import LogPanel from './components/LogPanel';
+import VoiceControlsPanel from './components/VoiceControlsPanel';
 import {
   Profile,
   StepStatus,
@@ -11,6 +12,7 @@ import {
   TrainStats,
   InferenceChunk,
   ProfileInfo,
+  VoiceControlValues,
 } from './types';
 
 type TrainFlags = {
@@ -38,6 +40,12 @@ const DEFAULT_AVATAR_BLUR_LEVEL: keyof typeof BLUR_KERNEL_BY_LEVEL = 'medium';
 const DEFAULT_VIDEO_FPS = 25;
 const DEFAULT_AUDIO_START_DELAY_SEC = 0.05;
 const WARMUP_CACHE_MAX_AGE_MS = 120_000;
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+const normalizeVoiceControls = (controls: VoiceControlValues): VoiceControlValues => ({
+  pitchShift: Number(clamp(controls.pitchShift, -4, 4).toFixed(1)),
+  f0Scale: Number(clamp(controls.f0Scale, 0.75, 1.35).toFixed(2)),
+  embeddingScale: Number(clamp(controls.embeddingScale, 0.8, 2.2).toFixed(2)),
+});
 const formatBytes = (value: number) => {
   if (!Number.isFinite(value) || value <= 0) return '0 MB';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -128,6 +136,10 @@ const App: React.FC = () => {
   const [refOverride, setRefOverride] = useState('');
   const [avatarBackend, setAvatarBackend] = useState<'wav2lip' | 'musetalk'>('musetalk');
   const [outputMode, setOutputMode] = useState<'voice' | 'avatar'>(DEFAULT_OUTPUT_MODE);
+  const [voiceControlDefaults, setVoiceControlDefaults] = useState<VoiceControlValues | null>(null);
+  const [voiceControlValues, setVoiceControlValues] = useState<VoiceControlValues | null>(null);
+  const [voiceControlsStatus, setVoiceControlsStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [voiceControlsError, setVoiceControlsError] = useState<string | null>(null);
   const [videoState, setVideoState] = useState<'idle' | 'buffering' | 'playing'>('idle');
   const [videoFps, setVideoFps] = useState(DEFAULT_VIDEO_FPS);
   const [videoQueue, setVideoQueue] = useState(0);
@@ -468,6 +480,66 @@ const App: React.FC = () => {
   const currentProfileInfo = profiles.find((item) => item.name === profile.name);
   const hasTrainedProfile = Boolean(currentProfileInfo?.has_profile);
   const hasData = Boolean(currentProfileInfo?.has_data);
+  const handleVoiceControlsChange = useCallback((patch: Partial<VoiceControlValues>) => {
+    setVoiceControlValues((prev) => {
+      const base = prev ?? voiceControlDefaults;
+      if (!base) return prev;
+      return normalizeVoiceControls({ ...base, ...patch });
+    });
+  }, [voiceControlDefaults]);
+  const resetVoiceControls = useCallback(() => {
+    if (!voiceControlDefaults) return;
+    setVoiceControlValues(voiceControlDefaults);
+  }, [voiceControlDefaults]);
+
+  useEffect(() => {
+    if (apiStatus !== 'online' || !profile.name || !hasTrainedProfile) {
+      setVoiceControlDefaults(null);
+      setVoiceControlValues(null);
+      setVoiceControlsStatus('idle');
+      setVoiceControlsError(null);
+      return;
+    }
+
+    let cancelled = false;
+    const controller = new AbortController();
+    setVoiceControlDefaults(null);
+    setVoiceControlValues(null);
+    setVoiceControlsStatus('loading');
+    setVoiceControlsError(null);
+
+    fetch(
+      `${apiBase}/profiles/${encodeURIComponent(profile.name)}/voice-controls?profile_type=${profileType}`,
+      { cache: 'no-store', signal: controller.signal },
+    )
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await readErrorDetail(res));
+        return res.json();
+      })
+      .then((data) => {
+        if (cancelled) return;
+        const controls = normalizeVoiceControls({
+          pitchShift: Number(data?.controls?.pitch_shift ?? 0),
+          f0Scale: Number(data?.controls?.f0_scale ?? 1),
+          embeddingScale: Number(data?.controls?.embedding_scale ?? 1.2),
+        });
+        setVoiceControlDefaults(controls);
+        setVoiceControlValues(controls);
+        setVoiceControlsStatus('ready');
+      })
+      .catch((err) => {
+        if (cancelled || (err as Error)?.name === 'AbortError') return;
+        setVoiceControlDefaults(null);
+        setVoiceControlValues(null);
+        setVoiceControlsStatus('error');
+        setVoiceControlsError(String(err));
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [apiBase, apiStatus, hasTrainedProfile, profile.name, profileType, readErrorDetail]);
 
   const preprocessSteps = [
     ...(profileType === 'avatar' ? ['Bake avatar frames (Wav2Lip cache)'] : []),
@@ -1012,6 +1084,11 @@ const App: React.FC = () => {
       model_path: modelOverride || null,
       ref_wav_path: refOverride || null,
     };
+    if (voiceControlsStatus === 'ready' && voiceControlValues) {
+      payload.pitch_shift = voiceControlValues.pitchShift;
+      payload.f0_scale = voiceControlValues.f0Scale;
+      payload.embedding_scale = voiceControlValues.embeddingScale;
+    }
     if (outputMode === 'avatar') {
       payload.avatar_profile = profile.name;
       payload.lipsync_backend = avatarBackend;
@@ -1094,7 +1171,21 @@ const App: React.FC = () => {
       }
       streamRunningRef.current = false;
     }
-  }, [apiBase, avatarBackend, enqueueFrames, interruptBackend, modelOverride, outputMode, profile.name, profileType, refOverride, resetVideo, unlockAudio]);
+  }, [
+    apiBase,
+    avatarBackend,
+    enqueueFrames,
+    interruptBackend,
+    modelOverride,
+    outputMode,
+    profile.name,
+    profileType,
+    refOverride,
+    resetVideo,
+    unlockAudio,
+    voiceControlValues,
+    voiceControlsStatus,
+  ]);
 
   const startInference = useCallback(async () => {
     await runInference(inferenceText, '/speak');
@@ -1844,6 +1935,15 @@ const App: React.FC = () => {
                         </div>
                       </div>
                     </div>
+
+                    <VoiceControlsPanel
+                      values={voiceControlValues}
+                      defaults={voiceControlDefaults}
+                      status={voiceControlsStatus}
+                      error={voiceControlsError}
+                      onChange={handleVoiceControlsChange}
+                      onReset={resetVoiceControls}
+                    />
 
                     <div className="bg-slate-950 border border-slate-900 rounded-2xl p-4">
                       <ControlPanel
