@@ -56,7 +56,9 @@ class MuseTalkBridge:
         self.fps = 25.0
         self.audio_history = np.array([], dtype=np.float32)
         self.audio_history_sec = float(os.getenv("MUSE_TALK_AUDIO_HISTORY_SEC", "2.0"))
-        self.infer_fps = float(os.getenv("MUSE_TALK_INFER_FPS", "12.0"))
+        # Keep default infer fps equal to output/avatar fps to avoid apparent slow-motion
+        # (low infer fps + frame upsampling reduces base-frame progression speed).
+        self.infer_fps = float(os.getenv("MUSE_TALK_INFER_FPS", "25.0"))
 
         # Keep MuseTalk box expansion conservative. This avoids chin cut lines without
         # shifting the mouth target area too far from the model's expected region.
@@ -68,9 +70,12 @@ class MuseTalkBridge:
         self.upper_boundary_ratio = float(os.getenv("MUSE_TALK_UPPER_BOUNDARY_RATIO", "0.5"))
         self.blend_expand = float(os.getenv("MUSE_TALK_BLEND_EXPAND", "1.2"))
         # Slightly shrink generated face patch inside the target box to avoid oversized mouth appearance.
-        self.face_scale = float(os.getenv("MUSE_TALK_FACE_SCALE", "1.0"))
-        self.alpha_blur_ratio = float(os.getenv("MUSE_TALK_ALPHA_BLUR_RATIO", "0.05"))
+        self.face_scale = float(os.getenv("MUSE_TALK_FACE_SCALE", "0.98"))
+        self.alpha_blur_ratio = float(os.getenv("MUSE_TALK_ALPHA_BLUR_RATIO", "0.035"))
         self.vignette_margin_ratio = float(os.getenv("MUSE_TALK_VIGNETTE_MARGIN_RATIO", "0.02"))
+        self.alpha_gamma = float(os.getenv("MUSE_TALK_ALPHA_GAMMA", "0.82"))
+        self.detail_sharpen = float(os.getenv("MUSE_TALK_DETAIL_SHARPEN", "0.28"))
+        self.color_match_strength = float(os.getenv("MUSE_TALK_COLOR_MATCH_STRENGTH", "0.65"))
         self.cache_version = int(os.getenv("MUSE_TALK_CACHE_VERSION", "9"))
 
         self.frames: np.ndarray | None = None
@@ -307,8 +312,12 @@ class MuseTalkBridge:
         blur = _odd_kernel(int(round(min(h, w) * self.alpha_blur_ratio)))
         if blur > 1:
             alpha = cv2.GaussianBlur(alpha, (blur, blur), 0)
+        gamma = max(0.6, min(1.4, float(self.alpha_gamma)))
+        if abs(gamma - 1.0) > 1e-3:
+            alpha = np.power(np.clip(alpha, 0.0, 1.0), gamma)
         alpha = np.clip(alpha, 0.0, 1.0)
         alpha *= self._build_vignette(h, w)
+        alpha[alpha < 0.01] = 0.0
         alpha[0, :] = 0.0
         alpha[-1, :] = 0.0
         alpha[:, 0] = 0.0
@@ -316,13 +325,47 @@ class MuseTalkBridge:
         return np.clip(alpha, 0.0, 1.0)
 
     @staticmethod
-    def _match_mean_color(target: np.ndarray, source: np.ndarray) -> np.ndarray:
+    def _match_mean_color(target: np.ndarray, source: np.ndarray, strength: float = 1.0) -> np.ndarray:
         if target.size == 0 or source.size == 0:
             return source
-        t_mean = target.reshape(-1, 3).mean(axis=0)
-        s_mean = source.reshape(-1, 3).mean(axis=0)
-        corrected = source.astype(np.float32) + (t_mean - s_mean)
-        return np.clip(corrected, 0, 255).astype(np.uint8)
+        strength = float(np.clip(strength, 0.0, 1.0))
+        if strength <= 1e-6:
+            return source
+
+        t_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype(np.float32)
+        s_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+        out_lab = s_lab.copy()
+        for channel in range(3):
+            t_ch = t_lab[:, :, channel]
+            s_ch = s_lab[:, :, channel]
+            t_mean = float(np.mean(t_ch))
+            s_mean = float(np.mean(s_ch))
+            t_std = float(np.std(t_ch)) + 1e-5
+            s_std = float(np.std(s_ch)) + 1e-5
+            gain = float(np.clip(t_std / s_std, 0.7, 1.3))
+            mapped = (s_ch - s_mean) * gain + t_mean
+            out_lab[:, :, channel] = mapped
+
+        corrected = cv2.cvtColor(np.clip(out_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+        if strength >= 0.999:
+            return corrected
+        mixed = cv2.addWeighted(corrected, strength, source, 1.0 - strength, 0.0)
+        return np.clip(mixed, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _adaptive_unsharp_luma(image_bgr: np.ndarray, amount: float) -> np.ndarray:
+        amount = float(np.clip(amount, 0.0, 0.8))
+        if amount <= 1e-4:
+            return image_bgr
+        lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l_f = l.astype(np.float32)
+        blur = cv2.GaussianBlur(l_f, (0, 0), 1.05)
+        sharp = cv2.addWeighted(l_f, 1.0 + amount, blur, -amount, 0.0)
+        l_out = np.clip(sharp, 0, 255).astype(np.uint8)
+        out = cv2.merge((l_out, a, b))
+        return cv2.cvtColor(out, cv2.COLOR_LAB2BGR)
 
     def _cache_manifest(
         self,
@@ -342,6 +385,9 @@ class MuseTalkBridge:
             "face_scale": self.face_scale,
             "alpha_blur_ratio": self.alpha_blur_ratio,
             "vignette_margin_ratio": self.vignette_margin_ratio,
+            "alpha_gamma": self.alpha_gamma,
+            "detail_sharpen": self.detail_sharpen,
+            "color_match_strength": self.color_match_strength,
             "frame_shape": list(frame_shape),
         }
 
@@ -684,6 +730,14 @@ class MuseTalkBridge:
             (local_x2 - local_x1, local_y2 - local_y1),
             interpolation=cv2.INTER_LANCZOS4,
         )
+        if self.detail_sharpen > 1e-4:
+            # Apply stronger sharpening only when 256px output is upscaled substantially.
+            scale_x = float(local_x2 - local_x1) / 256.0
+            scale_y = float(local_y2 - local_y1) / 256.0
+            upscale = max(scale_x, scale_y)
+            extra = max(0.0, upscale - 1.0) * 0.22
+            amount = float(np.clip(self.detail_sharpen + extra, 0.0, 0.8))
+            resized = self._adaptive_unsharp_luma(resized, amount)
         place_x1, place_y1 = local_x1, local_y1
         place_x2, place_y2 = local_x2, local_y2
 
@@ -710,7 +764,11 @@ class MuseTalkBridge:
         gx2, gy2 = cx1 + place_x2, cy1 + place_y2
         roi_orig = frame[gy1:gy2, gx1:gx2]
         if roi_orig.shape[:2] == resized.shape[:2]:
-            resized = self._match_mean_color(roi_orig, resized)
+            resized = self._match_mean_color(
+                roi_orig,
+                resized,
+                strength=self.color_match_strength,
+            )
 
         composed_patch = original_patch.copy()
         composed_patch[place_y1:place_y2, place_x1:place_x2] = resized.astype(np.float32)

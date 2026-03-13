@@ -100,7 +100,7 @@ def clean_text_for_tts(text: str) -> str:
         .replace("“", '"')
         .replace("”", '"')
         .replace("—", ", ")
-        .replace("–", "-")
+        .replace("–", ", ")
     )
 
     # Expand common contractions for clearer pronunciation.
@@ -146,6 +146,10 @@ def clean_text_for_tts(text: str) -> str:
     # Strip markdown bullets/asterisks so TTS doesn't read them aloud.
     text = re.sub(r"(^|\n)\s*[*+-]\s+", r"\1", text)
     text = text.replace("*", " ")
+    text = re.sub(r"[()\[\]{}<>|]", " ", text)
+    text = re.sub(r"[\\/]", " ", text)
+    text = re.sub(r"(?<=\w)-(?=\w)", " ", text)
+    text = re.sub(r"-{2,}", ", ", text)
 
     # Address-style "St" -> "Street" (avoid "Saint" in addresses)
     text = re.sub(r"\b(\d+)\s+St\.?\b", r"\1 Street", text)
@@ -182,7 +186,6 @@ def clean_text_for_tts(text: str) -> str:
 
         text = _NUMBER_RE.sub(lambda m: _replace_number(m, year_hint), text)
 
-    text = _glue_connectors(text)
     return text
 
 

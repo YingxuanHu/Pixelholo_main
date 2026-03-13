@@ -1,9 +1,12 @@
 import argparse
 import json
+import os
+import pickle
 import sys
 from pathlib import Path
 import cv2
 import numpy as np
+import torch
 
 # --- 1. REMBG IMPORT ---
 try:
@@ -209,6 +212,254 @@ def _load_detector(device: str = "cuda"):
         return None
 
 
+def _sanitize_xyxy(box: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = [int(v) for v in box]
+    x1 = max(0, min(x1, width - 1))
+    y1 = max(0, min(y1, height - 1))
+    x2 = max(1, min(x2, width))
+    y2 = max(1, min(y2, height))
+    if x2 <= x1:
+        x1, x2 = 0, width
+    if y2 <= y1:
+        y1, y2 = 0, height
+    return x1, y1, x2, y2
+
+
+def _align_mask_to_crop(
+    mask: np.ndarray,
+    crop_box: list[int],
+    frame_w: int,
+    frame_h: int,
+) -> tuple[np.ndarray, list[int]]:
+    x_s, y_s, x_e, y_e = [int(v) for v in crop_box]
+    if x_e <= x_s or y_e <= y_s:
+        return np.zeros((1, 1), dtype=np.uint8), [0, 0, 1, 1]
+
+    cx1 = max(0, x_s)
+    cy1 = max(0, y_s)
+    cx2 = min(frame_w, x_e)
+    cy2 = min(frame_h, y_e)
+    if cx2 <= cx1 or cy2 <= cy1:
+        return np.zeros((1, 1), dtype=np.uint8), [0, 0, 1, 1]
+
+    off_x = cx1 - x_s
+    off_y = cy1 - y_s
+    want_h = cy2 - cy1
+    want_w = cx2 - cx1
+    mask = np.asarray(mask)
+    if mask.ndim != 2:
+        mask = np.squeeze(mask)
+    mask = mask[max(0, off_y) : max(0, off_y) + want_h, max(0, off_x) : max(0, off_x) + want_w]
+    if mask.shape[:2] != (want_h, want_w):
+        mask = cv2.resize(mask, (want_w, want_h), interpolation=cv2.INTER_LINEAR)
+    return mask.astype(np.uint8, copy=False), [cx1, cy1, cx2, cy2]
+
+
+def _smooth_series(values: np.ndarray, window: int = 5) -> np.ndarray:
+    if values.size == 0:
+        return values
+    out = values.astype(np.float32).copy()
+    for i in range(len(out)):
+        start = max(0, i - window + 1)
+        out[i] = out[start : i + 1].mean(axis=0)
+    return out
+
+
+def _build_musetalk_boxes(
+    frames: np.ndarray,
+    base_coords_y1y2x1x2: np.ndarray,
+) -> np.ndarray:
+    frame_h, frame_w = frames.shape[1:3]
+    try:
+        import mediapipe as mp
+    except Exception:
+        mp = None
+
+    # Landmarks used for stable lower-face ROI.
+    lm_mouth_left = 61
+    lm_mouth_right = 291
+    lm_upper_lip = 13
+    lm_lower_lip = 14
+    lm_chin = 152
+    lm_nose = 1
+
+    centers_sizes: list[tuple[float, float, float]] = []
+    for frame, base in zip(frames, base_coords_y1y2x1x2):
+        y1, y2, x1, x2 = [int(v) for v in base]
+        bw = max(1, x2 - x1)
+        bh = max(1, y2 - y1)
+        base_size = float(max(bw, bh))
+        fallback_cx = x1 + bw * 0.5
+        fallback_cy = y1 + bh * 0.62
+        fallback_size = base_size * 0.78
+
+        cx, cy, size = fallback_cx, fallback_cy, fallback_size
+        if mp is not None:
+            if not hasattr(_build_musetalk_boxes, "_mesh"):
+                _build_musetalk_boxes._mesh = mp.solutions.face_mesh.FaceMesh(  # type: ignore[attr-defined]
+                    static_image_mode=True,
+                    max_num_faces=1,
+                    refine_landmarks=True,
+                    min_detection_confidence=0.5,
+                )
+            mesh = _build_musetalk_boxes._mesh  # type: ignore[attr-defined]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            result = mesh.process(rgb)
+            if result.multi_face_landmarks:
+                lms = result.multi_face_landmarks[0].landmark
+                pts = np.array([[lm.x * frame_w, lm.y * frame_h] for lm in lms], dtype=np.float32)
+                mouth_l = pts[lm_mouth_left]
+                mouth_r = pts[lm_mouth_right]
+                mouth_u = pts[lm_upper_lip]
+                mouth_d = pts[lm_lower_lip]
+                chin = pts[lm_chin]
+                nose = pts[lm_nose]
+
+                mouth_center = (mouth_l + mouth_r + mouth_u + mouth_d) / 4.0
+                mouth_w = float(np.linalg.norm(mouth_r - mouth_l))
+                lower_h = float(max(12.0, chin[1] - nose[1]))
+
+                cx = float(mouth_center[0])
+                cy = float(mouth_center[1] + 0.18 * max(8.0, chin[1] - mouth_center[1]))
+                size = max(mouth_w * 2.55, lower_h * 1.2)
+                size = float(np.clip(size, base_size * 0.58, base_size * 1.12))
+
+        centers_sizes.append((cx, cy, size))
+
+    arr = np.array(centers_sizes, dtype=np.float32)
+    if arr.size == 0:
+        return np.zeros((0, 4), dtype=np.int32)
+
+    median_size = float(np.median(arr[:, 2]))
+    if median_size > 1.0:
+        arr[:, 2] = np.clip(arr[:, 2], median_size * 0.85, median_size * 1.22)
+    arr = _smooth_series(arr, window=5)
+
+    coords_xyxy: list[list[int]] = []
+    for cx, cy, size in arr:
+        half = int(round(size / 2.0))
+        nx1 = int(round(cx)) - half
+        ny1 = int(round(cy)) - half
+        nx2 = nx1 + int(round(size))
+        ny2 = ny1 + int(round(size))
+
+        if nx1 < 0:
+            nx2 += -nx1
+            nx1 = 0
+        if ny1 < 0:
+            ny2 += -ny1
+            ny1 = 0
+        if nx2 > frame_w:
+            nx1 -= (nx2 - frame_w)
+            nx2 = frame_w
+        if ny2 > frame_h:
+            ny1 -= (ny2 - frame_h)
+            ny2 = frame_h
+        nx1, ny1, nx2, ny2 = _sanitize_xyxy((nx1, ny1, nx2, ny2), frame_w, frame_h)
+        coords_xyxy.append([nx1, ny1, nx2, ny2])
+
+    return np.array(coords_xyxy, dtype=np.int32)
+
+
+def bake_musetalk_assets(
+    cache_dir: Path,
+    frames: np.ndarray,
+    base_coords_y1y2x1x2: np.ndarray,
+) -> None:
+    if frames.ndim != 4 or base_coords_y1y2x1x2.ndim != 2:
+        raise ValueError("Invalid frames/coords layout for MuseTalk baking.")
+    if len(frames) == 0 or len(frames) != len(base_coords_y1y2x1x2):
+        raise ValueError("Frames/coords mismatch for MuseTalk baking.")
+
+    musetalk_dir = LIP_SYNCING_DIR / "lib" / "MuseTalk"
+    if not musetalk_dir.exists():
+        raise FileNotFoundError(f"MuseTalk repo not found at {musetalk_dir}")
+    if str(musetalk_dir) not in sys.path:
+        sys.path.insert(0, str(musetalk_dir))
+
+    from musetalk.models.vae import VAE
+    from musetalk.utils.blending import get_image_prepare_material
+    from musetalk.utils.face_parsing import FaceParsing
+
+    models_dir = Path(os.getenv("MUSE_TALK_MODELS_DIR", str(musetalk_dir / "models")))
+    vae_dir = Path(os.getenv("MUSE_TALK_VAE_DIR", str(models_dir / "sd-vae")))
+    face_parse_model = Path(
+        os.getenv(
+            "MUSE_TALK_FACE_PARSE_MODEL",
+            str(models_dir / "face-parse-bisent" / "79999_iter.pth"),
+        )
+    )
+    face_parse_resnet = Path(
+        os.getenv(
+            "MUSE_TALK_FACE_PARSE_RESNET",
+            str(models_dir / "face-parse-bisent" / "resnet18-5c106cde.pth"),
+        )
+    )
+    for path in (vae_dir, face_parse_model, face_parse_resnet):
+        if not path.exists():
+            raise FileNotFoundError(f"MuseTalk asset missing: {path}")
+
+    class _FaceParsingWithPaths(FaceParsing):
+        def __init__(self, resnet_path: Path, model_path: Path) -> None:
+            self._resnet_path = str(resnet_path)
+            self._model_path = str(model_path)
+            super().__init__()
+
+        def model_init(self, resnet_path=None, model_pth=None):
+            return super().model_init(
+                resnet_path=self._resnet_path,
+                model_pth=self._model_path,
+            )
+
+    print("   Baking MuseTalk assets (landmark-stabilized)...")
+    vae = VAE(model_path=str(vae_dir))
+    face_parser = _FaceParsingWithPaths(face_parse_resnet, face_parse_model)
+    parsing_mode = os.getenv("MUSE_TALK_PARSING_MODE", "jaw")
+    upper_boundary_ratio = float(os.getenv("MUSE_TALK_UPPER_BOUNDARY_RATIO", "0.5"))
+    bake_expand = float(os.getenv("MUSE_TALK_BAKE_EXPAND", "1.0"))
+    frame_h, frame_w = frames.shape[1:3]
+
+    coords_xyxy = _build_musetalk_boxes(frames, base_coords_y1y2x1x2)
+    np.save(cache_dir / "musetalk_coords.npy", coords_xyxy)
+
+    latents: list[torch.Tensor] = []
+    mask_arrays: list[np.ndarray] = []
+    mask_crop_boxes: list[list[int]] = []
+
+    for frame, coord in zip(frames, coords_xyxy):
+        x1, y1, x2, y2 = _sanitize_xyxy(tuple(int(v) for v in coord), frame_w, frame_h)
+
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            crop = frame
+            x1, y1, x2, y2 = 0, 0, frame_w, frame_h
+        resized = cv2.resize(crop, (256, 256), interpolation=cv2.INTER_LANCZOS4)
+        latents.append(vae.get_latents_for_unet(resized).detach().cpu())
+
+        mask, crop_box = get_image_prepare_material(
+            frame,
+            [x1, y1, x2, y2],
+            upper_boundary_ratio=upper_boundary_ratio,
+            expand=bake_expand,
+            fp=face_parser,
+            mode=parsing_mode,
+        )
+        aligned_mask, aligned_crop_box = _align_mask_to_crop(mask, crop_box, frame_w, frame_h)
+        mask_arrays.append(aligned_mask)
+        mask_crop_boxes.append([int(v) for v in aligned_crop_box])
+
+    torch.save(latents, cache_dir / "musetalk_latents.pt")
+    with (cache_dir / "musetalk_masks.pkl").open("wb") as handle:
+        pickle.dump(
+            {
+                "coord_format": "xyxy",
+                "mask_arrays": mask_arrays,
+                "mask_crop_boxes": mask_crop_boxes,
+            },
+            handle,
+        )
+
+
 def bake_avatar(
     profile: str,
     video_path: Path,
@@ -337,6 +588,17 @@ def bake_avatar(
         "height": int(frames[0].shape[0]),
     }
     (cache_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
+    # Build MuseTalk assets offline to keep runtime inference deterministic.
+    try:
+        bake_musetalk_assets(
+            cache_dir=cache_dir,
+            frames=np.array(frames, dtype=np.uint8),
+            base_coords_y1y2x1x2=coords_arr,
+        )
+    except Exception as exc:
+        print(f"[WARN] MuseTalk asset bake failed, runtime fallback will be used: {exc}")
+
     return cache_dir
 
 

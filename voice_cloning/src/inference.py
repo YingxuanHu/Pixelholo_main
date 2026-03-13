@@ -4,6 +4,7 @@ import base64
 import queue
 import threading
 import contextlib
+import gc
 import json
 import logging
 import traceback
@@ -20,7 +21,7 @@ import time
 import warnings
 from pathlib import Path
 from typing import Iterator, Protocol
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 import numpy as np
 import cv2
@@ -33,7 +34,6 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from src.lipsync_bridge import LipSyncBridge
 from src.text_normalize import clean_text_for_tts, warmup_text_normalizer
 from src.utils.smart_buffer import SmartStreamBuffer
 from src.utils.prosody_chunker import prosody_split
@@ -93,6 +93,8 @@ from config import (  # noqa: E402
     resolve_training_dir,
     TRAINING_DIRNAME,
     training_root,
+    inference_audio_dir,
+    inference_video_dir,
 )
 
 if STYLE_TTS2_DIR.exists():
@@ -131,6 +133,27 @@ _engine_lock = threading.Lock()
 _engines: dict[tuple[str, str], "StyleTTS2RepoEngine"] = {}
 _lipsync_lock = threading.Lock()
 _lipsync_engines: dict[str, "_LipSyncEngineProtocol"] = {}
+_active_stream_lock = threading.Lock()
+_active_stream_stop_events: set[threading.Event] = set()
+_warmup_profile_lock = threading.Lock()
+
+
+def _register_stream_stop_event(stop_event: threading.Event) -> None:
+    with _active_stream_lock:
+        _active_stream_stop_events.add(stop_event)
+
+
+def _unregister_stream_stop_event(stop_event: threading.Event) -> None:
+    with _active_stream_lock:
+        _active_stream_stop_events.discard(stop_event)
+
+
+def _interrupt_active_streams() -> int:
+    with _active_stream_lock:
+        events = list(_active_stream_stop_events)
+    for event in events:
+        event.set()
+    return len(events)
 _SIGMA_WARNED_PATHS: set[str] = set()
 
 
@@ -244,6 +267,52 @@ def _split_text_staircase(
 def _split_text_prosody(text: str, max_chars: int, first_chunk_max_chars: int | None = None) -> list[str]:
     limit = first_chunk_max_chars or max(60, int(max_chars * 0.5))
     return prosody_split(text, max_chars=max_chars, first_chunk_max_chars=limit)
+
+
+def _plan_stream_tts_chunks(
+    sentence: str,
+    max_chars: int,
+    max_words: int,
+    *,
+    first_chunk_max_chars: int | None = None,
+    is_first_global_chunk: bool = False,
+) -> list[str]:
+    text = sentence.strip()
+    if not text:
+        return []
+
+    # Favor full-sentence synthesis to keep timbre/prosody stable across output.
+    single_max_chars = max(
+        80,
+        min(
+            int(os.getenv("STREAM_SENTENCE_SINGLE_MAX_CHARS", "220")),
+            600,
+        ),
+    )
+    single_max_words = max(
+        16,
+        min(
+            int(os.getenv("STREAM_SENTENCE_SINGLE_MAX_WORDS", "48")),
+            120,
+        ),
+    )
+
+    # Optional fast-first-byte split only for the very first global chunk.
+    if (
+        is_first_global_chunk
+        and first_chunk_max_chars is not None
+        and len(text) > int(first_chunk_max_chars)
+    ):
+        return _split_text_prosody(
+            text,
+            max_chars=max_chars,
+            first_chunk_max_chars=int(first_chunk_max_chars),
+        )
+
+    if len(text) <= single_max_chars and len(text.split()) <= single_max_words:
+        return [text]
+
+    return _split_text(text, max_chars=max_chars, max_words=max_words)
 
 
 def _smart_chunks(text: str, min_chars: int = 40, max_chars: int = 150) -> list[str]:
@@ -669,6 +738,87 @@ def _list_profiles(profile_type: str | None) -> list[dict[str, object]]:
     return profiles
 
 
+def _normalize_profile_type(profile_type: str | None) -> str:
+    return PROFILE_TYPE_AVATAR if profile_type == PROFILE_TYPE_AVATAR else PROFILE_TYPE_VOICE
+
+
+def _sanitize_profile_name(name: str, field_name: str = "profile") -> str:
+    cleaned = (name or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required")
+    if cleaned in {".", ".."}:
+        raise HTTPException(status_code=400, detail=f"{field_name} is invalid")
+    if any(token in cleaned for token in ("/", "\\", "\x00")):
+        raise HTTPException(status_code=400, detail=f"{field_name} contains invalid characters")
+    return cleaned
+
+
+def _profile_paths(profile_name: str, profile_type: str) -> list[Path]:
+    ptype = _normalize_profile_type(profile_type)
+    candidates: list[Path] = [
+        profile_data_root(ptype) / profile_name,
+        training_root(ptype) / profile_name,
+        inference_audio_dir(profile_name, ptype),
+    ]
+    if ptype == PROFILE_TYPE_AVATAR:
+        candidates.append(inference_video_dir(profile_name, ptype))
+    else:
+        legacy_training = OUTPUTS_DIR / TRAINING_DIRNAME / profile_name
+        candidates.append(legacy_training)
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
+def _rewrite_profile_refs_in_dir(
+    root: Path,
+    *,
+    old_name: str,
+    new_name: str,
+    path_replacements: dict[str, str],
+) -> None:
+    if not root.exists() or not root.is_dir():
+        return
+    for file_path in root.rglob("*"):
+        if not file_path.is_file():
+            continue
+        if file_path.suffix.lower() not in {".json", ".txt"}:
+            continue
+        try:
+            if file_path.stat().st_size > 5_000_000:
+                continue
+            text = file_path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        updated = text
+        for old_path, new_path in path_replacements.items():
+            updated = updated.replace(old_path, new_path)
+            updated = updated.replace(old_path.replace("\\", "/"), new_path.replace("\\", "/"))
+        updated = updated.replace(f"/{old_name}/", f"/{new_name}/")
+        updated = updated.replace(f"\\{old_name}\\", f"\\{new_name}\\")
+        if updated != text:
+            file_path.write_text(updated, encoding="utf-8")
+
+
+def _drop_warmup_cache_for_profile(profile_name: str, profile_type: str) -> None:
+    ptype = _normalize_profile_type(profile_type)
+    global _warmed_tts_profiles, _warmed_lipsync_profiles
+    _warmed_tts_profiles = {
+        key for key in _warmed_tts_profiles if not (key[0] == profile_name and key[1] == ptype)
+    }
+    _warmed_lipsync_profiles = {
+        key
+        for key in _warmed_lipsync_profiles
+        if not (key[0] == profile_name and key[1] == ptype)
+    }
+
+
 def _resolve_config_path(
     model_path: Path,
     config_path: str | None,
@@ -916,7 +1066,8 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
     engine = _get_engine(model_path, config_path)
     try:
         lipsync = _get_lipsync_engine(req.lipsync_backend)
-        lipsync.load_profile(profile, profile_type)
+        with _lipsync_lock:
+            lipsync.load_profile(profile, profile_type)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     is_musetalk = lipsync.__class__.__name__ == "MuseTalkBridge"
@@ -988,6 +1139,14 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
         if req.smart_trim_pad_ms is not None
         else profile_defaults.get("stream_smart_trim_pad_ms", 30.0)
     )
+    # Avoid per-TTS-chunk fade envelopes by default. AudioStitcher already handles
+    # chunk boundary smoothing, and extra edge fades can introduce audible flutter/pops.
+    stream_chunk_edge_fade_ms = float(
+        profile_defaults.get(
+            "stream_chunk_edge_fade_ms",
+            os.getenv("STREAM_CHUNK_EDGE_FADE_MS", "0.0"),
+        )
+    )
 
     seed = req.seed if req.seed is not None else profile_defaults.get("seed")
     if seed is None:
@@ -1036,11 +1195,13 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
             jpeg_quality = int(
                 profile_defaults.get(
                     "musetalk_jpeg_quality",
-                    os.getenv("MUSE_TALK_JPEG_QUALITY", "72"),
+                    os.getenv("MUSE_TALK_JPEG_QUALITY", "92"),
                 )
             )
 
     def _generator() -> Iterator[str]:
+        stop_event = threading.Event()
+        _register_stream_stop_event(stop_event)
         result_queue: queue.Queue[tuple[str, int, np.ndarray | None, np.ndarray | None]] = queue.Queue(
             maxsize=3
         )
@@ -1050,33 +1211,69 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
         def _sentence_reader() -> None:
             try:
                 for sentence in text_iter:
-                    sentence_queue.put(sentence)
+                    if stop_event.is_set():
+                        break
+                    while not stop_event.is_set():
+                        try:
+                            sentence_queue.put(sentence, timeout=0.2)
+                            break
+                        except queue.Full:
+                            continue
             finally:
-                sentence_queue.put(None)
+                while True:
+                    try:
+                        sentence_queue.put(None, timeout=0.2)
+                        break
+                    except queue.Full:
+                        if stop_event.is_set():
+                            break
+                        continue
+
+        def _put_result(
+            kind: str,
+            idx: int,
+            audio: np.ndarray | None,
+            audio_16k: np.ndarray | None,
+        ) -> None:
+            while not stop_event.is_set():
+                try:
+                    result_queue.put((kind, idx, audio, audio_16k), timeout=0.2)
+                    return
+                except queue.Full:
+                    continue
 
         def _audio_worker() -> None:
             idx = 0
-            first_tts_chunk = True
+            tts_chunk_index = 0
             try:
                 if seed is not None:
                     _seed_everything(seed)
-                while True:
-                    sentence = sentence_queue.get()
+                while not stop_event.is_set():
+                    try:
+                        sentence = sentence_queue.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
                     if sentence is None:
                         break
                     clean_sentence = clean_text_for_tts(sentence)
                     if not re.search(r"[A-Za-z0-9]", clean_sentence):
                         continue
                     sentence_ref = ref_wav_path
-                    for chunk in _split_text_prosody(
+                    sentence_chunks = _plan_stream_tts_chunks(
                         clean_sentence,
-                        max_chars,
+                        max_chars=max_chars,
+                        max_words=max_words,
                         first_chunk_max_chars=first_chunk_max_chars,
-                    ):
+                        is_first_global_chunk=(tts_chunk_index == 0),
+                    )
+                    for chunk in sentence_chunks:
+                        if stop_event.is_set():
+                            return
                         if pad_text:
                             chunk = f"{pad_text_token} {chunk} {pad_text_token}"
-                        chunk_seed = seed if first_tts_chunk else None
-                        audio = _AI_EXECUTOR.submit(
+                        is_first_tts_chunk = tts_chunk_index == 0
+                        chunk_seed = seed
+                        future = _AI_EXECUTOR.submit(
                             _generate_with_seed,
                             engine,
                             chunk_seed,
@@ -1089,9 +1286,18 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
                             params["f0_scale"],
                             phonemizer_lang,
                             lexicon,
-                            first_tts_chunk,
-                        ).result()
-                        first_tts_chunk = False
+                            is_first_tts_chunk,
+                        )
+                        while True:
+                            if stop_event.is_set():
+                                future.cancel()
+                                return
+                            try:
+                                audio = future.result(timeout=0.2)
+                                break
+                            except FutureTimeoutError:
+                                continue
+                        tts_chunk_index += 1
                         if audio is None or audio.size == 0:
                             continue
                         audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1125,7 +1331,12 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
                                 audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order)
                             )
                         audio = _soft_clip(audio)
-                        audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
+                        if stream_chunk_edge_fade_ms > 0:
+                            audio = _fade_edges(
+                                audio,
+                                engine.sample_rate,
+                                fade_ms=float(stream_chunk_edge_fade_ms),
+                            )
                         is_sentence_end = chunk.rstrip().endswith((".", "!", "?"))
                         is_clause_end = chunk.rstrip().endswith((",", ";", ":"))
                         if is_sentence_end and pause.size:
@@ -1137,25 +1348,23 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
                             audio_16k = librosa.resample(
                                 stitched, orig_sr=engine.sample_rate, target_sr=16000
                             )
-                            result_queue.put(
-                                ("data", idx, stitched, audio_16k.astype(np.float32))
-                            )
+                            _put_result("data", idx, stitched, audio_16k.astype(np.float32))
                             idx += 1
                 tail = stitcher.flush()
-                if tail.size:
+                if tail.size and not stop_event.is_set():
                     audio_16k = librosa.resample(
                         tail, orig_sr=engine.sample_rate, target_sr=16000
                     )
-                    result_queue.put(
-                        ("data", idx, tail, audio_16k.astype(np.float32))
-                    )
+                    _put_result("data", idx, tail, audio_16k.astype(np.float32))
                     idx += 1
-                result_queue.put(("done", -1, None, None))
+                _put_result("done", -1, None, None)
             except Exception as exc:
-                result_queue.put(("error", -1, np.array([str(exc)], dtype=object), None))
+                _put_result("error", -1, np.array([str(exc)], dtype=object), None)
 
-        threading.Thread(target=_sentence_reader, daemon=True).start()
-        threading.Thread(target=_audio_worker, daemon=True).start()
+        sentence_reader_thread = threading.Thread(target=_sentence_reader, daemon=True)
+        audio_worker_thread = threading.Thread(target=_audio_worker, daemon=True)
+        sentence_reader_thread.start()
+        audio_worker_thread.start()
 
         last_frame: np.ndarray | None = None
         musetalk_prev_tail_frames: list[np.ndarray] = []
@@ -1267,7 +1476,12 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
 
         try:
             while True:
-                kind, idx, audio, audio_16k = result_queue.get()
+                try:
+                    kind, idx, audio, audio_16k = result_queue.get(timeout=0.2)
+                except queue.Empty:
+                    if stop_event.is_set():
+                        break
+                    continue
                 if kind == "error":
                     detail = "Audio worker failed."
                     if audio is not None and audio.size > 0:
@@ -1311,6 +1525,17 @@ def _stream_avatar_from_text_iter(req: GenerateRequest, text_iter: Iterator[str]
         except Exception:
             logger.exception("Avatar stream failed")
             yield json.dumps({"event": "error", "detail": traceback.format_exc()}) + "\n"
+        finally:
+            stop_event.set()
+            with contextlib.suppress(Exception):
+                close_text_iter = getattr(text_iter, "close", None)
+                if callable(close_text_iter):
+                    close_text_iter()
+            with contextlib.suppress(Exception):
+                sentence_reader_thread.join(timeout=0.5)
+            with contextlib.suppress(Exception):
+                audio_worker_thread.join(timeout=0.5)
+            _unregister_stream_stop_event(stop_event)
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
         yield json.dumps({"event": "done", "inference_ms": round(elapsed_ms, 2)}) + "\n"
@@ -1375,6 +1600,8 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
         seed = 1234
 
     def _generator() -> Iterator[str]:
+        stop_event = threading.Event()
+        _register_stream_stop_event(stop_event)
         idx = 0
         tts_chunk_index = 0
         stitcher = AudioStitcher(sample_rate=engine.sample_rate, fade_len_ms=15.0)
@@ -1382,12 +1609,22 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
             if seed is not None:
                 _seed_everything(seed)
             for sentence in text_iter:
+                if stop_event.is_set():
+                    break
                 clean_sentence = clean_text_for_tts(sentence)
                 sentence_ref = ref_wav_path
-                for chunk in _split_text_prosody(clean_sentence, max_chars):
+                sentence_chunks = _plan_stream_tts_chunks(
+                    clean_sentence,
+                    max_chars=max_chars,
+                    max_words=max_words,
+                    is_first_global_chunk=(tts_chunk_index == 0),
+                )
+                for chunk in sentence_chunks:
+                    if stop_event.is_set():
+                        break
                     if pad_text:
                         chunk = f"{pad_text_token} {chunk} {pad_text_token}"
-                    chunk_seed = seed if tts_chunk_index == 0 else None
+                    chunk_seed = seed
                     audio = engine.generate(
                         chunk,
                         ref_wav_path=sentence_ref,
@@ -1465,6 +1702,13 @@ def _stream_voice_from_text_iter(req: GenerateRequest, text_iter: Iterator[str])
             logger.exception("Voice stream failed")
             yield json.dumps({"event": "error", "detail": traceback.format_exc()}) + "\n"
             return
+        finally:
+            stop_event.set()
+            with contextlib.suppress(Exception):
+                close_text_iter = getattr(text_iter, "close", None)
+                if callable(close_text_iter):
+                    close_text_iter()
+            _unregister_stream_stop_event(stop_event)
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
         yield json.dumps({"event": "done", "inference_ms": round(elapsed_ms, 2)}) + "\n"
@@ -1545,6 +1789,18 @@ class TrainRequest(BaseModel):
     early_stop: bool = True
 
 
+class WarmupRequest(BaseModel):
+    profile: str
+    profile_type: str | None = None
+    lipsync_backend: str | None = None
+    force: bool = False
+
+
+class ProfileRenameRequest(BaseModel):
+    new_name: str
+    profile_type: str | None = None
+
+
 class StyleTTS2RepoEngine:
     def __init__(self, model_path: Path, config_path: Path, device: str | None = None):
         self.model_path = model_path
@@ -1573,7 +1829,7 @@ class StyleTTS2RepoEngine:
 
         from models import build_model, load_ASR_models, load_F0_models, load_checkpoint
         from utils import length_to_mask, recursive_munch
-        from text_utils import TextCleaner
+        from text_utils import TextCleaner, symbols as tts_symbols
         from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
         from Utils.PLBERT.util import load_plbert
 
@@ -1582,6 +1838,7 @@ class StyleTTS2RepoEngine:
         self._phonemizers: dict[str, object] = {}
         self._word_tokenize = word_tokenize
         self._length_to_mask = length_to_mask
+        self._text_symbols = set(tts_symbols)
 
         with self.config_path.open("r") as handle:
             self.config = yaml.safe_load(handle)
@@ -1753,6 +2010,11 @@ class StyleTTS2RepoEngine:
 
         phonemes = self._phonemize(text, phonemizer_lang, lexicon)
         tokens = " ".join(self._tokenize(phonemes))
+        if self._text_symbols:
+            tokens = "".join(ch for ch in tokens if ch in self._text_symbols)
+        tokens = re.sub(r"\s+", " ", tokens).strip()
+        if not tokens:
+            raise ValueError("Text normalization produced an empty token stream.")
         token_ids = self._text_cleaner(tokens)
         token_ids.insert(0, 0)
 
@@ -1831,11 +2093,11 @@ class StyleTTS2RepoEngine:
 
 
 
-def _resolve_lipsync_backend(requested_backend: str | None = None) -> str:
-    backend = (
-        requested_backend.strip().lower()
-        if isinstance(requested_backend, str) and requested_backend.strip()
-        else os.getenv("LIPSYNC_BACKEND", "wav2lip").strip().lower()
+def _normalize_lipsync_backend(backend: str | None, default: str = "musetalk") -> str:
+    resolved_input = (
+        backend.strip().lower()
+        if isinstance(backend, str) and backend.strip()
+        else default.strip().lower()
     )
     aliases = {
         "wav2lip": "wav2lip",
@@ -1843,12 +2105,30 @@ def _resolve_lipsync_backend(requested_backend: str | None = None) -> str:
         "musetalk": "musetalk",
         "mt": "musetalk",
     }
-    resolved = aliases.get(backend)
+    resolved = aliases.get(resolved_input)
     if not resolved:
         raise ValueError(
-            f"Unsupported LIPSYNC_BACKEND={backend}. Use one of: wav2lip, musetalk."
+            f"Unsupported LIPSYNC_BACKEND={resolved_input}. Use one of: wav2lip, musetalk."
         )
     return resolved
+
+
+def _runtime_lipsync_backend() -> str:
+    # Default to MuseTalk unless the process is explicitly started with wav2lip.
+    return _normalize_lipsync_backend(os.getenv("LIPSYNC_BACKEND", "musetalk"), default="musetalk")
+
+
+def _resolve_lipsync_backend(requested_backend: str | None = None) -> str:
+    runtime_backend = _runtime_lipsync_backend()
+    if isinstance(requested_backend, str) and requested_backend.strip():
+        req = _normalize_lipsync_backend(requested_backend, default=runtime_backend)
+        if req != runtime_backend:
+            logger.info(
+                "component=lipsync op=backend_select status=locked runtime=%s requested=%s",
+                runtime_backend,
+                req,
+            )
+    return runtime_backend
 
 
 def _build_lipsync_engine(backend: str) -> _LipSyncEngineProtocol:
@@ -1856,12 +2136,61 @@ def _build_lipsync_engine(backend: str) -> _LipSyncEngineProtocol:
         from src.musetalk_bridge import MuseTalkBridge
 
         return MuseTalkBridge()
+    from src.lipsync_bridge import LipSyncBridge
+
     return LipSyncBridge()
+
+
+def _dispose_lipsync_engine(engine: object) -> None:
+    for method_name in ("close", "shutdown"):
+        method = getattr(engine, method_name, None)
+        if callable(method):
+            try:
+                method()
+            except Exception:
+                logger.debug(
+                    "component=lipsync op=engine_dispose status=close_error method=%s",
+                    method_name,
+                    exc_info=True,
+                )
+    del engine
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            logger.debug(
+                "component=lipsync op=engine_dispose status=cuda_empty_cache_error",
+                exc_info=True,
+            )
+
+
+def _evict_lipsync_engines(keep_backend: str) -> None:
+    for backend_name in list(_lipsync_engines.keys()):
+        if backend_name == keep_backend:
+            continue
+        stale_engine = _lipsync_engines.pop(backend_name, None)
+        if stale_engine is None:
+            continue
+        _dispose_lipsync_engine(stale_engine)
+        logger.info(
+            "component=lipsync op=engine_evict status=ok backend=%s keep=%s",
+            backend_name,
+            keep_backend,
+        )
+        warmed = globals().get("_warmed_lipsync_profiles")
+        if isinstance(warmed, set):
+            stale_keys = [k for k in warmed if isinstance(k, tuple) and len(k) == 3 and k[2] == backend_name]
+            for key in stale_keys:
+                warmed.discard(key)
 
 
 def _get_lipsync_engine(requested_backend: str | None = None) -> _LipSyncEngineProtocol:
     with _lipsync_lock:
         desired_backend = _resolve_lipsync_backend(requested_backend)
+        strict_isolation = os.getenv("LIPSYNC_STRICT_ISOLATION", "1") == "1"
+        if strict_isolation:
+            _evict_lipsync_engines(keep_backend=desired_backend)
         if desired_backend not in _lipsync_engines:
             try:
                 _lipsync_engines[desired_backend] = _build_lipsync_engine(desired_backend)
@@ -1870,17 +2199,11 @@ def _get_lipsync_engine(requested_backend: str | None = None) -> _LipSyncEngineP
                     desired_backend,
                 )
             except Exception:
-                fallback_enabled = os.getenv("LIPSYNC_BACKEND_FALLBACK", "0") == "1"
-                if desired_backend != "wav2lip" and fallback_enabled:
-                    logger.exception(
-                        "component=lipsync op=engine_init status=error backend=%s fallback=wav2lip",
-                        desired_backend,
-                    )
-                    if "wav2lip" not in _lipsync_engines:
-                        _lipsync_engines["wav2lip"] = LipSyncBridge()
-                    desired_backend = "wav2lip"
-                else:
-                    raise
+                logger.exception(
+                    "component=lipsync op=engine_init status=error backend=%s",
+                    desired_backend,
+                )
+                raise
         return _lipsync_engines[desired_backend]
 
 
@@ -1932,43 +2255,66 @@ def _warmup_engine(model_path: Path, config_path: Path) -> None:
         print(f"Warmup failed: {exc}")
 
 
-_warmed_profiles: set[tuple[str, str]] = set()
+_warmed_tts_profiles: set[tuple[str, str]] = set()
+_warmed_lipsync_profiles: set[tuple[str, str, str]] = set()
 
 
-def _warmup_lipsync(profile: str, profile_type: str) -> None:
+def _warmup_lipsync(
+    profile: str,
+    profile_type: str,
+    requested_backend: str | None = None,
+) -> str:
+    backend = _resolve_lipsync_backend(requested_backend)
     try:
-        lipsync = _get_lipsync_engine()
-        lipsync.load_profile(profile, profile_type)
-        dummy = np.zeros(int(0.4 * 16000), dtype=np.float32)
-        lipsync.sync_chunk(dummy, fps=lipsync.fps)
-        print("Lipsync warmup completed.")
+        lipsync = _get_lipsync_engine(backend)
+        with _lipsync_lock:
+            lipsync.load_profile(profile, profile_type)
+            dummy = np.zeros(int(0.4 * 16000), dtype=np.float32)
+            lipsync.sync_chunk(dummy, fps=lipsync.fps)
+        print(f"Lipsync warmup completed ({backend}).")
+        return backend
     except Exception as exc:
-        print(f"Lipsync warmup failed: {exc}")
+        print(f"Lipsync warmup failed ({backend}): {exc}")
+        raise
 
 
-def _warmup_profile(profile: str, profile_type: str) -> None:
-    key = (profile, profile_type)
-    if key in _warmed_profiles:
-        return
-    try:
-        model_path = _resolve_model_path(None, profile, profile_type)
-        config_path = _resolve_config_path(model_path, None, profile, profile_type)
-        _warmup_engine(model_path, config_path)
-    except HTTPException:
-        logger.info(
-            "component=backend op=warmup_profile skip=tts profile=%s profile_type=%s reason=model_unset",
-            profile,
-            profile_type,
-        )
-    except Exception:
-        logger.exception(
-            "component=backend op=warmup_profile skip=tts profile=%s profile_type=%s reason=error",
-            profile,
-            profile_type,
-        )
-    if profile_type == PROFILE_TYPE_AVATAR:
-        _warmup_lipsync(profile, profile_type)
-    _warmed_profiles.add(key)
+def _warmup_profile(
+    profile: str,
+    profile_type: str,
+    requested_backend: str | None = None,
+    force: bool = False,
+) -> str | None:
+    with _warmup_profile_lock:
+        tts_key = (profile, profile_type)
+        if force or tts_key not in _warmed_tts_profiles:
+            try:
+                model_path = _resolve_model_path(None, profile, profile_type)
+                config_path = _resolve_config_path(model_path, None, profile, profile_type)
+                _warmup_engine(model_path, config_path)
+                _warmed_tts_profiles.add(tts_key)
+            except HTTPException:
+                logger.info(
+                    "component=backend op=warmup_profile skip=tts profile=%s profile_type=%s reason=model_unset",
+                    profile,
+                    profile_type,
+                )
+            except Exception:
+                logger.exception(
+                    "component=backend op=warmup_profile skip=tts profile=%s profile_type=%s reason=error",
+                    profile,
+                    profile_type,
+                )
+
+        warmed_backend: str | None = None
+        if profile_type == PROFILE_TYPE_AVATAR:
+            backend = _resolve_lipsync_backend(requested_backend)
+            lipsync_key = (profile, profile_type, backend)
+            if force or lipsync_key not in _warmed_lipsync_profiles:
+                warmed_backend = _warmup_lipsync(profile, profile_type, backend)
+                _warmed_lipsync_profiles.add(lipsync_key)
+            else:
+                warmed_backend = backend
+        return warmed_backend
 
 
 @app.on_event("startup")
@@ -1987,19 +2333,138 @@ def _startup() -> None:
         _warmup_engine(model_path, config_path)
 
 
+@app.get("/lipsync_backend")
+def lipsync_backend_status():
+    return {
+        "backend": _runtime_lipsync_backend(),
+    }
+
+
 @app.post("/warmup")
-def warmup(req: TrainRequest):
+def warmup(req: WarmupRequest):
     profile = req.profile.strip()
     if not profile:
         raise HTTPException(status_code=400, detail="profile is required")
     profile_type = req.profile_type or PROFILE_TYPE_VOICE
-    _warmup_profile(profile, profile_type)
-    return {"status": "ok", "profile": profile, "profile_type": profile_type}
+    warmed_backend = _warmup_profile(
+        profile,
+        profile_type,
+        requested_backend=req.lipsync_backend,
+        force=bool(req.force),
+    )
+    return {
+        "status": "ok",
+        "profile": profile,
+        "profile_type": profile_type,
+        "lipsync_backend": warmed_backend,
+    }
+
+
+@app.post("/interrupt")
+def interrupt_active_generation():
+    interrupted = _interrupt_active_streams()
+    return {"status": "ok", "interrupted_streams": interrupted}
 
 
 @app.get("/profiles")
 def profiles(profile_type: str | None = None):
     return {"profiles": _list_profiles(profile_type)}
+
+
+@app.delete("/profiles/{profile_name}")
+def delete_profile(profile_name: str, profile_type: str | None = None):
+    profile = _sanitize_profile_name(profile_name, "profile_name")
+    ptype = _normalize_profile_type(profile_type)
+    with _active_stream_lock:
+        if _active_stream_stop_events:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot delete profile while generation is running. Stop generation first.",
+            )
+    paths = _profile_paths(profile, ptype)
+    existing = [path for path in paths if path.exists()]
+    if not existing:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    removed: list[str] = []
+    for path in existing:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+        removed.append(str(path))
+
+    _drop_warmup_cache_for_profile(profile, ptype)
+    return {
+        "status": "ok",
+        "profile": profile,
+        "profile_type": ptype,
+        "removed_paths": removed,
+    }
+
+
+@app.patch("/profiles/{profile_name}")
+def rename_profile(profile_name: str, req: ProfileRenameRequest):
+    old_name = _sanitize_profile_name(profile_name, "profile_name")
+    new_name = _sanitize_profile_name(req.new_name, "new_name")
+    ptype = _normalize_profile_type(req.profile_type)
+    if old_name == new_name:
+        return {
+            "status": "ok",
+            "profile_type": ptype,
+            "old_name": old_name,
+            "new_name": new_name,
+            "moved_paths": [],
+        }
+    with _active_stream_lock:
+        if _active_stream_stop_events:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot rename profile while generation is running. Stop generation first.",
+            )
+
+    source_paths = _profile_paths(old_name, ptype)
+    existing_sources = [path for path in source_paths if path.exists()]
+    if not existing_sources:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    destination_pairs: list[tuple[Path, Path]] = []
+    for source in source_paths:
+        dest = source.parent / new_name
+        if source.exists():
+            destination_pairs.append((source, dest))
+        if dest.exists():
+            raise HTTPException(
+                status_code=409,
+                detail=f"Target profile already exists at {dest}",
+            )
+
+    moved_paths: list[dict[str, str]] = []
+    path_replacements: dict[str, str] = {}
+    for source, dest in destination_pairs:
+        source_resolved = str(source.resolve())
+        shutil.move(str(source), str(dest))
+        dest_resolved = str(dest.resolve())
+        moved_paths.append({"from": source_resolved, "to": dest_resolved})
+        path_replacements[source_resolved] = dest_resolved
+
+    for _source, dest in destination_pairs:
+        _rewrite_profile_refs_in_dir(
+            dest,
+            old_name=old_name,
+            new_name=new_name,
+            path_replacements=path_replacements,
+        )
+
+    _drop_warmup_cache_for_profile(old_name, ptype)
+    _drop_warmup_cache_for_profile(new_name, ptype)
+    return {
+        "status": "ok",
+        "profile_type": ptype,
+        "old_name": old_name,
+        "new_name": new_name,
+        "moved_paths": moved_paths,
+    }
 
 
 @app.post("/upload")
@@ -2189,7 +2654,7 @@ def train(req: TrainRequest):
         yield f"[process exited {exit_code}]\n"
         yield "[warmup] starting...\n"
         try:
-            _warmup_profile(profile, profile_type)
+            _warmup_profile(profile, profile_type, force=True)
             yield "[warmup] done\n"
         except Exception as exc:
             logger.exception(
@@ -2258,7 +2723,7 @@ def stream(req: GenerateRequest):
         else profile.get("crossfade_ms", 8.0)
     )
     clean_text = clean_text_for_tts(req.text)
-    chunks = _split_text_prosody(clean_text, max_chars)
+    chunks = _split_text(clean_text, max_chars, max_words)
     if not chunks:
         raise HTTPException(status_code=400, detail="Text is empty.")
     seed = req.seed if req.seed is not None else profile.get("seed")
@@ -2275,7 +2740,7 @@ def stream(req: GenerateRequest):
             ref_for_chunk = ref_wav_path
             if pad_text:
                 chunk = f"{pad_text_token} {chunk} {pad_text_token}"
-            chunk_seed = seed if tts_chunk_index == 0 else None
+            chunk_seed = seed
             audio = engine.generate(
                 chunk,
                 ref_wav_path=ref_for_chunk,
@@ -2403,7 +2868,7 @@ def generate(req: GenerateRequest):
             else profile.get("crossfade_ms", 8.0)
         )
         clean_text = clean_text_for_tts(req.text)
-        chunks = _split_text_prosody(clean_text, max_chars)
+        chunks = _split_text(clean_text, max_chars, max_words)
         if not chunks:
             raise HTTPException(status_code=400, detail="Text is empty.")
         parts: list[np.ndarray] = []
@@ -2420,7 +2885,7 @@ def generate(req: GenerateRequest):
             ref_for_chunk = ref_wav_path
             if pad_text:
                 chunk = f"{pad_text_token} {chunk} {pad_text_token}"
-            chunk_seed = seed if tts_chunk_index == 0 else None
+            chunk_seed = seed
             audio = engine.generate(
                 chunk,
                 ref_wav_path=ref_for_chunk,
@@ -2512,7 +2977,7 @@ def chat(req: GenerateRequest):
     if req.seed is None:
         req.seed = 1234
     if req.pad_text is None:
-        req.pad_text = False
+        req.pad_text = True
     if req.smart_trim_db is None:
         req.smart_trim_db = 0.0
     if req.smart_trim_pad_ms is None:
