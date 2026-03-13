@@ -1127,6 +1127,9 @@ def _resolve_voice_controls_for_profile(
         "pitch_shift": _coerce_float(profile_defaults.get("pitch_shift", 0.0), 0.0),
         "f0_scale": _coerce_float(params["f0_scale"], DEFAULT_F0_SCALE),
         "embedding_scale": _coerce_float(params["embedding_scale"], DEFAULT_EMBEDDING_SCALE),
+        "diffusion_steps": int(params["diffusion_steps"]),
+        "de_esser_cutoff": _coerce_float(profile_defaults.get("de_esser_cutoff", 0.0), 0.0),
+        "de_esser_order": int(_coerce_float(profile_defaults.get("de_esser_order", 2), 2)),
     }
 
 

@@ -41,6 +41,8 @@ export interface VoiceControlValues {
   pitchShift: number;
   f0Scale: number;
   embeddingScale: number;
+  diffusionSteps: number;
+  brightness: number;
 }
 
 export interface ProfileInfo {

@@ -48,6 +48,24 @@ const SLIDERS: SliderConfig[] = [
     step: 0.05,
     format: (value) => `${value.toFixed(2)}x`,
   },
+  {
+    key: 'diffusionSteps',
+    label: 'Diffusion Steps',
+    hint: 'More steps can sound cleaner, but will add latency.',
+    min: 6,
+    max: 20,
+    step: 1,
+    format: (value) => `${Math.round(value)} steps`,
+  },
+  {
+    key: 'brightness',
+    label: 'Brightness',
+    hint: 'Softens or brightens the top end around the profile default.',
+    min: -100,
+    max: 100,
+    step: 1,
+    format: (value) => `${value > 0 ? '+' : ''}${Math.round(value)}`,
+  },
 ];
 
 const VoiceControlsPanel: React.FC<VoiceControlsPanelProps> = ({
@@ -64,7 +82,7 @@ const VoiceControlsPanel: React.FC<VoiceControlsPanelProps> = ({
         <div>
           <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Voice Controls</p>
           <p className="mt-1 text-xs text-slate-500">
-            Live request-time adjustments. These do not rewrite profile files.
+            Applies to the next response you generate. These controls do not change saved profile defaults.
           </p>
         </div>
         <button
