@@ -9,6 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import (
+    LIP_SYNCING_DIR,
     PROFILE_TYPE_AVATAR,
     PROFILE_TYPE_VOICE,
     inference_audio_dir,
@@ -59,7 +60,7 @@ def main() -> None:
     parser.add_argument(
         "--lipsync_dir",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / ".." / "lip_syncing",
+        default=LIP_SYNCING_DIR,
         help="Path to the lip_syncing repo.",
     )
     parser.add_argument(

@@ -107,7 +107,7 @@ Suggested training settings:
 
 ## Setup
 ```bash
-cd /home/alvin/PixelHolo_trial/voice_cloning
+cd voice_cloning
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
@@ -129,7 +129,7 @@ wget -O StyleTTS2/Models/LibriTTS/config.yml   https://huggingface.co/yl4579/Sty
 
 Optional: install MuseTalk repo + weights (needed only when `LIPSYNC_BACKEND=musetalk`):
 ```bash
-cd /home/alvin/PixelHolo_trial/lip_syncing/lib
+cd lip_syncing/lib
 git clone https://github.com/TMElyralab/MuseTalk.git
 cd MuseTalk
 bash download_weights.sh
@@ -137,7 +137,7 @@ bash download_weights.sh
 
 ## Troubleshooting
 - "Command not found": activate `.venv` first.
-- "Lip sync bridge failed": `lip_syncing/` must be a sibling of `voice_cloning/`.
+- "Lip sync bridge failed": confirm `lip_syncing/` exists at the repo root and the backend path helpers still point to it.
 - "Stream stalls": check GPU VRAM usage and network stability.
 - Training crashes on tiny datasets:
   - `ValueError: high <= 0` means too few segments (use a longer clip or `--legacy_split`).

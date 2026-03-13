@@ -4,8 +4,11 @@ PixelHolo is a low-latency AI avatar system that clones voices (StyleTTS2) and s
 
 ## System Architecture
 - `frontend/` - React/Vite UI for chatting with the avatar.
+- `ios/` - Native iOS thin client sources.
+- `pixelholo_2_ios.xcodeproj/` - Xcode project for the iOS app.
 - `voice_cloning/` - The brain: voice training, text-to-speech, and orchestration.
 - `lip_syncing/` - The engine: Wav2Lip inference runners (standalone or bridged).
+- `setup_env.sh` - Bootstrap script for the shared Python environment.
 - `reference/` - legacy UI reference (not used).
 
 ## Concepts
@@ -19,7 +22,7 @@ Model downloads are documented in `voice_cloning/README.md` and `lip_syncing/REA
 
 1) Voice engine
 ```bash
-cd /home/alvin/PixelHolo_trial/voice_cloning
+cd voice_cloning
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
@@ -27,7 +30,7 @@ python -m pip install -r requirements.txt
 
 2) Lip sync engine
 ```bash
-cd /home/alvin/PixelHolo_trial/lip_syncing
+cd lip_syncing
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
@@ -35,13 +38,13 @@ python -m pip install -r requirements.txt
 
 3) Frontend
 ```bash
-cd /home/alvin/PixelHolo_trial/frontend
+cd frontend
 npm install
 ```
 
 4) Create a profile (video -> voice + avatar cache)
 ```bash
-cd /home/alvin/PixelHolo_trial/voice_cloning
+cd voice_cloning
 source .venv/bin/activate
 python src/preprocess_video.py --video /path/to/my_video.mp4 --name alvin
 ```
@@ -54,16 +57,16 @@ python src/train.py --dataset_path data/avatar_profiles/alvin --profile_type ava
 6) Run streaming
 ```bash
 # Terminal 1 (backend)
-cd /home/alvin/PixelHolo_trial/voice_cloning
+cd voice_cloning
 uvicorn src.inference:app --host 0.0.0.0 --port 8000
 
 # Terminal 2 (frontend)
-cd /home/alvin/PixelHolo_trial/frontend
+cd frontend
 npm run dev
 ```
 Open http://localhost:5173
 
-Optional (LLM chat): create `/home/alvin/PixelHolo_trial/.env` with:
+Optional (LLM chat): create `.env` at the repo root with:
 ```
 GROQ_API_KEY=your_key_here
 ```

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bootstrap the shared PixelHolo_trial Python environment.
+# Bootstrap the shared PixelHolo Python environment.
 # Usage:
 #   bash setup_env.sh
 
