@@ -14,7 +14,7 @@ Time: sub-second per sentence.
 
 ## Setup
 ```bash
-cd /home/alvin/PixelHolo_trial/lip_syncing
+cd lip_syncing
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
@@ -52,7 +52,7 @@ Use `voice_cloning/src/speak_video.py` or the streaming API for this path.
 ## Run from voice_cloning
 `voice_cloning/src/speak_video.py` calls this repo automatically.
 ```bash
-python /home/alvin/PixelHolo_trial/voice_cloning/src/speak_video.py \
+python voice_cloning/src/speak_video.py \
   --profile alvin \
   --text "Hello from video"
 ```

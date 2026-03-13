@@ -14,9 +14,9 @@ try:
     print("--- STREAM START ---")
 
     for i, sentence in enumerate(brain.stream_response("Explain quantum physics in 2 sentences.")):
-        print(f"👉 Sentence {i+1}: [{sentence}]")
+        print(f"Sentence {i+1}: [{sentence}]")
 
     print("--- STREAM END ---")
 
 except Exception as e:
-    print(f"❌ Test Failed: {e}")
+    print(f"Test Failed: {e}")

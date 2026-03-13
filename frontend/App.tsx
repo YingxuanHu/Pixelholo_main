@@ -3,6 +3,7 @@ import ControlPanel from './components/ControlPanel';
 import Header from './components/Header';
 import StepCard from './components/StepCard';
 import LogPanel from './components/LogPanel';
+import VoiceControlsPanel from './components/VoiceControlsPanel';
 import {
   Profile,
   StepStatus,
@@ -12,6 +13,7 @@ import {
   InferenceChunk,
   ProfileInfo,
   ProfileType,
+  VoiceControlValues,
 } from './types';
 
 type TrainFlags = {
@@ -27,7 +29,14 @@ type TrainParams = {
   maxLen: number;
 };
 
-type ProfileType = 'voice' | 'avatar';
+type VoiceControlBackendDefaults = {
+  pitchShift: number;
+  f0Scale: number;
+  embeddingScale: number;
+  diffusionSteps: number;
+  deEsserCutoff: number;
+  deEsserOrder: number;
+};
 
 const DEFAULT_API_BASE = 'http://127.0.0.1:8000';
 const LOCAL_STORAGE_API_BASE_KEY = 'voxclone_api_base';
@@ -38,6 +47,15 @@ const BLUR_KERNEL_BY_LEVEL = { low: 60, medium: 75, high: 90 } as const;
 const DEFAULT_AVATAR_BLUR_LEVEL: keyof typeof BLUR_KERNEL_BY_LEVEL = 'medium';
 const DEFAULT_VIDEO_FPS = 25;
 const DEFAULT_AUDIO_START_DELAY_SEC = 0.05;
+const WARMUP_CACHE_MAX_AGE_MS = 120_000;
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+const normalizeVoiceControls = (controls: VoiceControlValues): VoiceControlValues => ({
+  pitchShift: Number(clamp(controls.pitchShift, -4, 4).toFixed(1)),
+  f0Scale: Number(clamp(controls.f0Scale, 0.75, 1.35).toFixed(2)),
+  embeddingScale: Number(clamp(controls.embeddingScale, 0.8, 2.2).toFixed(2)),
+  diffusionSteps: Math.round(clamp(controls.diffusionSteps, 6, 20)),
+  brightness: Math.round(clamp(controls.brightness, -100, 100)),
+});
 const formatBytes = (value: number) => {
   if (!Number.isFinite(value) || value <= 0) return '0 MB';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -94,9 +112,8 @@ const App: React.FC = () => {
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [profilesStatus, setProfilesStatus] = useState<'idle' | 'loading' | 'error'>('idle');
   const [profileMenuKey, setProfileMenuKey] = useState<string | null>(null);
-  const warmupTimerRef = useRef<number | null>(null);
-  const warmupNoticeTimerRef = useRef<number | null>(null);
   const [isWarmingUp, setIsWarmingUp] = useState(false);
+  const [warmupTargetName, setWarmupTargetName] = useState<string | null>(null);
   const [uiNotice, setUiNotice] = useState<string | null>(null);
   const [stepStatuses, setStepStatuses] = useState<Record<string, StepStatus>>(DEFAULT_STEP_STATUSES);
   const [preprocessLogs, setPreprocessLogs] = useState<LogEntry[]>([]);
@@ -129,6 +146,11 @@ const App: React.FC = () => {
   const [refOverride, setRefOverride] = useState('');
   const [avatarBackend, setAvatarBackend] = useState<'wav2lip' | 'musetalk'>('musetalk');
   const [outputMode, setOutputMode] = useState<'voice' | 'avatar'>(DEFAULT_OUTPUT_MODE);
+  const [voiceControlBackendDefaults, setVoiceControlBackendDefaults] = useState<VoiceControlBackendDefaults | null>(null);
+  const [voiceControlDefaults, setVoiceControlDefaults] = useState<VoiceControlValues | null>(null);
+  const [voiceControlValues, setVoiceControlValues] = useState<VoiceControlValues | null>(null);
+  const [voiceControlsStatus, setVoiceControlsStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [voiceControlsError, setVoiceControlsError] = useState<string | null>(null);
   const [videoState, setVideoState] = useState<'idle' | 'buffering' | 'playing'>('idle');
   const [videoFps, setVideoFps] = useState(DEFAULT_VIDEO_FPS);
   const [videoQueue, setVideoQueue] = useState(0);
@@ -139,9 +161,13 @@ const App: React.FC = () => {
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const audioUnlockedRef = useRef<boolean>(false);
   const streamAbortRef = useRef<AbortController | null>(null);
+  const streamRunningRef = useRef(false);
   const streamSessionRef = useRef<number>(0);
   const isBusy = Object.values(stepStatuses).some(status => status === 'running');
-  const warmedProfilesRef = useRef<Set<string>>(new Set());
+  const warmedProfilesRef = useRef<Map<string, number>>(new Map());
+  const warmupInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
+  const backendRuntimeIdRef = useRef<string | null>(null);
+  const activeWarmupKeyRef = useRef<string | null>(null);
   const videoCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoTimerRef = useRef<number | null>(null);
   const videoRafRef = useRef<number | null>(null);
@@ -242,6 +268,20 @@ const App: React.FC = () => {
     }
   }, []);
 
+  const invalidateWarmupEntriesForProfile = useCallback((profileName: string) => {
+    const markers = [`|voice|${profileName}|`, `|avatar|${profileName}|`];
+    for (const key of Array.from(warmedProfilesRef.current.keys())) {
+      if (markers.some((marker) => key.includes(marker))) {
+        warmedProfilesRef.current.delete(key);
+      }
+    }
+    for (const key of Array.from(warmupInFlightRef.current.keys())) {
+      if (markers.some((marker) => key.includes(marker))) {
+        warmupInFlightRef.current.delete(key);
+      }
+    }
+  }, []);
+
   const handleRenameProfile = useCallback(
     async (item: ProfileInfo) => {
       if (isBusy) {
@@ -266,14 +306,14 @@ const App: React.FC = () => {
         if (profile.name === item.name && profileType === currentType) {
           setProfile(prev => ({ ...prev, name: nextName }));
         }
-        warmedProfilesRef.current.delete(item.name);
-        warmedProfilesRef.current.delete(nextName);
+        invalidateWarmupEntriesForProfile(item.name);
+        invalidateWarmupEntriesForProfile(nextName);
         await loadProfiles();
       } catch (err) {
         setUiNotice(`Rename failed: ${String(err)}`);
       }
     },
-    [apiBase, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
+    [apiBase, invalidateWarmupEntriesForProfile, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
   );
 
   const handleDeleteProfile = useCallback(
@@ -302,38 +342,96 @@ const App: React.FC = () => {
           setLastUploadedAudioFilename(null);
           setActiveStep(1);
         }
-        warmedProfilesRef.current.delete(item.name);
+        invalidateWarmupEntriesForProfile(item.name);
         await loadProfiles();
       } catch (err) {
         setUiNotice(`Delete failed: ${String(err)}`);
       }
     },
-    [apiBase, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
+    [apiBase, invalidateWarmupEntriesForProfile, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
   );
 
-  const triggerWarmup = useCallback(
-    (profileName: string, type: ProfileType) => {
-      if (!profileName) return;
-      if (warmupTimerRef.current) {
-        window.clearTimeout(warmupTimerRef.current);
-      }
-      warmupTimerRef.current = window.setTimeout(() => {
-        setIsWarmingUp(true);
-        if (warmupNoticeTimerRef.current) {
-          window.clearTimeout(warmupNoticeTimerRef.current);
-        }
-        warmupNoticeTimerRef.current = window.setTimeout(() => {
-          setIsWarmingUp(false);
-        }, 8000);
-        fetch(`${apiBase}/warmup`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ profile: profileName, profile_type: type }),
-        }).catch(() => {});
-      }, 300);
-    },
+  const warmupKeyFor = useCallback(
+    (profileName: string, type: ProfileType, backend: 'wav2lip' | 'musetalk', runtimeId: string | null) =>
+      `${runtimeId || 'unknown'}|${apiBase}|${type}|${profileName}|${type === 'avatar' ? backend : '-'}`,
     [apiBase],
   );
+
+  const hasFreshWarmup = useCallback((key: string) => {
+    const warmedAt = warmedProfilesRef.current.get(key);
+    if (!warmedAt) return false;
+    if (Date.now() - warmedAt > WARMUP_CACHE_MAX_AGE_MS) {
+      warmedProfilesRef.current.delete(key);
+      return false;
+    }
+    return true;
+  }, []);
+
+  const isWarmupSatisfied = useCallback((data: any, type: ProfileType) => {
+    const ttsReady = data?.tts_hot_before === true || data?.tts_warmed === true;
+    const lipsyncReady = type !== 'avatar' || data?.lipsync_hot_before === true || data?.lipsync_warmed === true;
+    const llmReady = data?.llm_hot_before === true || data?.llm_warmed === true;
+    return ttsReady && lipsyncReady && llmReady;
+  }, []);
+
+  const warmupProfile = useCallback(async (profileName: string, type: ProfileType) => {
+    if (!profileName) return;
+    const runtimeId = backendRuntimeIdRef.current;
+    const key = warmupKeyFor(profileName, type, avatarBackend, runtimeId);
+    if (hasFreshWarmup(key)) return;
+
+    const inFlight = warmupInFlightRef.current.get(key);
+    if (inFlight) {
+      await inFlight;
+      return;
+    }
+
+    const promise = (async () => {
+      activeWarmupKeyRef.current = key;
+      setIsWarmingUp(true);
+      setWarmupTargetName(profileName);
+      try {
+        const res = await fetch(`${apiBase}/warmup`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            profile: profileName,
+            profile_type: type,
+            lipsync_backend: type === 'avatar' ? avatarBackend : null,
+            include_llm: true,
+          }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        const resolvedRuntimeId = typeof data?.runtime_instance_id === 'string' ? data.runtime_instance_id : runtimeId;
+        if (resolvedRuntimeId && backendRuntimeIdRef.current !== resolvedRuntimeId) {
+          backendRuntimeIdRef.current = resolvedRuntimeId;
+          warmedProfilesRef.current.clear();
+          warmupInFlightRef.current.clear();
+        }
+        const resolvedBackend =
+          type === 'avatar' && (data?.lipsync_backend === 'wav2lip' || data?.lipsync_backend === 'musetalk')
+            ? data.lipsync_backend
+            : avatarBackend;
+        if (isWarmupSatisfied(data, type)) {
+          warmedProfilesRef.current.set(
+            warmupKeyFor(profileName, type, resolvedBackend, resolvedRuntimeId ?? backendRuntimeIdRef.current),
+            Date.now(),
+          );
+        }
+      } finally {
+        warmupInFlightRef.current.delete(key);
+        if (activeWarmupKeyRef.current === key) {
+          activeWarmupKeyRef.current = null;
+          setIsWarmingUp(false);
+          setWarmupTargetName(null);
+        }
+      }
+    })();
+
+    warmupInFlightRef.current.set(key, promise);
+    await promise;
+  }, [apiBase, avatarBackend, hasFreshWarmup, isWarmupSatisfied, warmupKeyFor]);
 
   useEffect(() => {
     loadProfiles();
@@ -374,6 +472,12 @@ const App: React.FC = () => {
       .then((data) => {
         if (cancelled) return;
         const backend = data?.backend === 'wav2lip' ? 'wav2lip' : 'musetalk';
+        const runtimeId = typeof data?.runtime_instance_id === 'string' ? data.runtime_instance_id : null;
+        if (backendRuntimeIdRef.current && runtimeId && backendRuntimeIdRef.current !== runtimeId) {
+          warmedProfilesRef.current.clear();
+          warmupInFlightRef.current.clear();
+        }
+        backendRuntimeIdRef.current = runtimeId;
         setAvatarBackend(backend);
       })
       .catch(() => {
@@ -387,12 +491,109 @@ const App: React.FC = () => {
   const currentProfileInfo = profiles.find((item) => item.name === profile.name);
   const hasTrainedProfile = Boolean(currentProfileInfo?.has_profile);
   const hasData = Boolean(currentProfileInfo?.has_data);
+  const resolveBrightnessOverrides = useCallback(
+    (brightness: number) => {
+      if (!voiceControlBackendDefaults) return { cutoff: 0, order: 2 };
+      const defaultCutoff = voiceControlBackendDefaults.deEsserCutoff;
+      const defaultOrder = voiceControlBackendDefaults.deEsserOrder || 2;
+      if (brightness === 0) {
+        return { cutoff: defaultCutoff, order: defaultOrder };
+      }
+      const normalized = brightness / 100;
+      if (defaultCutoff > 0) {
+        const target = normalized >= 0
+          ? defaultCutoff + (12000 - defaultCutoff) * normalized
+          : defaultCutoff + (3500 - defaultCutoff) * -normalized;
+        return { cutoff: Math.round(clamp(target, 3500, 12000)), order: defaultOrder };
+      }
+      if (normalized > 0) {
+        return { cutoff: 0, order: defaultOrder };
+      }
+      const target = 7000 + (3500 - 7000) * -normalized;
+      return { cutoff: Math.round(clamp(target, 3500, 7000)), order: 2 };
+    },
+    [voiceControlBackendDefaults],
+  );
+  const handleVoiceControlsChange = useCallback((patch: Partial<VoiceControlValues>) => {
+    setVoiceControlValues((prev) => {
+      const base = prev ?? voiceControlDefaults;
+      if (!base) return prev;
+      return normalizeVoiceControls({ ...base, ...patch });
+    });
+  }, [voiceControlDefaults]);
+  const resetVoiceControls = useCallback(() => {
+    if (!voiceControlDefaults) return;
+    setVoiceControlValues(voiceControlDefaults);
+  }, [voiceControlDefaults]);
+
+  useEffect(() => {
+    if (apiStatus !== 'online' || !profile.name || !hasTrainedProfile) {
+      setVoiceControlBackendDefaults(null);
+      setVoiceControlDefaults(null);
+      setVoiceControlValues(null);
+      setVoiceControlsStatus('idle');
+      setVoiceControlsError(null);
+      return;
+    }
+
+    let cancelled = false;
+    const controller = new AbortController();
+    setVoiceControlBackendDefaults(null);
+    setVoiceControlDefaults(null);
+    setVoiceControlValues(null);
+    setVoiceControlsStatus('loading');
+    setVoiceControlsError(null);
+
+    fetch(
+      `${apiBase}/profiles/${encodeURIComponent(profile.name)}/voice-controls?profile_type=${profileType}`,
+      { cache: 'no-store', signal: controller.signal },
+    )
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await readErrorDetail(res));
+        return res.json();
+      })
+      .then((data) => {
+        if (cancelled) return;
+        const backendDefaults: VoiceControlBackendDefaults = {
+          pitchShift: Number(data?.controls?.pitch_shift ?? 0),
+          f0Scale: Number(data?.controls?.f0_scale ?? 1),
+          embeddingScale: Number(data?.controls?.embedding_scale ?? 1.2),
+          diffusionSteps: Number(data?.controls?.diffusion_steps ?? 10),
+          deEsserCutoff: Number(data?.controls?.de_esser_cutoff ?? 0),
+          deEsserOrder: Number(data?.controls?.de_esser_order ?? 2),
+        };
+        const controls = normalizeVoiceControls({
+          pitchShift: backendDefaults.pitchShift,
+          f0Scale: backendDefaults.f0Scale,
+          embeddingScale: backendDefaults.embeddingScale,
+          diffusionSteps: backendDefaults.diffusionSteps,
+          brightness: 0,
+        });
+        setVoiceControlBackendDefaults(backendDefaults);
+        setVoiceControlDefaults(controls);
+        setVoiceControlValues(controls);
+        setVoiceControlsStatus('ready');
+      })
+      .catch((err) => {
+        if (cancelled || (err as Error)?.name === 'AbortError') return;
+        setVoiceControlBackendDefaults(null);
+        setVoiceControlDefaults(null);
+        setVoiceControlValues(null);
+        setVoiceControlsStatus('error');
+        setVoiceControlsError(String(err));
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [apiBase, apiStatus, hasTrainedProfile, profile.name, profileType, readErrorDetail]);
 
   const preprocessSteps = [
     ...(profileType === 'avatar' ? ['Bake avatar frames (Wav2Lip cache)'] : []),
     'Extract audio track',
     'Loudness normalize + filter',
-    'Split on silence (2–10s)',
+    'Split on silence (2-10s)',
     'Transcribe with Whisper',
     'Write metadata.csv',
   ];
@@ -426,26 +627,6 @@ const App: React.FC = () => {
     return Math.min(cap, raw * cap);
   };
 
-  const warmupProfile = useCallback(async (profileName: string) => {
-    if (!profileName) return;
-    if (warmedProfilesRef.current.has(profileName)) return;
-    warmedProfilesRef.current.add(profileName);
-    try {
-      const res = await fetch(`${apiBase}/warmup`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          profile: profileName,
-          profile_type: profileType,
-        }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      await res.json();
-    } catch (err) {
-      warmedProfilesRef.current.delete(profileName);
-    }
-  }, [apiBase, profileType]);
-
   const canProceedTo = (step: number) => {
     if (step === 1) return true;
     if (step === 2) return Boolean(profile.name);
@@ -458,8 +639,8 @@ const App: React.FC = () => {
     if (apiStatus !== 'online') return;
     if (!hasTrainedProfile) return;
     if (!profile.name) return;
-    warmupProfile(profile.name);
-  }, [apiStatus, hasTrainedProfile, profile.name, warmupProfile]);
+    void warmupProfile(profile.name, profileType);
+  }, [apiStatus, hasTrainedProfile, profile.name, profileType, warmupProfile]);
 
   const streamResponseLines = async (response: Response, onLine: (line: string) => void) => {
     if (!response.body) return;
@@ -615,11 +796,11 @@ const App: React.FC = () => {
         } else if (line.includes('Extracting audio')) {
           stageUpdate('Extract audio track');
         } else if (line.includes('Loaded audio')) {
-          stageUpdate('Split on silence (2–10s)');
+          stageUpdate('Split on silence (2-10s)');
         } else if (line.includes('Transcribing full audio')) {
           stageUpdate('Transcribe with Whisper');
         } else if (line.includes('Segments: raw=')) {
-          stageUpdate('Split on silence (2–10s)');
+          stageUpdate('Split on silence (2-10s)');
         } else if (line.includes('Exporting') || (line.includes('Wrote') && line.includes('.wav'))) {
           stageUpdate('Write metadata.csv');
         } else if (line.includes('Metadata written')) {
@@ -631,10 +812,10 @@ const App: React.FC = () => {
           const merged = Number(match[2]);
           const kept = Number(match[3]);
           setPreprocessStats({
-            duration: '—',
+            duration: '-',
             segmentsKept: kept,
             segmentsFiltered: merged - kept,
-            avgClipLength: '—',
+            avgClipLength: '-',
             sampleRate: '24 kHz',
           });
         }
@@ -917,7 +1098,7 @@ const App: React.FC = () => {
       setUiNotice('Safari blocked audio. Click again to enable sound.');
       return;
     }
-    await warmupProfile(profile.name);
+    await warmupProfile(profile.name, profileType);
     // End any existing stream immediately.
     streamSessionRef.current += 1;
     stopAllAudio();
@@ -932,12 +1113,13 @@ const App: React.FC = () => {
     audioEndTimeRef.current = nextStartTimeRef.current;
     let sawError = false;
 
-    if (streamAbortRef.current) {
+    if (streamAbortRef.current && streamRunningRef.current) {
       streamAbortRef.current.abort();
       await interruptBackend();
     }
     const controller = new AbortController();
     streamAbortRef.current = controller;
+    streamRunningRef.current = true;
     const sessionId = streamSessionRef.current;
 
     const startTime = performance.now();
@@ -950,6 +1132,15 @@ const App: React.FC = () => {
       model_path: modelOverride || null,
       ref_wav_path: refOverride || null,
     };
+    if (voiceControlsStatus === 'ready' && voiceControlValues) {
+      payload.pitch_shift = voiceControlValues.pitchShift;
+      payload.f0_scale = voiceControlValues.f0Scale;
+      payload.embedding_scale = voiceControlValues.embeddingScale;
+      payload.diffusion_steps = voiceControlValues.diffusionSteps;
+      const brightnessOverrides = resolveBrightnessOverrides(voiceControlValues.brightness);
+      payload.de_esser_cutoff = brightnessOverrides.cutoff;
+      payload.de_esser_order = brightnessOverrides.order;
+    }
     if (outputMode === 'avatar') {
       payload.avatar_profile = profile.name;
       payload.lipsync_backend = avatarBackend;
@@ -988,6 +1179,10 @@ const App: React.FC = () => {
           setLatency(prev => prev ? { ...prev, total: data.inference_ms ?? Math.round(performance.now() - startTime) } : null);
           setStepStatuses(prev => ({ ...prev, inference: 'done' }));
           setInferenceStageIndex(inferenceSteps.length ? inferenceSteps.length - 1 : null);
+          if (streamAbortRef.current === controller) {
+            streamAbortRef.current = null;
+          }
+          streamRunningRef.current = false;
           return;
         }
         if (!data.audio_base64) return;
@@ -1022,8 +1217,28 @@ const App: React.FC = () => {
         setStepStatuses(prev => ({ ...prev, inference: 'error' }));
         setInferenceStageIndex(null);
       }
+    } finally {
+      if (streamAbortRef.current === controller) {
+        streamAbortRef.current = null;
+      }
+      streamRunningRef.current = false;
     }
-  }, [apiBase, avatarBackend, enqueueFrames, interruptBackend, modelOverride, outputMode, profile.name, profileType, refOverride, resetVideo, unlockAudio]);
+  }, [
+    apiBase,
+    avatarBackend,
+    enqueueFrames,
+    interruptBackend,
+    modelOverride,
+    outputMode,
+    profile.name,
+    profileType,
+    refOverride,
+    resetVideo,
+    unlockAudio,
+    voiceControlValues,
+    voiceControlsStatus,
+    resolveBrightnessOverrides,
+  ]);
 
   const startInference = useCallback(async () => {
     await runInference(inferenceText, '/speak');
@@ -1031,6 +1246,8 @@ const App: React.FC = () => {
 
   const stopInference = async () => {
     if (streamAbortRef.current) streamAbortRef.current.abort();
+    streamAbortRef.current = null;
+    streamRunningRef.current = false;
     await interruptBackend();
     streamSessionRef.current += 1;
     await resetAudio();
@@ -1130,10 +1347,10 @@ const App: React.FC = () => {
         </div>
         <div className="grid grid-cols-2 gap-4 text-xs font-bold">
           <div className="bg-white p-2 rounded border border-amber-100">
-            Kept: {preprocessStats?.segmentsKept ?? '—'}
+            Kept: {preprocessStats?.segmentsKept ?? '-'}
           </div>
           <div className="bg-white p-2 rounded border border-amber-100">
-            Filtered: {preprocessStats?.segmentsFiltered ?? '—'}
+            Filtered: {preprocessStats?.segmentsFiltered ?? '-'}
           </div>
         </div>
       </div>
@@ -1306,7 +1523,7 @@ const App: React.FC = () => {
                                 }
                                 setProfile(prev => ({ ...prev, name: item.name }));
                                 const selectedType = item.profile_type === 'avatar' ? 'avatar' : 'voice';
-                                triggerWarmup(item.name, selectedType);
+                                void warmupProfile(item.name, selectedType);
                                 setLastUploadedFilename(null);
                                 setLastUploadedAudioFilename(null);
                                 if (item.has_profile) {
@@ -1320,7 +1537,7 @@ const App: React.FC = () => {
                               <div className="min-w-0">
                                 <p className="text-xs font-bold truncate">{item.name}</p>
                                 <p className="text-[10px] text-slate-400 truncate">
-                                  {item.processed_wavs} clips · {(item.raw_audio_files ?? 0)} audio · {item.raw_files} video · {item.profile_type || profileType}
+                                  {item.processed_wavs} clips | {(item.raw_audio_files ?? 0)} audio | {item.raw_files} video | {item.profile_type || profileType}
                                 </p>
                               </div>
                               <div className="text-[10px] font-bold ml-2">
@@ -1339,7 +1556,7 @@ const App: React.FC = () => {
                                   setProfileMenuKey(prev => (prev === key ? null : key));
                                 }}
                               >
-                                ⋯
+                                ...
                               </button>
                               {profileMenuKey === `${item.profile_type || profileType}:${item.name}` && (
                                 <div className="absolute right-0 mt-1 min-w-[120px] rounded-lg border border-slate-200 bg-white shadow-lg z-20 py-1">
@@ -1431,7 +1648,7 @@ const App: React.FC = () => {
                           </div>
                           {uploadPhaseVideo === 'uploading' && (
                             <span className="text-[11px] font-semibold text-slate-600">
-                              {formatBytes(uploadBytesVideo.loaded)} / {formatBytes(uploadBytesVideo.total)} · {uploadProgressVideo}%
+                                {formatBytes(uploadBytesVideo.loaded)} / {formatBytes(uploadBytesVideo.total)} | {uploadProgressVideo}%
                             </span>
                           )}
                         </div>
@@ -1498,7 +1715,7 @@ const App: React.FC = () => {
                             </div>
                             {uploadPhaseAudio === 'uploading' && (
                               <span className="text-[11px] font-semibold text-slate-600">
-                                {formatBytes(uploadBytesAudio.loaded)} / {formatBytes(uploadBytesAudio.total)} · {uploadProgressAudio}%
+                                {formatBytes(uploadBytesAudio.loaded)} / {formatBytes(uploadBytesAudio.total)} | {uploadProgressAudio}%
                               </span>
                             )}
                           </div>
@@ -1544,7 +1761,7 @@ const App: React.FC = () => {
               <div className="space-y-6">
                 <div className="bg-slate-50 border border-slate-100 rounded-xl p-4 text-xs text-slate-600">
                   <p className="uppercase tracking-widest text-[9px] font-bold text-slate-400">Input</p>
-                  <p>Profile: <span className="font-semibold">{profile.name || '—'}</span></p>
+                  <p>Profile: <span className="font-semibold">{profile.name || '-'}</span></p>
                   <p>File: <span className="font-semibold">{profile.lastUploadedFile || 'Upload a file first'}</span></p>
                 </div>
                 {profileType === 'avatar' && (
@@ -1739,17 +1956,17 @@ const App: React.FC = () => {
                 <div className="space-y-6">
                 {isWarmingUp && (
                   <div className="bg-amber-50 border border-amber-200 text-amber-800 text-xs font-semibold px-4 py-3 rounded-xl">
-                    Warming up {outputMode === 'avatar' ? (avatarBackend === 'wav2lip' ? 'Wav2Lip' : 'MuseTalk') : 'model'} for selected profile…
+                    Warming up {warmupTargetName || 'selected profile'}...
                   </div>
                 )}
                 <div className="bg-slate-50 border border-slate-100 rounded-xl px-4 py-3 text-sm text-slate-700">
-                  <span className="font-semibold">Profile:</span> {profile.name || '—'}
+                  <span className="font-semibold">Profile:</span> {profile.name || '-'}
                 </div>
                 <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
                   <div className={`xl:col-span-7 bg-slate-950 border border-slate-900 rounded-2xl p-4 flex flex-col ${outputMode === 'avatar' ? '' : 'opacity-40'}`}>
                     <div className="flex items-center justify-between text-xs text-slate-300">
                       <span className="uppercase tracking-widest text-[9px] font-bold text-slate-400">Avatar Preview</span>
-                      <span className="text-[10px] font-bold text-teal-300">{outputMode === 'avatar' ? `${videoFps} FPS · ${videoQueue} queued` : 'disabled'}</span>
+                      <span className="text-[10px] font-bold text-teal-300">{outputMode === 'avatar' ? `${videoFps} FPS | ${videoQueue} queued` : 'disabled'}</span>
                     </div>
                     <div className="mt-3 bg-black rounded-xl overflow-hidden border border-slate-800 w-full max-w-[720px] mx-auto min-h-[720px]">
                       <canvas ref={videoCanvasRef} width={640} height={853} className="w-full h-full" />
@@ -1771,6 +1988,15 @@ const App: React.FC = () => {
                         </div>
                       </div>
                     </div>
+
+                    <VoiceControlsPanel
+                      values={voiceControlValues}
+                      defaults={voiceControlDefaults}
+                      status={voiceControlsStatus}
+                      error={voiceControlsError}
+                      onChange={handleVoiceControlsChange}
+                      onReset={resetVoiceControls}
+                    />
 
                     <div className="bg-slate-950 border border-slate-900 rounded-2xl p-4">
                       <ControlPanel

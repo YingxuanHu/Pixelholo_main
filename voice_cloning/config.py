@@ -1,10 +1,11 @@
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BASE_DIR.parent
 DATA_DIR = BASE_DIR / "data"
 MODELS_DIR = BASE_DIR / "models"
 OUTPUTS_DIR = BASE_DIR / "outputs"
-LIP_SYNCING_DIR = BASE_DIR.parent / "lip_syncing"
+LIP_SYNCING_DIR = REPO_ROOT / "lip_syncing"
 
 INFERENCE_AUDIO_DIRNAME = "audio"
 INFERENCE_VIDEO_DIRNAME = "video"

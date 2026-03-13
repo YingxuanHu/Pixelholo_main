@@ -33,6 +33,12 @@ node_modules/
 .DS_Store
 Thumbs.db
 
+# Xcode user state
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
 # Data + outputs (generated)
 voice_cloning/data/
 voice_cloning/outputs/
@@ -55,6 +61,7 @@ frontend/.env*
 .env
 .env.*
 reference/
+
 # Large training datasets (downloaded locally)
 lip_syncing/training_data/
 # Local tools in voice_cloning (binaries, helpers)
