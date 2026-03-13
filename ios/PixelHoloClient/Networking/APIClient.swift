@@ -252,6 +252,48 @@ final class APIClient {
         }
     }
 
+    func fetchVoiceControls(
+        baseURL: URL,
+        profile: String,
+        profileType: ProfileType
+    ) async throws -> ProfileVoiceControlsResponse {
+        let endpointURL = baseURL
+            .appendingPathComponent("profiles")
+            .appendingPathComponent(profile)
+            .appendingPathComponent("voice-controls")
+        var components = URLComponents(url: endpointURL, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "profile_type", value: profileType.rawValue)]
+        guard let finalURL = components?.url else {
+            throw APIError.invalidBaseURL
+        }
+
+        var request = URLRequest(url: finalURL)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 20
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw APIError.invalidResponse
+            }
+            guard (200...299).contains(http.statusCode) else {
+                let message = String(data: data, encoding: .utf8) ?? "Unknown server error"
+                throw APIError.server(statusCode: http.statusCode, message: message)
+            }
+
+            do {
+                return try decoder.decode(ProfileVoiceControlsResponse.self, from: data)
+            } catch {
+                throw APIError.decoding(error)
+            }
+        } catch let error as APIError {
+            throw error
+        } catch {
+            throw APIError.transport(error)
+        }
+    }
+
     func lipsyncBackendStatus(baseURL: URL) async throws -> LipsyncBackendStatusResponse {
         let endpointURL = baseURL.appendingPathComponent("lipsync_backend")
         var request = URLRequest(url: endpointURL)

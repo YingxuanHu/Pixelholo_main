@@ -6,6 +6,7 @@ final class AvatarChatViewModel: ObservableObject {
     private static let maxLogLines = 120
     private static let warmupCacheMaxAgeSeconds: TimeInterval = 120
     private static let warmupTimeoutSeconds: UInt64 = 180
+    private static let voiceControlsDebounceNanoseconds: UInt64 = 300_000_000
 
     private enum MobileAvatarStreamProfile {
         static let wav2lipFPS = 20.0
@@ -31,6 +32,9 @@ final class AvatarChatViewModel: ObservableObject {
     @Published var isWarmingUp = false
     @Published var logs: [ConsoleLogLine] = []
     @Published var errorMessage: String?
+    @Published private(set) var voiceControlsStatus: VoiceControlsLoadState = .idle
+    @Published private(set) var voiceControlDefaults: VoiceControlValues?
+    @Published var voiceControlValues: VoiceControlValues?
     @Published private(set) var warmingProfileStateKey: String?
     @Published private(set) var activeStreamProfileStateKey: String?
     @Published private(set) var awaitingFirstChunkProfileStateKey: String?
@@ -47,6 +51,10 @@ final class AvatarChatViewModel: ObservableObject {
     private var preparedWarmupKey: String?
     private var preparedRuntimeInstanceID: String?
     private var preparedWarmupAt: Date?
+    private var voiceControlBackendDefaults: VoiceControlBackendDefaults?
+    private var voiceControlsTask: Task<Void, Never>?
+    private var voiceControlsTaskID: UUID?
+    private var voiceControlsLoadedKey: String?
 
     private enum WarmupFailure: LocalizedError {
         case timedOut(profile: String)
@@ -83,6 +91,7 @@ final class AvatarChatViewModel: ObservableObject {
         guard nextStateKey != previousStateKey else { return }
 
         errorMessage = nil
+        clearVoiceControls()
 
         if !isStreaming {
             player.stop()
@@ -170,6 +179,15 @@ final class AvatarChatViewModel: ObservableObject {
             modelPath: nil,
             refWavPath: nil
         )
+        if voiceControlsStatus == .ready, let voiceControlValues {
+            request.pitchShift = voiceControlValues.pitchShift
+            request.f0Scale = voiceControlValues.f0Scale
+            request.embeddingScale = voiceControlValues.embeddingScale
+            request.diffusionSteps = voiceControlValues.diffusionSteps
+            let brightnessOverrides = resolveBrightnessOverrides(voiceControlValues.brightness)
+            request.deEsserCutoff = brightnessOverrides.cutoff
+            request.deEsserOrder = brightnessOverrides.order
+        }
         if profileType == .avatar {
             request.avatarProfile = cleanedProfile
             request.lipsyncBackend = lipsyncBackend
@@ -323,6 +341,100 @@ final class AvatarChatViewModel: ObservableObject {
         }
     }
 
+    func scheduleVoiceControlsRefresh(baseURL: URL?) {
+        voiceControlsTask?.cancel()
+        voiceControlsTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: Self.voiceControlsDebounceNanoseconds)
+            } catch {
+                return
+            }
+            self?.voiceControlsTask = nil
+            await self?.refreshVoiceControlsNow(baseURL: baseURL)
+        }
+    }
+
+    func refreshVoiceControlsNow(baseURL: URL?) async {
+        let cleanedProfile = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let baseURL else {
+            clearVoiceControls()
+            return
+        }
+        guard !cleanedProfile.isEmpty else {
+            clearVoiceControls()
+            return
+        }
+
+        let key = voiceControlsKey(baseURL: baseURL, profile: cleanedProfile, profileType: profileType)
+        if voiceControlsLoadedKey == key, voiceControlsStatus == .ready {
+            return
+        }
+
+        voiceControlsTask?.cancel()
+        let taskID = UUID()
+        voiceControlsTaskID = taskID
+        voiceControlsLoadedKey = nil
+        voiceControlsStatus = .loading
+        voiceControlDefaults = nil
+        voiceControlValues = nil
+        voiceControlBackendDefaults = nil
+
+        do {
+            let response = try await apiClient.fetchVoiceControls(
+                baseURL: baseURL,
+                profile: cleanedProfile,
+                profileType: profileType
+            )
+            guard voiceControlsTaskID == taskID else { return }
+            let backendDefaults = VoiceControlBackendDefaults(
+                pitchShift: response.controls.pitchShift ?? 0,
+                f0Scale: response.controls.f0Scale ?? 1,
+                embeddingScale: response.controls.embeddingScale ?? 1.2,
+                diffusionSteps: response.controls.diffusionSteps ?? 10,
+                deEsserCutoff: response.controls.deEsserCutoff ?? 0,
+                deEsserOrder: response.controls.deEsserOrder ?? 2
+            )
+            let defaults = normalizeVoiceControls(
+                VoiceControlValues(
+                    pitchShift: backendDefaults.pitchShift,
+                    f0Scale: backendDefaults.f0Scale,
+                    embeddingScale: backendDefaults.embeddingScale,
+                    diffusionSteps: backendDefaults.diffusionSteps,
+                    brightness: 0
+                )
+            )
+            voiceControlBackendDefaults = backendDefaults
+            voiceControlDefaults = defaults
+            voiceControlValues = defaults
+            voiceControlsStatus = .ready
+            voiceControlsLoadedKey = key
+        } catch is CancellationError {
+            return
+        } catch let error as APIError {
+            guard voiceControlsTaskID == taskID else { return }
+            switch error {
+            case let .server(statusCode, _message) where statusCode == 404:
+                voiceControlsStatus = .unavailable(message: "Voice controls appear once the selected profile has a trained model.")
+            default:
+                voiceControlsStatus = .error(message: error.localizedDescription)
+            }
+        } catch {
+            guard voiceControlsTaskID == taskID else { return }
+            voiceControlsStatus = .error(message: error.localizedDescription)
+        }
+    }
+
+    func updateVoiceControls(_ update: (inout VoiceControlValues) -> Void) {
+        guard var values = voiceControlValues ?? voiceControlDefaults else { return }
+        update(&values)
+        voiceControlValues = normalizeVoiceControls(values)
+    }
+
+    func resetVoiceControls() {
+        guard let voiceControlDefaults else { return }
+        voiceControlValues = voiceControlDefaults
+    }
+
     private var effectiveWarmupBackend: LipsyncBackend? {
         profileType == .avatar ? lipsyncBackend : nil
     }
@@ -373,10 +485,25 @@ final class AvatarChatViewModel: ObservableObject {
         return "\(baseURL.absoluteString)|\(profileType.rawValue):\(profile):\(backendValue)"
     }
 
+    private func voiceControlsKey(baseURL: URL, profile: String, profileType: ProfileType) -> String {
+        "\(baseURL.absoluteString)|\(profileType.rawValue):\(profile)"
+    }
+
     private func clearPreparedWarmup() {
         preparedWarmupKey = nil
         preparedRuntimeInstanceID = nil
         preparedWarmupAt = nil
+    }
+
+    private func clearVoiceControls() {
+        voiceControlsTask?.cancel()
+        voiceControlsTask = nil
+        voiceControlsTaskID = nil
+        voiceControlsLoadedKey = nil
+        voiceControlBackendDefaults = nil
+        voiceControlsStatus = .idle
+        voiceControlDefaults = nil
+        voiceControlValues = nil
     }
 
     private func hasFreshPreparedWarmup(for key: String) -> Bool {
@@ -410,6 +537,41 @@ final class AvatarChatViewModel: ObservableObject {
         let ttsReady = response.ttsHotBefore == true || response.ttsWarmed == true
         let lipsyncReady = profileType != .avatar || response.lipsyncHotBefore == true || response.lipsyncWarmed == true
         return ttsReady && lipsyncReady
+    }
+
+    private func clamp(_ value: Double, min lowerBound: Double, max upperBound: Double) -> Double {
+        min(upperBound, max(lowerBound, value))
+    }
+
+    private func normalizeVoiceControls(_ values: VoiceControlValues) -> VoiceControlValues {
+        VoiceControlValues(
+            pitchShift: Double(round(clamp(values.pitchShift, min: -4, max: 4) * 10) / 10),
+            f0Scale: Double(round(clamp(values.f0Scale, min: 0.75, max: 1.35) * 100) / 100),
+            embeddingScale: Double(round(clamp(values.embeddingScale, min: 0.8, max: 2.2) * 100) / 100),
+            diffusionSteps: Int(clamp(Double(values.diffusionSteps), min: 6, max: 20).rounded()),
+            brightness: Int(clamp(Double(values.brightness), min: -100, max: 100).rounded())
+        )
+    }
+
+    private func resolveBrightnessOverrides(_ brightness: Int) -> (cutoff: Double, order: Int) {
+        guard let voiceControlBackendDefaults else { return (0, 2) }
+        let defaultCutoff = voiceControlBackendDefaults.deEsserCutoff
+        let defaultOrder = voiceControlBackendDefaults.deEsserOrder
+        if brightness == 0 {
+            return (defaultCutoff, defaultOrder)
+        }
+        let normalized = Double(brightness) / 100
+        if defaultCutoff > 0 {
+            let target = normalized >= 0
+                ? defaultCutoff + (12_000 - defaultCutoff) * normalized
+                : defaultCutoff + (3_500 - defaultCutoff) * -normalized
+            return (round(clamp(target, min: 3_500, max: 12_000)), defaultOrder)
+        }
+        if normalized > 0 {
+            return (0, defaultOrder)
+        }
+        let target = 7_000 + (3_500 - 7_000) * -normalized
+        return (round(clamp(target, min: 3_500, max: 7_000)), 2)
     }
 
     private func performWarmup(baseURL: URL, request: WarmupRequest) async throws -> WarmupResponse {

@@ -73,3 +73,58 @@ struct LipsyncBackendStatusResponse: Codable, Hashable {
         case runtimeInstanceID = "runtime_instance_id"
     }
 }
+
+enum VoiceControlsLoadState: Equatable {
+    case idle
+    case loading
+    case ready
+    case unavailable(message: String)
+    case error(message: String)
+}
+
+struct VoiceControlBackendDefaults: Hashable {
+    let pitchShift: Double
+    let f0Scale: Double
+    let embeddingScale: Double
+    let diffusionSteps: Int
+    let deEsserCutoff: Double
+    let deEsserOrder: Int
+}
+
+struct VoiceControlValues: Hashable {
+    var pitchShift: Double
+    var f0Scale: Double
+    var embeddingScale: Double
+    var diffusionSteps: Int
+    var brightness: Int
+}
+
+struct ProfileVoiceControlsResponse: Codable, Hashable {
+    struct Controls: Codable, Hashable {
+        let pitchShift: Double?
+        let f0Scale: Double?
+        let embeddingScale: Double?
+        let diffusionSteps: Int?
+        let deEsserCutoff: Double?
+        let deEsserOrder: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case pitchShift = "pitch_shift"
+            case f0Scale = "f0_scale"
+            case embeddingScale = "embedding_scale"
+            case diffusionSteps = "diffusion_steps"
+            case deEsserCutoff = "de_esser_cutoff"
+            case deEsserOrder = "de_esser_order"
+        }
+    }
+
+    let profile: String
+    let profileType: ProfileType
+    let controls: Controls
+
+    enum CodingKeys: String, CodingKey {
+        case profile
+        case profileType = "profile_type"
+        case controls
+    }
+}

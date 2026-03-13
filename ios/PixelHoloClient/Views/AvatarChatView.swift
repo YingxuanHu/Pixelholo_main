@@ -15,6 +15,7 @@ struct AvatarChatView: View {
     @State private var speechPressIsActive = false
     @State private var showsSessionOptions = false
     @State private var showsDiagnostics = false
+    @State private var showsVoiceControls = false
 
     var body: some View {
         AppScreen {
@@ -54,14 +55,28 @@ struct AvatarChatView: View {
             _ = await speech.requestPermissions()
             viewModel.applySelectedProfile(appSession.selectedProfile)
             viewModel.prepareSelectedProfileWarmup(baseURL: serverConfig.baseURL)
+            await viewModel.refreshVoiceControlsNow(baseURL: serverConfig.baseURL)
         }
         .onChange(of: appSession.selectedProfile?.id) { _, _ in
             viewModel.applySelectedProfile(appSession.selectedProfile)
             viewModel.prepareSelectedProfileWarmup(baseURL: serverConfig.baseURL)
+            Task {
+                await viewModel.refreshVoiceControlsNow(baseURL: serverConfig.baseURL)
+            }
         }
         .onChange(of: viewModel.isStreaming) { _, isStreaming in
             guard !isStreaming else { return }
             viewModel.prepareSelectedProfileWarmup(baseURL: serverConfig.baseURL)
+        }
+        .onChange(of: viewModel.profileType) { _, _ in
+            Task {
+                await viewModel.refreshVoiceControlsNow(baseURL: serverConfig.baseURL)
+            }
+        }
+        .onChange(of: serverConfig.baseURL?.absoluteString) { _, _ in
+            Task {
+                await viewModel.refreshVoiceControlsNow(baseURL: serverConfig.baseURL)
+            }
         }
         .onChange(of: speech.transcript) { _, newValue in
             guard speech.isRecording || speech.isStarting else { return }
@@ -251,6 +266,12 @@ struct AvatarChatView: View {
                             TextField("Enter a profile name or tap one from Profiles", text: $viewModel.profileName)
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled(true)
+                                .submitLabel(.done)
+                                .onSubmit {
+                                    Task {
+                                        await viewModel.refreshVoiceControlsNow(baseURL: serverConfig.baseURL)
+                                    }
+                                }
                                 .appInputField()
                         }
 
@@ -293,6 +314,39 @@ struct AvatarChatView: View {
                             Text("Server: \(baseURL)")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    AppCard {
+                        DisclosureGroup(isExpanded: $showsVoiceControls) {
+                            VStack(alignment: .leading, spacing: 16) {
+                                HStack {
+                                    Button("Reload Defaults") {
+                                        Task {
+                                            await viewModel.refreshVoiceControlsNow(baseURL: serverConfig.baseURL)
+                                        }
+                                    }
+                                    .font(.footnote.weight(.semibold))
+                                    .buttonStyle(.plain)
+
+                                    Spacer()
+
+                                    Button("Reset") {
+                                        viewModel.resetVoiceControls()
+                                    }
+                                    .font(.footnote.weight(.semibold))
+                                    .buttonStyle(.plain)
+                                    .disabled(viewModel.voiceControlsStatus != .ready || viewModel.voiceControlDefaults == nil)
+                                }
+
+                                voiceControlsContent
+                            }
+                            .padding(.top, 10)
+                        } label: {
+                            AppSectionHeader(
+                                title: "Voice Controls",
+                                subtitle: "Applies to the next response only. Saved profile defaults stay unchanged."
+                            )
                         }
                     }
                 }
@@ -391,6 +445,140 @@ struct AvatarChatView: View {
                 }
         )
     }
+
+    @ViewBuilder
+    private var voiceControlsContent: some View {
+        switch viewModel.voiceControlsStatus {
+        case .idle:
+            Text("Choose or enter a trained profile, then load its defaults here.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        case .loading:
+            HStack(spacing: 10) {
+                ProgressView()
+                Text("Loading voice defaults...")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+        case let .unavailable(message):
+            AppBanner(text: message, tone: .warning)
+        case let .error(message):
+            AppBanner(text: message, tone: .error)
+        case .ready:
+            if let values = viewModel.voiceControlValues,
+               let defaults = viewModel.voiceControlDefaults {
+                VStack(alignment: .leading, spacing: 18) {
+                    VoiceControlSliderRow(
+                        title: "Pitch",
+                        hint: "Shift the final voice higher or lower.",
+                        valueLabel: signedFormat(values.pitchShift, suffix: " st", decimals: 1),
+                        defaultLabel: "Default \(signedFormat(defaults.pitchShift, suffix: " st", decimals: 1))",
+                        rangeLabel: "-4.0 st to +4.0 st"
+                    ) {
+                        Slider(
+                            value: Binding(
+                                get: { values.pitchShift },
+                                set: { nextValue in
+                                    viewModel.updateVoiceControls { $0.pitchShift = nextValue }
+                                }
+                            ),
+                            in: -4...4,
+                            step: 0.1
+                        )
+                    }
+
+                    VoiceControlSliderRow(
+                        title: "Pitch Range",
+                        hint: "Control how much pitch movement the voice keeps.",
+                        valueLabel: multiplierFormat(values.f0Scale),
+                        defaultLabel: "Default \(multiplierFormat(defaults.f0Scale))",
+                        rangeLabel: "0.75x to 1.35x"
+                    ) {
+                        Slider(
+                            value: Binding(
+                                get: { values.f0Scale },
+                                set: { nextValue in
+                                    viewModel.updateVoiceControls { $0.f0Scale = nextValue }
+                                }
+                            ),
+                            in: 0.75...1.35,
+                            step: 0.01
+                        )
+                    }
+
+                    VoiceControlSliderRow(
+                        title: "Style Strength",
+                        hint: "Blend more or less of the trained style into output.",
+                        valueLabel: multiplierFormat(values.embeddingScale),
+                        defaultLabel: "Default \(multiplierFormat(defaults.embeddingScale))",
+                        rangeLabel: "0.80x to 2.20x"
+                    ) {
+                        Slider(
+                            value: Binding(
+                                get: { values.embeddingScale },
+                                set: { nextValue in
+                                    viewModel.updateVoiceControls { $0.embeddingScale = nextValue }
+                                }
+                            ),
+                            in: 0.8...2.2,
+                            step: 0.05
+                        )
+                    }
+
+                    VoiceControlSliderRow(
+                        title: "Diffusion Steps",
+                        hint: "More steps can sound cleaner, but add latency.",
+                        valueLabel: "\(values.diffusionSteps) steps",
+                        defaultLabel: "Default \(defaults.diffusionSteps) steps",
+                        rangeLabel: "6 to 20"
+                    ) {
+                        Slider(
+                            value: Binding(
+                                get: { Double(values.diffusionSteps) },
+                                set: { nextValue in
+                                    viewModel.updateVoiceControls { $0.diffusionSteps = Int(nextValue.rounded()) }
+                                }
+                            ),
+                            in: 6...20,
+                            step: 1
+                        )
+                    }
+
+                    VoiceControlSliderRow(
+                        title: "Brightness",
+                        hint: "Softens or brightens the top end around the profile default.",
+                        valueLabel: signedIntegerFormat(values.brightness),
+                        defaultLabel: "Default \(signedIntegerFormat(defaults.brightness))",
+                        rangeLabel: "-100 to +100"
+                    ) {
+                        Slider(
+                            value: Binding(
+                                get: { Double(values.brightness) },
+                                set: { nextValue in
+                                    viewModel.updateVoiceControls { $0.brightness = Int(nextValue.rounded()) }
+                                }
+                            ),
+                            in: -100...100,
+                            step: 1
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func multiplierFormat(_ value: Double) -> String {
+        String(format: "%.2fx", value)
+    }
+
+    private func signedFormat(_ value: Double, suffix: String, decimals: Int) -> String {
+        let format = "%@%.\(decimals)f%@"
+        return String(format: format, value > 0 ? "+" : "", value, suffix)
+    }
+
+    private func signedIntegerFormat(_ value: Int) -> String {
+        value > 0 ? "+\(value)" : "\(value)"
+    }
 }
 
 private struct PreviewStageContent: View {
@@ -475,6 +663,47 @@ private struct HoldToTalkControl: View {
                 .fill(isActive ? Color.red : Color.blue)
         )
         .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+}
+
+private struct VoiceControlSliderRow<SliderView: View>: View {
+    let title: String
+    let hint: String
+    let valueLabel: String
+    let defaultLabel: String
+    let rangeLabel: String
+    @ViewBuilder let slider: SliderView
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.subheadline.weight(.semibold))
+                    Text(hint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 8)
+
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(valueLabel)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(.tint)
+                    Text(defaultLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            slider
+                .tint(.accentColor)
+
+            Text(rangeLabel)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+        }
     }
 }
 

@@ -33,6 +33,12 @@ struct GenerateRequest: Codable, Hashable {
     var musetalkAudioHistorySec: Double?
     var musetalkMaxChunkChars: Int?
     var musetalkFirstChunkChars: Int?
+    var pitchShift: Double?
+    var f0Scale: Double?
+    var embeddingScale: Double?
+    var diffusionSteps: Int?
+    var deEsserCutoff: Double?
+    var deEsserOrder: Int?
 
     enum CodingKeys: String, CodingKey {
         case text
@@ -55,6 +61,12 @@ struct GenerateRequest: Codable, Hashable {
         case musetalkAudioHistorySec = "musetalk_audio_history_sec"
         case musetalkMaxChunkChars = "musetalk_max_chunk_chars"
         case musetalkFirstChunkChars = "musetalk_first_chunk_chars"
+        case pitchShift = "pitch_shift"
+        case f0Scale = "f0_scale"
+        case embeddingScale = "embedding_scale"
+        case diffusionSteps = "diffusion_steps"
+        case deEsserCutoff = "de_esser_cutoff"
+        case deEsserOrder = "de_esser_order"
     }
 }
 
