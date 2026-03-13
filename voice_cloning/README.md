@@ -117,6 +117,13 @@ If you see an "externally-managed-environment" error, use `.venv/bin/python -m p
 
 System deps: `ffmpeg`, `espeak-ng`.
 
+LLM chat defaults:
+- `GROQ_MODEL_DEFAULT=meta-llama/llama-4-scout-17b-16e-instruct`
+- `GROQ_MODEL_LIVE=groq/compound-mini`
+- `GROQ_ENABLE_LIVE_ROUTING=1`
+
+With those defaults, ordinary chat stays on the faster base model and time-sensitive prompts such as weather, latest news, scores, prices, and post-2024 factual questions are routed to the live-data model automatically.
+
 Clone StyleTTS2 and download LibriTTS weights:
 ```bash
 mkdir -p lib
