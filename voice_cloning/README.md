@@ -100,6 +100,13 @@ Files of interest:
 - `outputs/training/avatar/<name>/profile.json` - inference defaults (model path, ref wav, alpha/beta, f0_scale).
 - `outputs/training/avatar/<name>/best_epoch.txt` - selected checkpoint.
 - `outputs/training/avatar/<name>/epoch_scores.json` - scoring history.
+- `data/<type>_profiles/<name>/lexicon.json` - pronunciation overrides. Supports both single words and full phrases (for example `\"1300 b c\"` or a proper noun phrase) when you need exact spoken output.
+
+Pronunciation pipeline:
+- text is normalized first (numbers, dotted abbreviations such as `B.C.`, contractions, punctuation cleanup)
+- runtime then prefers a CMUdict-backed base pronunciation dictionary when available
+- profile `lexicon.json` overrides still win over the base dictionary
+- espeak phonemizer remains the fallback for out-of-vocabulary words
 
 Suggested training settings:
 - `epochs: 25`

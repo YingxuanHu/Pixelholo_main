@@ -37,6 +37,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.text_normalize import clean_text_for_tts, warmup_text_normalizer
+from src.pronunciation_dict import lookup_base_pronunciation
 from src.utils.smart_buffer import SmartStreamBuffer
 from src.utils.prosody_chunker import prosody_split
 from src.llm.llm_service import LLMService
@@ -118,6 +119,10 @@ DEFAULT_PAUSE_MS = 40
 
 _WORD_RE = re.compile(r"[A-Za-z']+|[^A-Za-z']+")
 _WORD_ONLY_RE = re.compile(r"[A-Za-z']+$")
+
+
+def _is_lexicon_boundary_char(ch: str) -> bool:
+    return not (ch.isalnum() or ch == "'")
 
 app = FastAPI()
 
@@ -2289,16 +2294,59 @@ class StyleTTS2RepoEngine:
 
     def _phonemize(self, text: str, lang: str | None, lexicon: dict[str, str] | None) -> str:
         phonemizer = self._get_phonemizer(lang)
+        phrase_entries: list[tuple[str, str]] = []
+        word_entries: dict[str, str] = {}
+        if lexicon:
+            for raw_key, value in lexicon.items():
+                key = str(raw_key).strip().lower()
+                if not key or not value:
+                    continue
+                if " " in key or any(not (ch.isalpha() or ch == "'") for ch in key):
+                    phrase_entries.append((key, str(value)))
+                else:
+                    word_entries[key] = str(value)
+            phrase_entries.sort(key=lambda item: len(item[0]), reverse=True)
+
         parts: list[str] = []
-        for token in _WORD_RE.findall(text):
+        lowered = text.lower()
+        idx = 0
+        while idx < len(text):
+            matched_phrase = False
+            for key, value in phrase_entries:
+                if not lowered.startswith(key, idx):
+                    continue
+                start_ok = idx == 0 or _is_lexicon_boundary_char(text[idx - 1])
+                end_idx = idx + len(key)
+                end_ok = end_idx >= len(text) or _is_lexicon_boundary_char(text[end_idx])
+                if not (start_ok and end_ok):
+                    continue
+                parts.append(value)
+                idx = end_idx
+                matched_phrase = True
+                break
+            if matched_phrase:
+                continue
+
+            match = _WORD_RE.match(text, idx)
+            if not match:
+                parts.append(text[idx])
+                idx += 1
+                continue
+
+            token = match.group(0)
             if _WORD_ONLY_RE.match(token):
                 key = token.lower()
-                if lexicon and key in lexicon:
-                    parts.append(lexicon[key])
+                if key in word_entries:
+                    parts.append(word_entries[key])
                 else:
-                    parts.append(phonemizer.phonemize([token])[0].strip())
+                    base_pronunciation = lookup_base_pronunciation(token)
+                    if base_pronunciation:
+                        parts.append(base_pronunciation)
+                    else:
+                        parts.append(phonemizer.phonemize([token])[0].strip())
             else:
                 parts.append(token)
+            idx = match.end()
         return "".join(parts)
 
     def _preprocess(self, wave: np.ndarray) -> torch.Tensor:

@@ -11,6 +11,7 @@ except Exception:
 
 _CURRENCY_RE = re.compile(r"(?P<sign>[$£€])\s?(?P<amount>\d[\d,]*)(?:\.(?P<cents>\d{1,2}))?")
 _NUMBER_RE = re.compile(r"\d[\d,]*")
+_DOTTED_INITIALISM_RE = re.compile(r"\b(?:[A-Za-z]\.){2,}[A-Za-z]?\.?")
 
 _ACRONYMS = {
     "LLM": "L L M",
@@ -77,6 +78,11 @@ def _replace_number(match: re.Match, year_hint: Callable[[int], bool]) -> str:
     return _to_words(raw, to_year=year_hint(number))
 
 
+def _expand_dotted_initialism(match: re.Match) -> str:
+    letters = re.findall(r"[A-Za-z]", match.group(0))
+    return " ".join(letter.upper() for letter in letters)
+
+
 def clean_text_for_tts(text: str) -> str:
     """
     Normalizes numbers to words so TTS pronounces them naturally.
@@ -102,6 +108,10 @@ def clean_text_for_tts(text: str) -> str:
         .replace("—", ", ")
         .replace("–", ", ")
     )
+
+    # Turn dotted letter abbreviations into connected spoken letters:
+    # "B.C." -> "B C", "U.S.A." -> "U S A".
+    text = _DOTTED_INITIALISM_RE.sub(_expand_dotted_initialism, text)
 
     # Expand common contractions for clearer pronunciation.
     contractions = {
