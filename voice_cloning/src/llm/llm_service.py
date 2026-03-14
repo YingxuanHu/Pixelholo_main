@@ -9,7 +9,7 @@ from groq import Groq
 
 logger = logging.getLogger("pixelholo.llm")
 
-DEFAULT_CHAT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+DEFAULT_CHAT_MODEL = "llama-3.1-8b-instant"
 DEFAULT_LIVE_MODEL = "groq/compound-mini"
 LIVE_ROUTING_TRUE = {"1", "true", "yes", "on"}
 LIVE_SIGNAL_PATTERNS = (
@@ -69,6 +69,20 @@ class LLMService:
             temperature=0.7,
         )
 
+    @staticmethod
+    def _fallback_live_error(error: Exception) -> bool:
+        message = str(error).lower()
+        live_retry_signals = (
+            "rate limit",
+            "tokens per minute",
+            "requested",
+            "please try again in",
+            "tool use is not available",
+            "model is blocked",
+            "service tier",
+        )
+        return any(signal in message for signal in live_retry_signals)
+
     def warmup(self) -> bool:
         if self.stream_warmed:
             return False
@@ -112,18 +126,6 @@ class LLMService:
         use_live_model, route_reason = self._should_use_live_model(user_input)
         model = self.live_model if use_live_model else self.default_model
 
-        try:
-            stream = self._start_stream(model, self.history)
-        except Exception as e:
-            logger.exception(
-                "component=llm op=groq_chat status=error model=%s input_chars=%s route_reason=%s",
-                model,
-                len(user_input),
-                route_reason,
-            )
-            yield f"Error calling Groq: {str(e)}"
-            return
-
         full_response_text = ""
         buffer = ""
         min_chunk_size = max(min_chars, min_words * 2)
@@ -135,34 +137,69 @@ class LLMService:
             route_reason,
             len(user_input),
         )
-        print(f"LLM Thinking ({model})...", end="", flush=True)
 
-        for chunk in stream:
-            if chunk.choices[0].delta.content:
-                token = chunk.choices[0].delta.content
-                full_response_text += token
-                buffer += token
+        attempted_fallback = False
+        current_model = model
 
-                # Split only on strong punctuation once we have enough context.
-                if any(punct in token for punct in (".", "?", "!", "\n")):
-                    if len(buffer) >= min_chunk_size:
-                        yield buffer.strip()
-                        buffer = ""
-                        continue
+        while True:
+            try:
+                stream = self._start_stream(current_model, self.history)
+                print(f"LLM Thinking ({current_model})...", end="", flush=True)
 
-                # Emergency split if buffer gets too long (avoid latency spikes).
-                if len(buffer) >= max_chars:
-                    last_space = buffer.rfind(" ")
-                    if last_space != -1:
-                        head = buffer[:last_space].strip()
-                        tail = buffer[last_space:].strip()
-                        if head:
-                            yield head
-                        buffer = tail
+                for chunk in stream:
+                    if chunk.choices[0].delta.content:
+                        token = chunk.choices[0].delta.content
+                        full_response_text += token
+                        buffer += token
+
+                        # Split only on strong punctuation once we have enough context.
+                        if any(punct in token for punct in (".", "?", "!", "\n")):
+                            if len(buffer) >= min_chunk_size:
+                                yield buffer.strip()
+                                buffer = ""
+                                continue
+
+                        # Emergency split if buffer gets too long (avoid latency spikes).
+                        if len(buffer) >= max_chars:
+                            last_space = buffer.rfind(" ")
+                            if last_space != -1:
+                                head = buffer[:last_space].strip()
+                                tail = buffer[last_space:].strip()
+                                if head:
+                                    yield head
+                                buffer = tail
+                break
+            except Exception as e:
+                can_fallback = (
+                    current_model == self.live_model
+                    and not attempted_fallback
+                    and not full_response_text
+                    and self._fallback_live_error(e)
+                )
+                if can_fallback:
+                    logger.warning(
+                        "component=llm op=route_fallback status=retry model=%s fallback_model=%s reason=%s input_chars=%s",
+                        current_model,
+                        self.default_model,
+                        route_reason,
+                        len(user_input),
+                    )
+                    attempted_fallback = True
+                    current_model = self.default_model
+                    continue
+
+                logger.exception(
+                    "component=llm op=groq_chat status=error model=%s input_chars=%s route_reason=%s",
+                    current_model,
+                    len(user_input),
+                    route_reason,
+                )
+                yield f"Error calling Groq: {str(e)}"
+                return
 
         if buffer.strip():
             yield buffer.strip()
 
         self.history.append({"role": "assistant", "content": full_response_text})
-        self._warmed_models.add(model)
+        self._warmed_models.add(current_model)
         print(" Done.")
