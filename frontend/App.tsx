@@ -270,15 +270,25 @@ const App: React.FC = () => {
 
   const invalidateWarmupEntriesForProfile = useCallback((profileName: string) => {
     const markers = [`|voice|${profileName}|`, `|avatar|${profileName}|`];
-    for (const key of Array.from(warmedProfilesRef.current.keys())) {
+
+    const warmedKeysToDelete: string[] = [];
+    for (const key of warmedProfilesRef.current.keys()) {
       if (markers.some((marker) => key.includes(marker))) {
-        warmedProfilesRef.current.delete(key);
+        warmedKeysToDelete.push(key);
       }
     }
-    for (const key of Array.from(warmupInFlightRef.current.keys())) {
+    for (const key of warmedKeysToDelete) {
+      warmedProfilesRef.current.delete(key);
+    }
+
+    const inFlightKeysToDelete: string[] = [];
+    for (const key of warmupInFlightRef.current.keys()) {
       if (markers.some((marker) => key.includes(marker))) {
-        warmupInFlightRef.current.delete(key);
+        inFlightKeysToDelete.push(key);
       }
+    }
+    for (const key of inFlightKeysToDelete) {
+      warmupInFlightRef.current.delete(key);
     }
   }, []);
 
