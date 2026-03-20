@@ -124,6 +124,13 @@ If you see an "externally-managed-environment" error, use `.venv/bin/python -m p
 
 System deps: `ffmpeg`, `espeak-ng`.
 
+LLM chat defaults:
+- `GROQ_MODEL_DEFAULT=llama-3.1-8b-instant`
+- `OPENAI_MODEL_LIVE=gpt-4o-mini-search-preview`
+- `LLM_ENABLE_LIVE_ROUTING=1`
+
+With those defaults, ordinary chat stays on the fast Groq base model. Prompts that clearly ask for current information such as weather, latest news, scores, prices, or post-2024 facts are routed to the OpenAI live-search model instead. If OpenAI is not configured or the live request fails before it produces any text, the backend falls back to the default Groq chat model instead of crashing the stream.
+
 Clone StyleTTS2 and download LibriTTS weights:
 ```bash
 mkdir -p lib
