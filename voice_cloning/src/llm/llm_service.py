@@ -17,11 +17,28 @@ logger = logging.getLogger("pixelholo.llm")
 DEFAULT_CHAT_MODEL = "llama-3.1-8b-instant"
 DEFAULT_LIVE_MODEL = "gpt-4o-mini-search-preview"
 LIVE_ROUTING_TRUE = {"1", "true", "yes", "on"}
-LIVE_SIGNAL_PATTERNS = (
-    re.compile(r"\b(today|tonight|tomorrow|yesterday|currently|current|latest|recent|recently|right now|at the moment|as of)\b", re.I),
-    re.compile(r"\b(weather|forecast|temperature|rain|snow|news|headline|price|stock|market|score|scores|standings|schedule|schedules|traffic)\b", re.I),
-    re.compile(r"\b(who is|who won|what happened|what's happening|what is happening|what time|when is|when did)\b", re.I),
+TIME_SENSITIVE_PATTERNS = (
+    re.compile(r"\b(today|tonight|tomorrow|yesterday|currently|current|latest|recent|recently|right now|at the moment|as of|last night|this morning|this afternoon|this evening|this week|this month|this year)\b", re.I),
     re.compile(r"\b(202[5-9]|20[3-9]\d)\b"),
+)
+DYNAMIC_TOPIC_PATTERNS = (
+    re.compile(r"\b(weather|forecast|temperature|rain|snow|air quality|uv index|pollen|sunrise|sunset)\b", re.I),
+    re.compile(r"\b(news|headline|headlines|breaking news|current events)\b", re.I),
+    re.compile(r"\b(score|scores|standings|schedule|schedules|next game|next match|upcoming game|upcoming match)\b", re.I),
+    re.compile(r"\b(traffic|transit delays?|road closures?|flight status|opening hours|hours today)\b", re.I),
+    re.compile(r"\b(stock price|share price|market cap|exchange rate|forex|trading at|bitcoin price|ethereum price|btc price|eth price|gold price|oil price)\b", re.I),
+    re.compile(r"\bwhen is\b.*\b(next|upcoming)\b.*\b(game|match|flight)\b", re.I),
+    re.compile(r"\bwhat time does\b.*\b(open|close)\b", re.I),
+    re.compile(r"\bwhen does\b.*\b(open|close)\b", re.I),
+)
+CURRENT_ROLE_QUERY_PATTERNS = (
+    re.compile(r"\b(who is|who's|is|tell me|name|identify)\b.*\b(president|prime minister|ceo|governor|mayor|chancellor|head coach)\b", re.I),
+    re.compile(r"\b(current|incumbent)\b.*\b(president|prime minister|ceo|governor|mayor|chancellor|head coach)\b", re.I),
+)
+HISTORICAL_ROLE_HINT_PATTERNS = (
+    re.compile(r"\bwho was\b", re.I),
+    re.compile(r"\b(former|previous|historical|history of|back in|during)\b", re.I),
+    re.compile(r"\b(1[0-9]{3}|20(?:0[0-9]|1[0-9]|2[0-4]))\b"),
 )
 NON_LIVE_HINT_PATTERNS = (
     re.compile(r"\b(write|story|poem|script|roleplay|pretend|imagine|fictional|lyrics)\b", re.I),
@@ -56,6 +73,13 @@ class LLMService:
     def stream_warmed(self) -> bool:
         return self.default_model in self._warmed_models
 
+    @staticmethod
+    def _matches_any(patterns: tuple[re.Pattern[str], ...], text: str) -> re.Pattern[str] | None:
+        for pattern in patterns:
+            if pattern.search(text):
+                return pattern
+        return None
+
     def _should_use_live_model(self, user_input: str) -> tuple[bool, str]:
         if not self.live_routing_enabled:
             return False, "disabled"
@@ -70,9 +94,19 @@ class LLMService:
         if any(pattern.search(lowered) for pattern in NON_LIVE_HINT_PATTERNS):
             return False, "creative_prompt"
 
-        for pattern in LIVE_SIGNAL_PATTERNS:
-            if pattern.search(lowered):
-                return True, f"matched:{pattern.pattern}"
+        pattern = self._matches_any(TIME_SENSITIVE_PATTERNS, lowered)
+        if pattern is not None:
+            return True, f"time_sensitive:{pattern.pattern}"
+
+        pattern = self._matches_any(DYNAMIC_TOPIC_PATTERNS, lowered)
+        if pattern is not None:
+            return True, f"dynamic_topic:{pattern.pattern}"
+
+        pattern = self._matches_any(CURRENT_ROLE_QUERY_PATTERNS, lowered)
+        if pattern is not None:
+            if self._matches_any(HISTORICAL_ROLE_HINT_PATTERNS, lowered) is not None:
+                return False, "historical_role_query"
+            return True, f"current_role:{pattern.pattern}"
 
         return False, "no_live_signal"
 
@@ -95,7 +129,19 @@ class LLMService:
 
     @staticmethod
     def _fallback_live_error(error: Exception) -> bool:
-        return True
+        message = str(error).lower()
+        fallback_signals = (
+            "rate limit",
+            "quota",
+            "429",
+            "temporarily unavailable",
+            "overloaded",
+            "timeout",
+            "timed out",
+            "connection",
+            "service unavailable",
+        )
+        return any(signal in message for signal in fallback_signals)
 
     def warmup(self) -> bool:
         if self.stream_warmed:
