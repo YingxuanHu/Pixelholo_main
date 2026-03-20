@@ -470,16 +470,16 @@ struct AvatarChatView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     VoiceControlSliderRow(
                         title: "Pitch",
-                        hint: "Shift the final voice higher or lower.",
-                        valueLabel: signedFormat(values.pitchShift, suffix: " st", decimals: 1),
-                        defaultLabel: "Default \(signedFormat(defaults.pitchShift, suffix: " st", decimals: 1))",
-                        rangeLabel: "-4.0 st to +4.0 st"
+                        hint: "Make the voice deeper or higher.",
+                        valueLabel: describePitch(values.pitch),
+                        defaultLabel: describeDefault(describePitch(defaults.pitch)),
+                        rangeLabel: "Deeper to Higher"
                     ) {
                         Slider(
                             value: Binding(
-                                get: { values.pitchShift },
+                                get: { values.pitch },
                                 set: { nextValue in
-                                    viewModel.updateVoiceControls { $0.pitchShift = nextValue }
+                                    viewModel.updateVoiceControls { $0.pitch = nextValue }
                                 }
                             ),
                             in: -4...4,
@@ -488,74 +488,55 @@ struct AvatarChatView: View {
                     }
 
                     VoiceControlSliderRow(
-                        title: "Pitch Range",
-                        hint: "Control how much pitch movement the voice keeps.",
-                        valueLabel: multiplierFormat(values.f0Scale),
-                        defaultLabel: "Default \(multiplierFormat(defaults.f0Scale))",
-                        rangeLabel: "0.75x to 1.35x"
+                        title: "Pace",
+                        hint: "Slow the delivery down or speed it up.",
+                        valueLabel: describeRelative(values.pace, negative: "slower", positive: "faster"),
+                        defaultLabel: describeDefault(describeRelative(defaults.pace, negative: "slower", positive: "faster")),
+                        rangeLabel: "Slower to Faster"
                     ) {
                         Slider(
                             value: Binding(
-                                get: { values.f0Scale },
+                                get: { Double(values.pace) },
                                 set: { nextValue in
-                                    viewModel.updateVoiceControls { $0.f0Scale = nextValue }
+                                    viewModel.updateVoiceControls { $0.pace = Int(nextValue.rounded()) }
                                 }
                             ),
-                            in: 0.75...1.35,
-                            step: 0.01
-                        )
-                    }
-
-                    VoiceControlSliderRow(
-                        title: "Style Strength",
-                        hint: "Blend more or less of the trained style into output.",
-                        valueLabel: multiplierFormat(values.embeddingScale),
-                        defaultLabel: "Default \(multiplierFormat(defaults.embeddingScale))",
-                        rangeLabel: "0.80x to 2.20x"
-                    ) {
-                        Slider(
-                            value: Binding(
-                                get: { values.embeddingScale },
-                                set: { nextValue in
-                                    viewModel.updateVoiceControls { $0.embeddingScale = nextValue }
-                                }
-                            ),
-                            in: 0.8...2.2,
-                            step: 0.05
-                        )
-                    }
-
-                    VoiceControlSliderRow(
-                        title: "Diffusion Steps",
-                        hint: "More steps can sound cleaner, but add latency.",
-                        valueLabel: "\(values.diffusionSteps) steps",
-                        defaultLabel: "Default \(defaults.diffusionSteps) steps",
-                        rangeLabel: "6 to 20"
-                    ) {
-                        Slider(
-                            value: Binding(
-                                get: { Double(values.diffusionSteps) },
-                                set: { nextValue in
-                                    viewModel.updateVoiceControls { $0.diffusionSteps = Int(nextValue.rounded()) }
-                                }
-                            ),
-                            in: 6...20,
+                            in: -100...100,
                             step: 1
                         )
                     }
 
                     VoiceControlSliderRow(
-                        title: "Brightness",
-                        hint: "Softens or brightens the top end around the profile default.",
-                        valueLabel: signedIntegerFormat(values.brightness),
-                        defaultLabel: "Default \(signedIntegerFormat(defaults.brightness))",
-                        rangeLabel: "-100 to +100"
+                        title: "Tone",
+                        hint: "Move the delivery toward calmer or more expressive.",
+                        valueLabel: describeRelative(values.tone, negative: "calmer", positive: "more expressive"),
+                        defaultLabel: describeDefault(describeRelative(defaults.tone, negative: "calmer", positive: "more expressive")),
+                        rangeLabel: "Calmer to More expressive"
                     ) {
                         Slider(
                             value: Binding(
-                                get: { Double(values.brightness) },
+                                get: { Double(values.tone) },
                                 set: { nextValue in
-                                    viewModel.updateVoiceControls { $0.brightness = Int(nextValue.rounded()) }
+                                    viewModel.updateVoiceControls { $0.tone = Int(nextValue.rounded()) }
+                                }
+                            ),
+                            in: -100...100,
+                            step: 1
+                        )
+                    }
+
+                    VoiceControlSliderRow(
+                        title: "Volume",
+                        hint: "Make the voice softer or stronger.",
+                        valueLabel: describeRelative(values.volume, negative: "softer", positive: "stronger"),
+                        defaultLabel: describeDefault(describeRelative(defaults.volume, negative: "softer", positive: "stronger")),
+                        rangeLabel: "Softer to Stronger"
+                    ) {
+                        Slider(
+                            value: Binding(
+                                get: { Double(values.volume) },
+                                set: { nextValue in
+                                    viewModel.updateVoiceControls { $0.volume = Int(nextValue.rounded()) }
                                 }
                             ),
                             in: -100...100,
@@ -567,17 +548,24 @@ struct AvatarChatView: View {
         }
     }
 
-    private func multiplierFormat(_ value: Double) -> String {
-        String(format: "%.2fx", value)
+    private func describePitch(_ value: Double) -> String {
+        let amount = abs(value)
+        if amount < 0.05 { return "Default" }
+        if amount < 1.0 { return value < 0 ? "Slightly deeper" : "Slightly higher" }
+        if amount < 2.5 { return value < 0 ? "Deeper" : "Higher" }
+        return value < 0 ? "Much deeper" : "Much higher"
     }
 
-    private func signedFormat(_ value: Double, suffix: String, decimals: Int) -> String {
-        let format = "%@%.\(decimals)f%@"
-        return String(format: format, value > 0 ? "+" : "", value, suffix)
+    private func describeDefault(_ value: String) -> String {
+        value == "Default" ? "Profile default" : "Default \(value.lowercased())"
     }
 
-    private func signedIntegerFormat(_ value: Int) -> String {
-        value > 0 ? "+\(value)" : "\(value)"
+    private func describeRelative(_ value: Int, negative: String, positive: String) -> String {
+        let amount = abs(value)
+        if amount < 5 { return "Default" }
+        if amount < 35 { return value < 0 ? "Slightly \(negative)" : "Slightly \(positive)" }
+        if amount < 70 { return value < 0 ? negative.capitalized : positive.capitalized }
+        return value < 0 ? "Much \(negative)" : "Much \(positive)"
     }
 }
 

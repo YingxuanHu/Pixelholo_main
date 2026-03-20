@@ -33,9 +33,8 @@ type VoiceControlBackendDefaults = {
   pitchShift: number;
   f0Scale: number;
   embeddingScale: number;
-  diffusionSteps: number;
-  deEsserCutoff: number;
-  deEsserOrder: number;
+  paceScale: number;
+  volumeGain: number;
 };
 
 const DEFAULT_API_BASE = 'http://127.0.0.1:8000';
@@ -50,11 +49,10 @@ const DEFAULT_AUDIO_START_DELAY_SEC = 0.05;
 const WARMUP_CACHE_MAX_AGE_MS = 120_000;
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 const normalizeVoiceControls = (controls: VoiceControlValues): VoiceControlValues => ({
-  pitchShift: Number(clamp(controls.pitchShift, -4, 4).toFixed(1)),
-  f0Scale: Number(clamp(controls.f0Scale, 0.75, 1.35).toFixed(2)),
-  embeddingScale: Number(clamp(controls.embeddingScale, 0.8, 2.2).toFixed(2)),
-  diffusionSteps: Math.round(clamp(controls.diffusionSteps, 6, 20)),
-  brightness: Math.round(clamp(controls.brightness, -100, 100)),
+  pitch: Number(clamp(controls.pitch, -4, 4).toFixed(1)),
+  pace: Math.round(clamp(controls.pace, -100, 100)),
+  tone: Math.round(clamp(controls.tone, -100, 100)),
+  volume: Math.round(clamp(controls.volume, -100, 100)),
 });
 const formatBytes = (value: number) => {
   if (!Number.isFinite(value) || value <= 0) return '0 MB';
@@ -501,26 +499,29 @@ const App: React.FC = () => {
   const currentProfileInfo = profiles.find((item) => item.name === profile.name);
   const hasTrainedProfile = Boolean(currentProfileInfo?.has_profile);
   const hasData = Boolean(currentProfileInfo?.has_data);
-  const resolveBrightnessOverrides = useCallback(
-    (brightness: number) => {
-      if (!voiceControlBackendDefaults) return { cutoff: 0, order: 2 };
-      const defaultCutoff = voiceControlBackendDefaults.deEsserCutoff;
-      const defaultOrder = voiceControlBackendDefaults.deEsserOrder || 2;
-      if (brightness === 0) {
-        return { cutoff: defaultCutoff, order: defaultOrder };
-      }
-      const normalized = brightness / 100;
-      if (defaultCutoff > 0) {
-        const target = normalized >= 0
-          ? defaultCutoff + (12000 - defaultCutoff) * normalized
-          : defaultCutoff + (3500 - defaultCutoff) * -normalized;
-        return { cutoff: Math.round(clamp(target, 3500, 12000)), order: defaultOrder };
-      }
-      if (normalized > 0) {
-        return { cutoff: 0, order: defaultOrder };
-      }
-      const target = 7000 + (3500 - 7000) * -normalized;
-      return { cutoff: Math.round(clamp(target, 3500, 7000)), order: 2 };
+  const resolvePaceScale = useCallback(
+    (pace: number) => {
+      const base = voiceControlBackendDefaults?.paceScale ?? 1;
+      return Number(clamp(base + (pace / 100) * 0.15, 0.85, 1.15).toFixed(2));
+    },
+    [voiceControlBackendDefaults],
+  );
+  const resolveToneOverrides = useCallback(
+    (tone: number) => {
+      const baseF0 = voiceControlBackendDefaults?.f0Scale ?? 1;
+      const baseEmbedding = voiceControlBackendDefaults?.embeddingScale ?? 1.2;
+      const normalized = tone / 100;
+      return {
+        f0Scale: Number(clamp(baseF0 + normalized * 0.18, 0.75, 1.35).toFixed(2)),
+        embeddingScale: Number(clamp(baseEmbedding + normalized * 0.55, 0.8, 2.2).toFixed(2)),
+      };
+    },
+    [voiceControlBackendDefaults],
+  );
+  const resolveVolumeGain = useCallback(
+    (volume: number) => {
+      const base = voiceControlBackendDefaults?.volumeGain ?? 1;
+      return Number(clamp(base + (volume / 100) * 0.45, 0.6, 1.45).toFixed(2));
     },
     [voiceControlBackendDefaults],
   );
@@ -568,16 +569,14 @@ const App: React.FC = () => {
           pitchShift: Number(data?.controls?.pitch_shift ?? 0),
           f0Scale: Number(data?.controls?.f0_scale ?? 1),
           embeddingScale: Number(data?.controls?.embedding_scale ?? 1.2),
-          diffusionSteps: Number(data?.controls?.diffusion_steps ?? 10),
-          deEsserCutoff: Number(data?.controls?.de_esser_cutoff ?? 0),
-          deEsserOrder: Number(data?.controls?.de_esser_order ?? 2),
+          paceScale: Number(data?.controls?.pace_scale ?? 1),
+          volumeGain: Number(data?.controls?.volume_gain ?? 1),
         };
         const controls = normalizeVoiceControls({
-          pitchShift: backendDefaults.pitchShift,
-          f0Scale: backendDefaults.f0Scale,
-          embeddingScale: backendDefaults.embeddingScale,
-          diffusionSteps: backendDefaults.diffusionSteps,
-          brightness: 0,
+          pitch: backendDefaults.pitchShift,
+          pace: 0,
+          tone: 0,
+          volume: 0,
         });
         setVoiceControlBackendDefaults(backendDefaults);
         setVoiceControlDefaults(controls);
@@ -1143,13 +1142,12 @@ const App: React.FC = () => {
       ref_wav_path: refOverride || null,
     };
     if (voiceControlsStatus === 'ready' && voiceControlValues) {
-      payload.pitch_shift = voiceControlValues.pitchShift;
-      payload.f0_scale = voiceControlValues.f0Scale;
-      payload.embedding_scale = voiceControlValues.embeddingScale;
-      payload.diffusion_steps = voiceControlValues.diffusionSteps;
-      const brightnessOverrides = resolveBrightnessOverrides(voiceControlValues.brightness);
-      payload.de_esser_cutoff = brightnessOverrides.cutoff;
-      payload.de_esser_order = brightnessOverrides.order;
+      payload.pitch_shift = voiceControlValues.pitch;
+      payload.pace_scale = resolvePaceScale(voiceControlValues.pace);
+      const toneOverrides = resolveToneOverrides(voiceControlValues.tone);
+      payload.f0_scale = toneOverrides.f0Scale;
+      payload.embedding_scale = toneOverrides.embeddingScale;
+      payload.volume_gain = resolveVolumeGain(voiceControlValues.volume);
     }
     if (outputMode === 'avatar') {
       payload.avatar_profile = profile.name;
@@ -1247,7 +1245,9 @@ const App: React.FC = () => {
     unlockAudio,
     voiceControlValues,
     voiceControlsStatus,
-    resolveBrightnessOverrides,
+    resolvePaceScale,
+    resolveToneOverrides,
+    resolveVolumeGain,
   ]);
 
   const startInference = useCallback(async () => {

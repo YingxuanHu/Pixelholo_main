@@ -17,54 +17,73 @@ type SliderConfig = {
   min: number;
   max: number;
   step: number;
-  format: (value: number) => string;
+  minLabel: string;
+  maxLabel: string;
+  describe: (value: number) => string;
 };
+
+const describeRelative = (value: number, softer: string, stronger: string) => {
+  const amount = Math.abs(value);
+  if (amount < 5) return 'Default';
+  if (amount < 35) return value < 0 ? `Slightly ${softer}` : `Slightly ${stronger}`;
+  if (amount < 70) return value < 0 ? softer : stronger;
+  return value < 0 ? `Much ${softer}` : `Much ${stronger}`;
+};
+
+const describePitch = (value: number) => {
+  const amount = Math.abs(value);
+  if (amount < 0.05) return 'Default';
+  if (amount < 1.0) return value < 0 ? 'Slightly deeper' : 'Slightly higher';
+  if (amount < 2.5) return value < 0 ? 'Deeper' : 'Higher';
+  return value < 0 ? 'Much deeper' : 'Much higher';
+};
+
+const describeDefault = (value: string) => (value === 'Default' ? 'Profile default' : `Default ${value.toLowerCase()}`);
 
 const SLIDERS: SliderConfig[] = [
   {
-    key: 'pitchShift',
+    key: 'pitch',
     label: 'Pitch',
-    hint: 'Shift the final voice higher or lower.',
+    hint: 'Make the voice deeper or higher.',
     min: -4,
     max: 4,
     step: 0.1,
-    format: (value) => `${value > 0 ? '+' : ''}${value.toFixed(1)} st`,
+    minLabel: 'Deeper',
+    maxLabel: 'Higher',
+    describe: describePitch,
   },
   {
-    key: 'f0Scale',
-    label: 'Pitch Range',
-    hint: 'Control how much pitch movement the voice keeps.',
-    min: 0.75,
-    max: 1.35,
-    step: 0.01,
-    format: (value) => `${value.toFixed(2)}x`,
-  },
-  {
-    key: 'embeddingScale',
-    label: 'Style Strength',
-    hint: 'Blend more or less of the trained style into output.',
-    min: 0.8,
-    max: 2.2,
-    step: 0.05,
-    format: (value) => `${value.toFixed(2)}x`,
-  },
-  {
-    key: 'diffusionSteps',
-    label: 'Diffusion Steps',
-    hint: 'More steps can sound cleaner, but will add latency.',
-    min: 6,
-    max: 20,
-    step: 1,
-    format: (value) => `${Math.round(value)} steps`,
-  },
-  {
-    key: 'brightness',
-    label: 'Brightness',
-    hint: 'Softens or brightens the top end around the profile default.',
+    key: 'pace',
+    label: 'Pace',
+    hint: 'Slow the delivery down or speed it up.',
     min: -100,
     max: 100,
     step: 1,
-    format: (value) => `${value > 0 ? '+' : ''}${Math.round(value)}`,
+    minLabel: 'Slower',
+    maxLabel: 'Faster',
+    describe: (value) => describeRelative(value, 'slower', 'faster'),
+  },
+  {
+    key: 'tone',
+    label: 'Tone',
+    hint: 'Move the delivery toward calmer or more expressive.',
+    min: -100,
+    max: 100,
+    step: 1,
+    minLabel: 'Calmer',
+    maxLabel: 'More expressive',
+    describe: (value) => describeRelative(value, 'calmer', 'more expressive'),
+  },
+  {
+    key: 'volume',
+    label: 'Volume',
+    hint: 'Make the voice softer or stronger.',
+    min: -100,
+    max: 100,
+    step: 1,
+    minLabel: 'Softer',
+    maxLabel: 'Stronger',
+    describe: (value) => describeRelative(value, 'softer', 'stronger'),
   },
 ];
 
@@ -120,8 +139,8 @@ const VoiceControlsPanel: React.FC<VoiceControlsPanelProps> = ({
                     <p className="text-[11px] text-slate-500">{slider.hint}</p>
                   </div>
                   <div className="text-right">
-                    <p className="text-sm font-bold text-teal-700">{slider.format(value)}</p>
-                    <p className="text-[10px] text-slate-400">Default {slider.format(defaultValue)}</p>
+                    <p className="text-sm font-bold text-teal-700">{slider.describe(value)}</p>
+                    <p className="text-[10px] text-slate-400">{describeDefault(slider.describe(defaultValue))}</p>
                   </div>
                 </div>
                 <input
@@ -137,8 +156,8 @@ const VoiceControlsPanel: React.FC<VoiceControlsPanelProps> = ({
                   disabled={status !== 'ready'}
                 />
                 <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-widest text-slate-400">
-                  <span>{slider.format(slider.min)}</span>
-                  <span>{slider.format(slider.max)}</span>
+                  <span>{slider.minLabel}</span>
+                  <span>{slider.maxLabel}</span>
                 </div>
               </div>
             );

@@ -180,13 +180,12 @@ final class AvatarChatViewModel: ObservableObject {
             refWavPath: nil
         )
         if voiceControlsStatus == .ready, let voiceControlValues {
-            request.pitchShift = voiceControlValues.pitchShift
-            request.f0Scale = voiceControlValues.f0Scale
-            request.embeddingScale = voiceControlValues.embeddingScale
-            request.diffusionSteps = voiceControlValues.diffusionSteps
-            let brightnessOverrides = resolveBrightnessOverrides(voiceControlValues.brightness)
-            request.deEsserCutoff = brightnessOverrides.cutoff
-            request.deEsserOrder = brightnessOverrides.order
+            request.pitchShift = voiceControlValues.pitch
+            request.paceScale = resolvePaceScale(voiceControlValues.pace)
+            let toneOverrides = resolveToneOverrides(voiceControlValues.tone)
+            request.f0Scale = toneOverrides.f0Scale
+            request.embeddingScale = toneOverrides.embeddingScale
+            request.volumeGain = resolveVolumeGain(voiceControlValues.volume)
         }
         if profileType == .avatar {
             request.avatarProfile = cleanedProfile
@@ -390,17 +389,15 @@ final class AvatarChatViewModel: ObservableObject {
                 pitchShift: response.controls.pitchShift ?? 0,
                 f0Scale: response.controls.f0Scale ?? 1,
                 embeddingScale: response.controls.embeddingScale ?? 1.2,
-                diffusionSteps: response.controls.diffusionSteps ?? 10,
-                deEsserCutoff: response.controls.deEsserCutoff ?? 0,
-                deEsserOrder: response.controls.deEsserOrder ?? 2
+                paceScale: response.controls.paceScale ?? 1,
+                volumeGain: response.controls.volumeGain ?? 1
             )
             let defaults = normalizeVoiceControls(
                 VoiceControlValues(
-                    pitchShift: backendDefaults.pitchShift,
-                    f0Scale: backendDefaults.f0Scale,
-                    embeddingScale: backendDefaults.embeddingScale,
-                    diffusionSteps: backendDefaults.diffusionSteps,
-                    brightness: 0
+                    pitch: backendDefaults.pitchShift,
+                    pace: 0,
+                    tone: 0,
+                    volume: 0
                 )
             )
             voiceControlBackendDefaults = backendDefaults
@@ -545,33 +542,30 @@ final class AvatarChatViewModel: ObservableObject {
 
     private func normalizeVoiceControls(_ values: VoiceControlValues) -> VoiceControlValues {
         VoiceControlValues(
-            pitchShift: Double(round(clamp(values.pitchShift, min: -4, max: 4) * 10) / 10),
-            f0Scale: Double(round(clamp(values.f0Scale, min: 0.75, max: 1.35) * 100) / 100),
-            embeddingScale: Double(round(clamp(values.embeddingScale, min: 0.8, max: 2.2) * 100) / 100),
-            diffusionSteps: Int(clamp(Double(values.diffusionSteps), min: 6, max: 20).rounded()),
-            brightness: Int(clamp(Double(values.brightness), min: -100, max: 100).rounded())
+            pitch: Double(round(clamp(values.pitch, min: -4, max: 4) * 10) / 10),
+            pace: Int(clamp(Double(values.pace), min: -100, max: 100).rounded()),
+            tone: Int(clamp(Double(values.tone), min: -100, max: 100).rounded()),
+            volume: Int(clamp(Double(values.volume), min: -100, max: 100).rounded())
         )
     }
 
-    private func resolveBrightnessOverrides(_ brightness: Int) -> (cutoff: Double, order: Int) {
-        guard let voiceControlBackendDefaults else { return (0, 2) }
-        let defaultCutoff = voiceControlBackendDefaults.deEsserCutoff
-        let defaultOrder = voiceControlBackendDefaults.deEsserOrder
-        if brightness == 0 {
-            return (defaultCutoff, defaultOrder)
-        }
-        let normalized = Double(brightness) / 100
-        if defaultCutoff > 0 {
-            let target = normalized >= 0
-                ? defaultCutoff + (12_000 - defaultCutoff) * normalized
-                : defaultCutoff + (3_500 - defaultCutoff) * -normalized
-            return (round(clamp(target, min: 3_500, max: 12_000)), defaultOrder)
-        }
-        if normalized > 0 {
-            return (0, defaultOrder)
-        }
-        let target = 7_000 + (3_500 - 7_000) * -normalized
-        return (round(clamp(target, min: 3_500, max: 7_000)), 2)
+    private func resolvePaceScale(_ pace: Int) -> Double {
+        let base = voiceControlBackendDefaults?.paceScale ?? 1
+        return Double(round(clamp(base + (Double(pace) / 100) * 0.15, min: 0.85, max: 1.15) * 100) / 100)
+    }
+
+    private func resolveToneOverrides(_ tone: Int) -> (f0Scale: Double, embeddingScale: Double) {
+        let baseF0 = voiceControlBackendDefaults?.f0Scale ?? 1
+        let baseEmbedding = voiceControlBackendDefaults?.embeddingScale ?? 1.2
+        let normalized = Double(tone) / 100
+        let f0Scale = Double(round(clamp(baseF0 + normalized * 0.18, min: 0.75, max: 1.35) * 100) / 100)
+        let embeddingScale = Double(round(clamp(baseEmbedding + normalized * 0.55, min: 0.8, max: 2.2) * 100) / 100)
+        return (f0Scale, embeddingScale)
+    }
+
+    private func resolveVolumeGain(_ volume: Int) -> Double {
+        let base = voiceControlBackendDefaults?.volumeGain ?? 1
+        return Double(round(clamp(base + (Double(volume) / 100) * 0.45, min: 0.6, max: 1.45) * 100) / 100)
     }
 
     private func performWarmup(baseURL: URL, request: WarmupRequest) async throws -> WarmupResponse {

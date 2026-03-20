@@ -86,17 +86,15 @@ struct VoiceControlBackendDefaults: Hashable {
     let pitchShift: Double
     let f0Scale: Double
     let embeddingScale: Double
-    let diffusionSteps: Int
-    let deEsserCutoff: Double
-    let deEsserOrder: Int
+    let paceScale: Double
+    let volumeGain: Double
 }
 
 struct VoiceControlValues: Hashable {
-    var pitchShift: Double
-    var f0Scale: Double
-    var embeddingScale: Double
-    var diffusionSteps: Int
-    var brightness: Int
+    var pitch: Double
+    var pace: Int
+    var tone: Int
+    var volume: Int
 }
 
 struct ProfileVoiceControlsResponse: Codable, Hashable {
@@ -104,17 +102,15 @@ struct ProfileVoiceControlsResponse: Codable, Hashable {
         let pitchShift: Double?
         let f0Scale: Double?
         let embeddingScale: Double?
-        let diffusionSteps: Int?
-        let deEsserCutoff: Double?
-        let deEsserOrder: Int?
+        let paceScale: Double?
+        let volumeGain: Double?
 
         enum CodingKeys: String, CodingKey {
             case pitchShift = "pitch_shift"
             case f0Scale = "f0_scale"
             case embeddingScale = "embedding_scale"
-            case diffusionSteps = "diffusion_steps"
-            case deEsserCutoff = "de_esser_cutoff"
-            case deEsserOrder = "de_esser_order"
+            case paceScale = "pace_scale"
+            case volumeGain = "volume_gain"
         }
     }
 
