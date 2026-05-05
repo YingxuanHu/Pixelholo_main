@@ -33,27 +33,8 @@ final class APIClient {
         request.timeoutInterval = 20
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
 
-        do {
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                throw APIError.invalidResponse
-            }
-            guard (200...299).contains(http.statusCode) else {
-                let message = String(data: data, encoding: .utf8) ?? "Unknown server error"
-                throw APIError.server(statusCode: http.statusCode, message: message)
-            }
-
-            do {
-                let decoded = try decoder.decode(ProfilesResponse.self, from: data)
-                return decoded.profiles
-            } catch {
-                throw APIError.decoding(error)
-            }
-        } catch let error as APIError {
-            throw error
-        } catch {
-            throw APIError.transport(error)
-        }
+        let decoded: ProfilesResponse = try await decodedResponse(for: request)
+        return decoded.profiles
     }
 
     func uploadVideo(
@@ -108,26 +89,7 @@ final class APIClient {
             boundary: boundary
         )
 
-        do {
-            let (data, response) = try await session.upload(for: request, from: body)
-            guard let http = response as? HTTPURLResponse else {
-                throw APIError.invalidResponse
-            }
-            guard (200...299).contains(http.statusCode) else {
-                let message = String(data: data, encoding: .utf8) ?? "Unknown server error"
-                throw APIError.server(statusCode: http.statusCode, message: message)
-            }
-
-            do {
-                return try decoder.decode(UploadResponse.self, from: data)
-            } catch {
-                throw APIError.decoding(error)
-            }
-        } catch let error as APIError {
-            throw error
-        } catch {
-            throw APIError.transport(error)
-        }
+        return try await decodedUploadResponse(for: request, body: body)
     }
 
     private func makeMultipartBody(
@@ -174,12 +136,12 @@ final class APIClient {
         baseURL: URL,
         request: PreprocessRequest
     ) throws -> AsyncThrowingStream<String, Error> {
-        let endpointURL = baseURL.appendingPathComponent("preprocess")
-        var urlRequest = URLRequest(url: endpointURL)
-        urlRequest.httpMethod = "POST"
-        urlRequest.timeoutInterval = 60 * 60
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        urlRequest.httpBody = try JSONEncoder().encode(request)
+        let urlRequest = try makeJSONRequest(
+            baseURL: baseURL,
+            endpoint: "preprocess",
+            timeout: 60 * 60,
+            body: request
+        )
         return lineStreamer.streamLines(request: urlRequest)
     }
 
@@ -187,12 +149,12 @@ final class APIClient {
         baseURL: URL,
         request: TrainRequest
     ) throws -> AsyncThrowingStream<String, Error> {
-        let endpointURL = baseURL.appendingPathComponent("train")
-        var urlRequest = URLRequest(url: endpointURL)
-        urlRequest.httpMethod = "POST"
-        urlRequest.timeoutInterval = 60 * 60
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        urlRequest.httpBody = try JSONEncoder().encode(request)
+        let urlRequest = try makeJSONRequest(
+            baseURL: baseURL,
+            endpoint: "train",
+            timeout: 60 * 60,
+            body: request
+        )
         return lineStreamer.streamLines(request: urlRequest)
     }
 
@@ -202,54 +164,17 @@ final class APIClient {
         request.httpMethod = "POST"
         request.timeoutInterval = 15
 
-        do {
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                throw APIError.invalidResponse
-            }
-            guard (200...299).contains(http.statusCode) else {
-                let message = String(data: data, encoding: .utf8) ?? "Unknown server error"
-                throw APIError.server(statusCode: http.statusCode, message: message)
-            }
-            do {
-                return try decoder.decode(InterruptResponse.self, from: data)
-            } catch {
-                throw APIError.decoding(error)
-            }
-        } catch let error as APIError {
-            throw error
-        } catch {
-            throw APIError.transport(error)
-        }
+        return try await decodedResponse(for: request)
     }
 
     func warmup(baseURL: URL, request warmupRequest: WarmupRequest) async throws -> WarmupResponse {
-        let endpointURL = baseURL.appendingPathComponent("warmup")
-        var request = URLRequest(url: endpointURL)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 190
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(warmupRequest)
-
-        do {
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                throw APIError.invalidResponse
-            }
-            guard (200...299).contains(http.statusCode) else {
-                let message = String(data: data, encoding: .utf8) ?? "Unknown server error"
-                throw APIError.server(statusCode: http.statusCode, message: message)
-            }
-            do {
-                return try decoder.decode(WarmupResponse.self, from: data)
-            } catch {
-                throw APIError.decoding(error)
-            }
-        } catch let error as APIError {
-            throw error
-        } catch {
-            throw APIError.transport(error)
-        }
+        let request = try makeJSONRequest(
+            baseURL: baseURL,
+            endpoint: "warmup",
+            timeout: 190,
+            body: warmupRequest
+        )
+        return try await decodedResponse(for: request)
     }
 
     func fetchVoiceControls(
@@ -272,26 +197,7 @@ final class APIClient {
         request.timeoutInterval = 20
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
 
-        do {
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                throw APIError.invalidResponse
-            }
-            guard (200...299).contains(http.statusCode) else {
-                let message = String(data: data, encoding: .utf8) ?? "Unknown server error"
-                throw APIError.server(statusCode: http.statusCode, message: message)
-            }
-
-            do {
-                return try decoder.decode(ProfileVoiceControlsResponse.self, from: data)
-            } catch {
-                throw APIError.decoding(error)
-            }
-        } catch let error as APIError {
-            throw error
-        } catch {
-            throw APIError.transport(error)
-        }
+        return try await decodedResponse(for: request)
     }
 
     func lipsyncBackendStatus(baseURL: URL) async throws -> LipsyncBackendStatusResponse {
@@ -300,24 +206,65 @@ final class APIClient {
         request.httpMethod = "GET"
         request.timeoutInterval = 15
 
+        return try await decodedResponse(for: request)
+    }
+
+    private func makeJSONRequest<T: Encodable>(
+        baseURL: URL,
+        endpoint: String,
+        timeout: TimeInterval,
+        body: T
+    ) throws -> URLRequest {
+        let endpointURL = baseURL.appendingPathComponent(endpoint)
+        var request = URLRequest(url: endpointURL)
+        request.httpMethod = "POST"
+        request.timeoutInterval = timeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+        return request
+    }
+
+    private func decodedResponse<T: Decodable>(for request: URLRequest) async throws -> T {
         do {
             let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                throw APIError.invalidResponse
-            }
-            guard (200...299).contains(http.statusCode) else {
-                let message = String(data: data, encoding: .utf8) ?? "Unknown server error"
-                throw APIError.server(statusCode: http.statusCode, message: message)
-            }
-            do {
-                return try decoder.decode(LipsyncBackendStatusResponse.self, from: data)
-            } catch {
-                throw APIError.decoding(error)
-            }
+            return try decodeResponseData(data, response: response)
         } catch let error as APIError {
             throw error
         } catch {
             throw APIError.transport(error)
+        }
+    }
+
+    private func decodedUploadResponse<T: Decodable>(
+        for request: URLRequest,
+        body: Data
+    ) async throws -> T {
+        do {
+            let (data, response) = try await session.upload(for: request, from: body)
+            return try decodeResponseData(data, response: response)
+        } catch let error as APIError {
+            throw error
+        } catch {
+            throw APIError.transport(error)
+        }
+    }
+
+    private func decodeResponseData<T: Decodable>(
+        _ data: Data,
+        response: URLResponse
+    ) throws -> T {
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.invalidResponse
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let message = String(data: data, encoding: .utf8) ?? "Unknown server error"
+            throw APIError.server(statusCode: http.statusCode, message: message)
+        }
+
+        do {
+            return try decoder.decode(T.self, from: data)
+        } catch {
+            throw APIError.decoding(error)
         }
     }
 }

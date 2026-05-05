@@ -13,6 +13,7 @@ scipy
 pyyaml
 librosa
 phonemizer
+cmudict
 nltk
 soundfile
 transformers

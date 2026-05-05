@@ -34,9 +34,10 @@ struct GenerateRequest: Codable, Hashable {
     var musetalkMaxChunkChars: Int?
     var musetalkFirstChunkChars: Int?
     var pitchShift: Double?
+    var paceScale: Double?
+    var volumeGain: Double?
     var f0Scale: Double?
     var embeddingScale: Double?
-    var diffusionSteps: Int?
     var deEsserCutoff: Double?
     var deEsserOrder: Int?
 
@@ -62,9 +63,10 @@ struct GenerateRequest: Codable, Hashable {
         case musetalkMaxChunkChars = "musetalk_max_chunk_chars"
         case musetalkFirstChunkChars = "musetalk_first_chunk_chars"
         case pitchShift = "pitch_shift"
+        case paceScale = "pace_scale"
+        case volumeGain = "volume_gain"
         case f0Scale = "f0_scale"
         case embeddingScale = "embedding_scale"
-        case diffusionSteps = "diffusion_steps"
         case deEsserCutoff = "de_esser_cutoff"
         case deEsserOrder = "de_esser_order"
     }

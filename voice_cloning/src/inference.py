@@ -37,6 +37,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.text_normalize import clean_text_for_tts, warmup_text_normalizer
+from src.pronunciation_dict import lookup_base_pronunciation
 from src.utils.smart_buffer import SmartStreamBuffer
 from src.utils.prosody_chunker import prosody_split
 from src.llm.llm_service import LLMService
@@ -111,6 +112,8 @@ DEFAULT_BETA = 0.7
 DEFAULT_DIFFUSION_STEPS = 10
 DEFAULT_EMBEDDING_SCALE = 1.7
 DEFAULT_F0_SCALE = 1.0
+DEFAULT_PACE_SCALE = 1.0
+DEFAULT_VOLUME_GAIN = 1.0
 DEFAULT_LANG = "en-ca"
 DEFAULT_MAX_CHUNK_CHARS = 180
 DEFAULT_MAX_CHUNK_WORDS = 45
@@ -118,6 +121,10 @@ DEFAULT_PAUSE_MS = 40
 
 _WORD_RE = re.compile(r"[A-Za-z']+|[^A-Za-z']+")
 _WORD_ONLY_RE = re.compile(r"[A-Za-z']+$")
+
+
+def _is_lexicon_boundary_char(ch: str) -> bool:
+    return not (ch.isalnum() or ch == "'")
 
 app = FastAPI()
 
@@ -443,6 +450,67 @@ def _apply_de_esser(
     sos = butter(order, cutoff_hz, btype="lowpass", fs=sample_rate, output="sos")
     filtered = sosfilt(sos, audio.astype(np.float32))
     return np.nan_to_num(filtered, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _apply_pace_scale(
+    audio: np.ndarray,
+    pace_scale: float,
+) -> np.ndarray:
+    if pace_scale <= 0:
+        return audio
+    if abs(pace_scale - 1.0) < 1e-3:
+        return audio
+    try:
+        stretched = librosa.effects.time_stretch(audio.astype(np.float32), rate=float(pace_scale))
+    except Exception as exc:
+        raise RuntimeError("Missing librosa support for pace adjustment.") from exc
+    return np.nan_to_num(stretched, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _apply_volume_gain(
+    audio: np.ndarray,
+    gain: float,
+) -> np.ndarray:
+    if abs(gain - 1.0) < 1e-3:
+        return audio
+    return np.nan_to_num(audio.astype(np.float32, copy=False) * float(gain), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _apply_audio_controls(
+    audio: np.ndarray,
+    sample_rate: int,
+    req: "GenerateRequest",
+    defaults: dict,
+) -> np.ndarray:
+    audio = _remove_dc(audio.astype(np.float32, copy=False))
+    pitch_shift = req.pitch_shift if req.pitch_shift is not None else defaults.get("pitch_shift", 0.0)
+    if pitch_shift:
+        audio = _apply_pitch_shift(audio, sample_rate, float(pitch_shift))
+
+    pace_scale = req.pace_scale if req.pace_scale is not None else defaults.get("pace_scale", DEFAULT_PACE_SCALE)
+    pace_scale = max(0.85, min(1.15, float(pace_scale)))
+    if abs(pace_scale - 1.0) >= 1e-3:
+        audio = _apply_pace_scale(audio, pace_scale)
+
+    de_esser_cutoff = (
+        req.de_esser_cutoff
+        if req.de_esser_cutoff is not None
+        else defaults.get("de_esser_cutoff", 0.0)
+    )
+    de_esser_order = (
+        req.de_esser_order
+        if req.de_esser_order is not None
+        else defaults.get("de_esser_order", 2)
+    )
+    if de_esser_cutoff:
+        audio = _apply_de_esser(audio, sample_rate, float(de_esser_cutoff), int(de_esser_order))
+
+    volume_gain = req.volume_gain if req.volume_gain is not None else defaults.get("volume_gain", DEFAULT_VOLUME_GAIN)
+    volume_gain = max(0.6, min(1.45, float(volume_gain)))
+    if abs(volume_gain - 1.0) >= 1e-3:
+        audio = _apply_volume_gain(audio, volume_gain)
+
+    return _soft_clip(audio)
 
 
 def _soft_clip(audio: np.ndarray, threshold: float = 0.98) -> np.ndarray:
@@ -1128,6 +1196,8 @@ def _resolve_voice_controls_for_profile(
         "f0_scale": _coerce_float(params["f0_scale"], DEFAULT_F0_SCALE),
         "embedding_scale": _coerce_float(params["embedding_scale"], DEFAULT_EMBEDDING_SCALE),
         "diffusion_steps": int(params["diffusion_steps"]),
+        "pace_scale": _coerce_float(profile_defaults.get("pace_scale", DEFAULT_PACE_SCALE), DEFAULT_PACE_SCALE),
+        "volume_gain": _coerce_float(profile_defaults.get("volume_gain", DEFAULT_VOLUME_GAIN), DEFAULT_VOLUME_GAIN),
         "de_esser_cutoff": _coerce_float(profile_defaults.get("de_esser_cutoff", 0.0), 0.0),
         "de_esser_order": int(_coerce_float(profile_defaults.get("de_esser_order", 2), 2)),
     }
@@ -1504,29 +1574,7 @@ def _stream_avatar_from_text_iter(
                                 top_db=float(smart_trim_db),
                                 pad_ms=float(smart_trim_pad_ms),
                             )
-                        audio = _remove_dc(audio.astype(np.float32, copy=False))
-                        pitch_shift = (
-                            req.pitch_shift
-                            if req.pitch_shift is not None
-                            else profile_defaults.get("pitch_shift", 0.0)
-                        )
-                        if pitch_shift:
-                            audio = _apply_pitch_shift(audio, engine.sample_rate, pitch_shift)
-                        de_esser_cutoff = (
-                            req.de_esser_cutoff
-                            if req.de_esser_cutoff is not None
-                            else profile_defaults.get("de_esser_cutoff", 0.0)
-                        )
-                        de_esser_order = (
-                            req.de_esser_order
-                            if req.de_esser_order is not None
-                            else profile_defaults.get("de_esser_order", 2)
-                        )
-                        if de_esser_cutoff:
-                            audio = _apply_de_esser(
-                                audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order)
-                            )
-                        audio = _soft_clip(audio)
+                        audio = _apply_audio_controls(audio, engine.sample_rate, req, profile_defaults)
                         if stream_chunk_edge_fade_ms > 0:
                             audio = _fade_edges(
                                 audio,
@@ -1909,29 +1957,7 @@ def _stream_voice_from_text_iter(
                             top_db=float(smart_trim_db),
                             pad_ms=float(smart_trim_pad_ms),
                         )
-                    audio = _remove_dc(audio.astype(np.float32, copy=False))
-                    pitch_shift = (
-                        req.pitch_shift
-                        if req.pitch_shift is not None
-                        else profile.get("pitch_shift", 0.0)
-                    )
-                    if pitch_shift:
-                        audio = _apply_pitch_shift(audio, engine.sample_rate, pitch_shift)
-                    de_esser_cutoff = (
-                        req.de_esser_cutoff
-                        if req.de_esser_cutoff is not None
-                        else profile.get("de_esser_cutoff", 0.0)
-                    )
-                    de_esser_order = (
-                        req.de_esser_order
-                        if req.de_esser_order is not None
-                        else profile.get("de_esser_order", 2)
-                    )
-                    if de_esser_cutoff:
-                        audio = _apply_de_esser(
-                            audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order)
-                        )
-                    audio = _soft_clip(audio)
+                    audio = _apply_audio_controls(audio, engine.sample_rate, req, profile)
                     audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
                     suffix = chunk.rstrip()
                     if suffix.endswith((".", "!", "?")) and pause.size:
@@ -2046,6 +2072,8 @@ class GenerateRequest(BaseModel):
     embedding_scale: float | None = None
     f0_scale: float | None = None
     pitch_shift: float | None = None
+    pace_scale: float | None = None
+    volume_gain: float | None = None
     de_esser_cutoff: float | None = None
     de_esser_order: int | None = None
     pad_text: bool | None = None
@@ -2289,16 +2317,59 @@ class StyleTTS2RepoEngine:
 
     def _phonemize(self, text: str, lang: str | None, lexicon: dict[str, str] | None) -> str:
         phonemizer = self._get_phonemizer(lang)
+        phrase_entries: list[tuple[str, str]] = []
+        word_entries: dict[str, str] = {}
+        if lexicon:
+            for raw_key, value in lexicon.items():
+                key = str(raw_key).strip().lower()
+                if not key or not value:
+                    continue
+                if " " in key or any(not (ch.isalpha() or ch == "'") for ch in key):
+                    phrase_entries.append((key, str(value)))
+                else:
+                    word_entries[key] = str(value)
+            phrase_entries.sort(key=lambda item: len(item[0]), reverse=True)
+
         parts: list[str] = []
-        for token in _WORD_RE.findall(text):
+        lowered = text.lower()
+        idx = 0
+        while idx < len(text):
+            matched_phrase = False
+            for key, value in phrase_entries:
+                if not lowered.startswith(key, idx):
+                    continue
+                start_ok = idx == 0 or _is_lexicon_boundary_char(text[idx - 1])
+                end_idx = idx + len(key)
+                end_ok = end_idx >= len(text) or _is_lexicon_boundary_char(text[end_idx])
+                if not (start_ok and end_ok):
+                    continue
+                parts.append(value)
+                idx = end_idx
+                matched_phrase = True
+                break
+            if matched_phrase:
+                continue
+
+            match = _WORD_RE.match(text, idx)
+            if not match:
+                parts.append(text[idx])
+                idx += 1
+                continue
+
+            token = match.group(0)
             if _WORD_ONLY_RE.match(token):
                 key = token.lower()
-                if lexicon and key in lexicon:
-                    parts.append(lexicon[key])
+                if key in word_entries:
+                    parts.append(word_entries[key])
                 else:
-                    parts.append(phonemizer.phonemize([token])[0].strip())
+                    base_pronunciation = lookup_base_pronunciation(token)
+                    if base_pronunciation:
+                        parts.append(base_pronunciation)
+                    else:
+                        parts.append(phonemizer.phonemize([token])[0].strip())
             else:
                 parts.append(token)
+            idx = match.end()
         return "".join(parts)
 
     def _preprocess(self, wave: np.ndarray) -> torch.Tensor:
@@ -3449,33 +3520,13 @@ def stream(req: GenerateRequest):
                         top_db=float(smart_trim_db),
                         pad_ms=float(smart_trim_pad_ms),
                     )
-                audio = _remove_dc(audio.astype(np.float32, copy=False))
                 if idx < len(chunks) - 1:
                     suffix = chunk.rstrip()
                     if suffix.endswith((".", "!", "?")) and pause.size:
                         audio = np.concatenate([audio, pause])
                     elif suffix.endswith((",", ";", ":")) and comma_pause.size:
                         audio = np.concatenate([audio, comma_pause])
-                pitch_shift = (
-                    req.pitch_shift
-                    if req.pitch_shift is not None
-                    else profile.get("pitch_shift", 0.0)
-                )
-                if pitch_shift:
-                    audio = _apply_pitch_shift(audio, engine.sample_rate, pitch_shift)
-                de_esser_cutoff = (
-                    req.de_esser_cutoff
-                    if req.de_esser_cutoff is not None
-                    else profile.get("de_esser_cutoff", 0.0)
-                )
-                de_esser_order = (
-                    req.de_esser_order
-                    if req.de_esser_order is not None
-                    else profile.get("de_esser_order", 2)
-                )
-                if de_esser_cutoff:
-                    audio = _apply_de_esser(audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order))
-                audio = _soft_clip(audio)
+                audio = _apply_audio_controls(audio, engine.sample_rate, req, profile)
                 audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
                 wav_bytes = _audio_to_wav_bytes(audio, engine.sample_rate)
                 payload = base64.b64encode(wav_bytes).decode("ascii")
@@ -3603,26 +3654,7 @@ def generate(req: GenerateRequest):
                     elif suffix.endswith((",", ";", ":")) and comma_pause.size:
                         parts.append(comma_pause)
             audio = _apply_crossfade(parts, engine.sample_rate, crossfade_ms)
-            pitch_shift = (
-                req.pitch_shift
-                if req.pitch_shift is not None
-                else profile.get("pitch_shift", 0.0)
-            )
-            if pitch_shift:
-                audio = _apply_pitch_shift(audio, engine.sample_rate, pitch_shift)
-            de_esser_cutoff = (
-                req.de_esser_cutoff
-                if req.de_esser_cutoff is not None
-                else profile.get("de_esser_cutoff", 0.0)
-            )
-            de_esser_order = (
-                req.de_esser_order
-                if req.de_esser_order is not None
-                else profile.get("de_esser_order", 2)
-            )
-            if de_esser_cutoff:
-                audio = _apply_de_esser(audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order))
-            audio = _soft_clip(audio)
+            audio = _apply_audio_controls(audio, engine.sample_rate, req, profile)
             audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
             sample_rate = engine.sample_rate
     except HTTPException:

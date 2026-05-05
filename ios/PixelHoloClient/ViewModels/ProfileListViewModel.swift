@@ -74,17 +74,10 @@ final class ProfileListViewModel: ObservableObject {
 
     private static func errorMessage(for error: Error, baseURL: URL) -> String {
         let baseMessage = error.localizedDescription
-        guard usesLoopbackHost(baseURL) else {
+        guard ServerConfig.isLoopbackAddress(baseURL.absoluteString) else {
             return baseMessage
         }
         return "\(baseMessage)\n127.0.0.1 only works when the backend is running on this same machine. For a VM or another computer, enter its reachable LAN IP instead."
-    }
-
-    private static func usesLoopbackHost(_ url: URL) -> Bool {
-        guard let host = url.host?.lowercased() else {
-            return false
-        }
-        return host == "127.0.0.1" || host == "localhost" || host == "::1"
     }
 
     private static func isCancellation(_ error: Error) -> Bool {

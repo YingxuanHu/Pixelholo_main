@@ -39,11 +39,10 @@ export interface InferenceChunk {
 }
 
 export interface VoiceControlValues {
-  pitchShift: number;
-  f0Scale: number;
-  embeddingScale: number;
-  diffusionSteps: number;
-  brightness: number;
+  pitch: number;
+  pace: number;
+  tone: number;
+  volume: number;
 }
 
 export interface ProfileInfo {

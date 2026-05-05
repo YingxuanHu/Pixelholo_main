@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import PROFILE_TYPE_AVATAR, PROFILE_TYPE_VOICE, resolve_dataset_root
+from src.pronunciation_dict import has_base_pronunciation_dictionary, lookup_base_pronunciation
 
 WORD_RE = re.compile(r"[A-Za-z']+")
 
@@ -86,12 +87,23 @@ def main() -> None:
         )
 
     lexicon = {}
+    base_dict_count = 0
+    phonemizer_count = 0
     for word in words:
-        phoneme = backend.phonemize([word])[0].strip()
+        phoneme = lookup_base_pronunciation(word)
+        if phoneme:
+            base_dict_count += 1
+        else:
+            phoneme = backend.phonemize([word])[0].strip()
+            phonemizer_count += 1
         lexicon[word] = phoneme
 
     output_path.write_text(json.dumps(lexicon, indent=2, ensure_ascii=True))
     print(f"Wrote {output_path} ({len(lexicon)} words)")
+    print(
+        f"Sources: base_dict={base_dict_count}, phonemizer={phonemizer_count}, "
+        f"cmudict_available={has_base_pronunciation_dictionary()}"
+    )
 
 
 if __name__ == "__main__":

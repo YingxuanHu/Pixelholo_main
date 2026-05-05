@@ -50,7 +50,7 @@ final class ServerConfig: ObservableObject {
         return Self.isLoopbackAddress(rawValue)
     }
 
-    private static func isLoopbackAddress(_ value: String) -> Bool {
+    static func isLoopbackAddress(_ value: String) -> Bool {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         let candidate = trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://")
             ? trimmed
