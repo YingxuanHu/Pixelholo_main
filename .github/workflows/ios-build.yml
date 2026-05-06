@@ -31,7 +31,7 @@ jobs:
           xcodebuild -list -project pixelholo_2_ios.xcodeproj
           xcodebuild \
             -project pixelholo_2_ios.xcodeproj \
-            -target pixelholo_2_ios \
+            -scheme pixelholo_2_ios \
             -configuration Debug \
             -sdk iphonesimulator \
             -destination 'generic/platform=iOS Simulator' \
