@@ -27,6 +27,7 @@ struct AvatarFrameView: UIViewRepresentable {
         private weak var boundView: FrameContainerView?
         private weak var boundPlayer: AvatarPlayer?
 
+        @MainActor
         func bind(player: AvatarPlayer, view: FrameContainerView) {
             guard boundPlayer !== player || boundView !== view else { return }
             cancellable?.cancel()
@@ -36,7 +37,9 @@ struct AvatarFrameView: UIViewRepresentable {
             cancellable = player.$currentFrame
                 .receive(on: DispatchQueue.main)
                 .sink { [weak view] image in
-                    view?.setImage(image)
+                    Task { @MainActor in
+                        view?.setImage(image)
+                    }
                 }
         }
     }
