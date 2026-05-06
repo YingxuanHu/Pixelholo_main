@@ -1,11 +1,7 @@
 import argparse
 import json
 import random
-import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -26,6 +22,17 @@ from config import (
 )
 from src.inference import StyleTTS2RepoEngine
 from src.text_normalize import clean_text_for_tts
+from src.utils.audio_processing import (
+    apply_crossfade as _apply_crossfade,
+    apply_de_esser as _apply_de_esser,
+    apply_pitch_shift as _apply_pitch_shift,
+    fade_edges as _fade_edges,
+    remove_dc as _remove_dc,
+    sanitize_audio_for_playback as _sanitize_audio_for_playback,
+    smart_vad_trim as _smart_vad_trim,
+    soft_clip as _soft_clip,
+    split_text as _split_text,
+)
 
 
 def _find_latest_checkpoint(training_dir: Path) -> Path | None:
@@ -137,182 +144,6 @@ def _load_f0_scale(model_path: Path) -> float | None:
         except ValueError:
             return None
     return None
-
-
-def _split_text(text: str, max_chars: int, max_words: int) -> list[str]:
-    if not text:
-        return []
-    sentences = [s.strip() for s in re.findall(r"[^.!?]+[.!?]?", text) if s.strip()]
-    chunks: list[str] = []
-    for sentence in sentences:
-        if len(sentence) <= max_chars and len(sentence.split()) <= max_words:
-            chunks.append(sentence)
-            continue
-        words = sentence.split()
-        current: list[str] = []
-        for word in words:
-            current.append(word)
-            if len(" ".join(current)) >= max_chars or len(current) >= max_words:
-                chunks.append(" ".join(current))
-                current = []
-        if current:
-            chunks.append(" ".join(current))
-    return chunks
-
-
-def _apply_pitch_shift(audio: np.ndarray, sample_rate: int, semitones: float) -> np.ndarray:
-    if semitones == 0:
-        return audio
-    if shutil.which("rubberband"):
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                in_path = Path(tmpdir) / "in.wav"
-                out_path = Path(tmpdir) / "out.wav"
-                sf.write(in_path, audio, sample_rate)
-                result = subprocess.run(
-                    ["rubberband", "-p", str(semitones), str(in_path), str(out_path)],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if result.returncode != 0:
-                    raise RuntimeError(result.stderr.strip() or "rubberband failed")
-                shifted, out_sr = sf.read(out_path)
-                if shifted.ndim > 1:
-                    shifted = shifted.mean(axis=1)
-                if out_sr != sample_rate:
-                    try:
-                        import librosa
-                    except Exception as exc:
-                        raise RuntimeError("Missing librosa for pitch resampling.") from exc
-                    shifted = librosa.resample(shifted, orig_sr=out_sr, target_sr=sample_rate)
-                return np.nan_to_num(shifted, nan=0.0, posinf=0.0, neginf=0.0)
-        except Exception:
-            pass
-    try:
-        import librosa
-    except Exception as exc:
-        raise RuntimeError("Missing librosa for pitch shifting.") from exc
-    shifted = librosa.effects.pitch_shift(audio.astype(np.float32), sr=sample_rate, n_steps=semitones)
-    return np.nan_to_num(shifted, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def _apply_de_esser(audio: np.ndarray, sample_rate: int, cutoff_hz: float, order: int) -> np.ndarray:
-    if cutoff_hz <= 0:
-        return audio
-    nyquist = sample_rate * 0.5
-    if cutoff_hz >= nyquist:
-        return audio
-    try:
-        from scipy.signal import butter, sosfilt
-    except Exception as exc:
-        raise RuntimeError("Missing scipy for de-esser filtering.") from exc
-    sos = butter(order, cutoff_hz, btype="lowpass", fs=sample_rate, output="sos")
-    filtered = sosfilt(sos, audio.astype(np.float32))
-    return np.nan_to_num(filtered, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def _smart_vad_trim(
-    audio: np.ndarray,
-    sample_rate: int,
-    top_db: float = 30.0,
-    frame_length: int = 1024,
-    hop_length: int = 256,
-    pad_ms: float = 50.0,
-) -> np.ndarray:
-    try:
-        import librosa
-    except Exception:
-        return audio
-    if audio.size == 0:
-        return audio
-    rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
-    rms_db = librosa.power_to_db(rms * rms, ref=np.max)
-    non_silent = np.flatnonzero(rms_db > -top_db)
-    if non_silent.size == 0:
-        return audio
-    start = librosa.frames_to_samples(non_silent[0], hop_length=hop_length)
-    end = librosa.frames_to_samples(non_silent[-1], hop_length=hop_length)
-    pad = int(sample_rate * (pad_ms / 1000.0))
-    start = max(0, start - pad)
-    end = min(audio.size, end + pad)
-    return audio[start:end]
-
-
-def _soft_clip(audio: np.ndarray, threshold: float = 0.98) -> np.ndarray:
-    if audio.size == 0:
-        return audio
-    audio = audio.astype(np.float32, copy=False)
-    max_val = float(np.max(np.abs(audio)))
-    if max_val <= threshold:
-        return audio
-    return np.tanh(audio / threshold) * threshold
-
-
-def _remove_dc(audio: np.ndarray) -> np.ndarray:
-    if audio.size == 0:
-        return audio
-    audio = audio.astype(np.float32, copy=False)
-    return audio - float(np.mean(audio))
-
-
-def _apply_crossfade(
-    chunks: list[np.ndarray],
-    sample_rate: int,
-    crossfade_ms: float,
-    fade_edges_ms: float = 8.0,
-) -> np.ndarray:
-    if not chunks:
-        return np.array([], dtype=np.float32)
-    cross_len = int(sample_rate * (crossfade_ms / 1000.0))
-    fade_len = int(sample_rate * (fade_edges_ms / 1000.0))
-
-    def _edge_fade(audio: np.ndarray) -> np.ndarray:
-        if fade_len <= 1:
-            return audio
-        effective_len = fade_len
-        if effective_len * 2 > audio.size:
-            effective_len = max(1, audio.size // 2)
-        audio = audio.astype(np.float32, copy=False)
-        fade_in = np.linspace(0.0, 1.0, effective_len, dtype=np.float32)
-        fade_out = np.linspace(1.0, 0.0, effective_len, dtype=np.float32)
-        audio[:effective_len] *= fade_in
-        audio[-effective_len:] *= fade_out
-        return audio
-
-    if cross_len < 2:
-        return np.concatenate([_edge_fade(c) for c in chunks])
-
-    faded = _edge_fade(chunks[0].astype(np.float32, copy=False))
-    t = np.linspace(0.0, 1.0, cross_len, dtype=np.float32)
-    fade_in = np.sin(t * (np.pi / 2.0))
-    fade_out = np.cos(t * (np.pi / 2.0))
-    for nxt in chunks[1:]:
-        nxt = _edge_fade(nxt.astype(np.float32, copy=False))
-        if faded.size < cross_len or nxt.size < cross_len:
-            faded = np.concatenate([faded, nxt])
-            continue
-        tail = faded[-cross_len:] * fade_out
-        head = nxt[:cross_len] * fade_in
-        blended = tail + head
-        faded = np.concatenate([faded[:-cross_len], blended, nxt[cross_len:]])
-    return faded
-
-
-def _fade_edges(audio: np.ndarray, sample_rate: int, fade_ms: float = 5.0) -> np.ndarray:
-    if audio.size == 0:
-        return audio
-    fade_len = int(sample_rate * (fade_ms / 1000.0))
-    if fade_len <= 1:
-        return audio
-    if fade_len * 2 > audio.size:
-        fade_len = max(1, audio.size // 2)
-    audio = audio.astype(np.float32, copy=False)
-    fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
-    fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
-    audio[:fade_len] *= fade_in
-    audio[-fade_len:] *= fade_out
-    return audio
 
 
 def main() -> None:
@@ -623,6 +454,7 @@ def main() -> None:
     if de_esser_cutoff:
         audio = _apply_de_esser(audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order))
     audio = _soft_clip(audio)
+    audio = _sanitize_audio_for_playback(audio)
 
     sf.write(out_path, audio, engine.sample_rate)
     infer_elapsed = time.perf_counter() - infer_start

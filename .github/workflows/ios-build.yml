@@ -1,0 +1,37 @@
+name: iOS Build
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/ios-build.yml"
+      - "ios/**"
+      - "pixelholo_2_ios.xcodeproj/**"
+      - "pixelholo_2_ios-Info.plist"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/ios-build.yml"
+      - "ios/**"
+      - "pixelholo_2_ios.xcodeproj/**"
+      - "pixelholo_2_ios-Info.plist"
+
+jobs:
+  build:
+    name: Build PixelHolo iOS
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project pixelholo_2_ios.xcodeproj \
+            -target pixelholo_2_ios \
+            -configuration Debug \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
