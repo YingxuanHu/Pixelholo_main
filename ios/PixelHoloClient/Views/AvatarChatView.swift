@@ -69,11 +69,19 @@ struct AvatarChatView: View {
             viewModel.prepareSelectedProfileWarmup(baseURL: serverConfig.baseURL)
         }
         .onChange(of: viewModel.profileType) { _, _ in
+            viewModel.prepareSelectedProfileWarmup(baseURL: serverConfig.baseURL)
             Task {
                 await viewModel.refreshVoiceControlsNow(baseURL: serverConfig.baseURL)
             }
         }
+        .onChange(of: viewModel.lipsyncBackend) { _, _ in
+            viewModel.prepareSelectedProfileWarmup(baseURL: serverConfig.baseURL)
+        }
+        .onChange(of: viewModel.endpoint) { _, _ in
+            viewModel.prepareSelectedProfileWarmup(baseURL: serverConfig.baseURL)
+        }
         .onChange(of: serverConfig.baseURL?.absoluteString) { _, _ in
+            viewModel.prepareSelectedProfileWarmup(baseURL: serverConfig.baseURL)
             Task {
                 await viewModel.refreshVoiceControlsNow(baseURL: serverConfig.baseURL)
             }
@@ -268,6 +276,7 @@ struct AvatarChatView: View {
                                 .autocorrectionDisabled(true)
                                 .submitLabel(.done)
                                 .onSubmit {
+                                    viewModel.prepareSelectedProfileWarmup(baseURL: serverConfig.baseURL)
                                     Task {
                                         await viewModel.refreshVoiceControlsNow(baseURL: serverConfig.baseURL)
                                     }

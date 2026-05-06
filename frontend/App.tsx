@@ -376,9 +376,11 @@ const App: React.FC = () => {
   }, []);
 
   const isWarmupSatisfied = useCallback((data: any, type: ProfileType) => {
-    const ttsReady = data?.tts_hot_before === true || data?.tts_warmed === true;
-    const lipsyncReady = type !== 'avatar' || data?.lipsync_hot_before === true || data?.lipsync_warmed === true;
-    const llmReady = data?.llm_hot_before === true || data?.llm_warmed === true;
+    const ttsReady = data?.tts_ready ?? (data?.tts_hot_before === true || data?.tts_warmed === true);
+    const lipsyncReady = data?.lipsync_ready ?? (
+      type !== 'avatar' || data?.lipsync_hot_before === true || data?.lipsync_warmed === true
+    );
+    const llmReady = data?.llm_ready ?? (data?.llm_hot_before === true || data?.llm_warmed === true);
     return ttsReady && lipsyncReady && llmReady;
   }, []);
 

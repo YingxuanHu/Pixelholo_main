@@ -17,7 +17,6 @@ import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 import warnings
@@ -42,6 +41,17 @@ from src.utils.smart_buffer import SmartStreamBuffer
 from src.utils.prosody_chunker import prosody_split
 from src.llm.llm_service import LLMService
 from src.utils.audio_stitcher import AudioStitcher
+from src.utils.audio_processing import (
+    apply_crossfade as _apply_crossfade,
+    apply_de_esser as _apply_de_esser,
+    apply_pitch_shift as _apply_pitch_shift,
+    fade_edges as _fade_edges,
+    remove_dc as _remove_dc,
+    sanitize_audio_for_playback as _sanitize_audio_for_playback,
+    smart_vad_trim as _smart_vad_trim,
+    soft_clip as _soft_clip,
+    split_text as _split_text,
+)
 
 SILENCE_CULLING_ENABLED = True
 SILENCE_RMS_THRESHOLD = 0.003
@@ -184,8 +194,27 @@ def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
     if hasattr(audio, "detach"):
         audio = audio.detach().cpu().numpy()
     audio = np.asarray(audio, dtype=np.float32)
-    audio = np.nan_to_num(audio, nan=0.0, posinf=1.0, neginf=-1.0)
-    audio = np.clip(audio, -1.0, 1.0)
+    if audio.size:
+        finite_mask = np.isfinite(audio)
+        finite_audio = audio[finite_mask]
+        nonfinite_samples = int(audio.size - finite_audio.size)
+        peak = float(np.max(np.abs(finite_audio))) if finite_audio.size else float("nan")
+        rms = (
+            float(np.sqrt(np.mean(finite_audio.astype(np.float64) ** 2)))
+            if finite_audio.size
+            else float("nan")
+        )
+        if nonfinite_samples or peak > 1.0 or rms > 0.35:
+            logger.warning(
+                "component=tts op=audio_safety status=corrected "
+                "nonfinite_samples=%s total_samples=%s peak=%.4f rms=%.4f",
+                nonfinite_samples,
+                audio.size,
+                peak,
+                rms,
+            )
+    audio = _sanitize_audio_for_playback(audio)
+    audio = np.clip(audio, -0.98, 0.98)
     pcm16 = (audio * 32767.0).astype(np.int16)
 
     import wave
@@ -224,27 +253,6 @@ def _pack_binary_stream_packet(metadata: dict[str, object], payload: bytes = b""
     meta_bytes = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
     header = _PIXELHOLO_BINARY_MAGIC + struct.pack(">II", len(meta_bytes), len(payload))
     return header + meta_bytes + payload
-
-
-def _split_text(text: str, max_chars: int, max_words: int) -> list[str]:
-    if not text:
-        return []
-    sentences = [s.strip() for s in re.findall(r"[^.!?]+[.!?]?", text) if s.strip()]
-    chunks: list[str] = []
-    for sentence in sentences:
-        if len(sentence) <= max_chars and len(sentence.split()) <= max_words:
-            chunks.append(sentence)
-            continue
-        words = sentence.split()
-        current: list[str] = []
-        for word in words:
-            current.append(word)
-            if len(" ".join(current)) >= max_chars or len(current) >= max_words:
-                chunks.append(" ".join(current))
-                current = []
-        if current:
-            chunks.append(" ".join(current))
-    return chunks
 
 
 def _split_text_warmup(
@@ -389,69 +397,6 @@ def _smart_chunks(text: str, min_chars: int = 40, max_chars: int = 150) -> list[
     return chunks
 
 
-def _apply_pitch_shift(
-    audio: np.ndarray,
-    sample_rate: int,
-    semitones: float,
-) -> np.ndarray:
-    if semitones == 0:
-        return audio
-    if shutil.which("rubberband"):
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                in_path = Path(tmpdir) / "in.wav"
-                out_path = Path(tmpdir) / "out.wav"
-                import soundfile as sf
-
-                sf.write(in_path, audio, sample_rate)
-                result = subprocess.run(
-                    ["rubberband", "-p", str(semitones), str(in_path), str(out_path)],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if result.returncode != 0:
-                    raise RuntimeError(result.stderr.strip() or "rubberband failed")
-                shifted, out_sr = sf.read(out_path)
-                if shifted.ndim > 1:
-                    shifted = shifted.mean(axis=1)
-                if out_sr != sample_rate:
-                    try:
-                        import librosa
-                    except Exception as exc:
-                        raise RuntimeError("Missing librosa for pitch resampling.") from exc
-                    shifted = librosa.resample(shifted, orig_sr=out_sr, target_sr=sample_rate)
-                return np.nan_to_num(shifted, nan=0.0, posinf=0.0, neginf=0.0)
-        except Exception:
-            pass
-    try:
-        import librosa
-    except Exception as exc:
-        raise RuntimeError("Missing librosa for pitch shifting.") from exc
-    shifted = librosa.effects.pitch_shift(audio.astype(np.float32), sr=sample_rate, n_steps=semitones)
-    return np.nan_to_num(shifted, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def _apply_de_esser(
-    audio: np.ndarray,
-    sample_rate: int,
-    cutoff_hz: float,
-    order: int,
-) -> np.ndarray:
-    if cutoff_hz <= 0:
-        return audio
-    nyquist = sample_rate * 0.5
-    if cutoff_hz >= nyquist:
-        return audio
-    try:
-        from scipy.signal import butter, sosfilt
-    except Exception as exc:
-        raise RuntimeError("Missing scipy for de-esser filtering.") from exc
-    sos = butter(order, cutoff_hz, btype="lowpass", fs=sample_rate, output="sos")
-    filtered = sosfilt(sos, audio.astype(np.float32))
-    return np.nan_to_num(filtered, nan=0.0, posinf=0.0, neginf=0.0)
-
-
 def _apply_pace_scale(
     audio: np.ndarray,
     pace_scale: float,
@@ -511,90 +456,6 @@ def _apply_audio_controls(
         audio = _apply_volume_gain(audio, volume_gain)
 
     return _soft_clip(audio)
-
-
-def _soft_clip(audio: np.ndarray, threshold: float = 0.98) -> np.ndarray:
-    if audio.size == 0:
-        return audio
-    audio = audio.astype(np.float32, copy=False)
-    max_val = float(np.max(np.abs(audio)))
-    if max_val <= threshold:
-        return audio
-    return np.tanh(audio / threshold) * threshold
-
-
-def _remove_dc(audio: np.ndarray) -> np.ndarray:
-    if audio.size == 0:
-        return audio
-    audio = audio.astype(np.float32, copy=False)
-    return audio - float(np.mean(audio))
-
-
-def _apply_crossfade(chunks: list[np.ndarray], sample_rate: int, crossfade_ms: float) -> np.ndarray:
-    if not chunks:
-        return np.array([], dtype=np.float32)
-    if crossfade_ms <= 0:
-        return np.concatenate(chunks)
-    cross_len = int(sample_rate * (crossfade_ms / 1000.0))
-    if cross_len < 2:
-        return np.concatenate(chunks)
-    faded = chunks[0].astype(np.float32, copy=False)
-    t = np.linspace(0.0, 1.0, cross_len, dtype=np.float32)
-    fade_in = np.sin(t * (np.pi / 2.0))
-    fade_out = np.cos(t * (np.pi / 2.0))
-    for nxt in chunks[1:]:
-        nxt = nxt.astype(np.float32, copy=False)
-        if faded.size < cross_len or nxt.size < cross_len:
-            faded = np.concatenate([faded, nxt])
-            continue
-        tail = faded[-cross_len:] * fade_out
-        head = nxt[:cross_len] * fade_in
-        blended = tail + head
-        faded = np.concatenate([faded[:-cross_len], blended, nxt[cross_len:]])
-    return faded
-
-
-def _fade_edges(audio: np.ndarray, sample_rate: int, fade_ms: float = 5.0) -> np.ndarray:
-    if audio.size == 0:
-        return audio
-    fade_len = int(sample_rate * (fade_ms / 1000.0))
-    if fade_len <= 1:
-        return audio
-    if fade_len * 2 > audio.size:
-        fade_len = max(1, audio.size // 2)
-    audio = audio.astype(np.float32, copy=False)
-    fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
-    fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
-    audio[:fade_len] *= fade_in
-    audio[-fade_len:] *= fade_out
-    return audio
-
-
-def _smart_vad_trim(
-    audio: np.ndarray,
-    sample_rate: int,
-    top_db: float = 30.0,
-    frame_length: int = 1024,
-    hop_length: int = 256,
-    pad_ms: float = 50.0,
-) -> np.ndarray:
-    try:
-        import librosa
-    except Exception:
-        return audio
-    if audio.size == 0:
-        return audio
-    rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
-    rms_db = librosa.power_to_db(rms * rms, ref=np.max)
-    non_silent = np.flatnonzero(rms_db > -top_db)
-    if non_silent.size == 0:
-        return audio
-    start = librosa.frames_to_samples(non_silent[0], hop_length=hop_length)
-    end = librosa.frames_to_samples(non_silent[-1], hop_length=hop_length)
-    pad = int(sample_rate * (pad_ms / 1000.0))
-    start = max(0, start - pad)
-    end = min(audio.size, end + pad)
-    return audio[start:end]
 
 
 def _seed_everything(seed: int) -> None:
@@ -2138,6 +1999,11 @@ class WarmupRequest(BaseModel):
     lipsync_backend: str | None = None
     force: bool = False
     include_llm: bool = False
+    mobile_profile: bool = False
+    avatar_fps: float | None = None
+    musetalk_infer_fps: float | None = None
+    musetalk_stream_window_sec: float | None = None
+    musetalk_lookahead_sec: float | None = None
 
 
 class ProfileRenameRequest(BaseModel):
@@ -2496,7 +2362,7 @@ class StyleTTS2RepoEngine:
 
             out = self.model.decoder(asr, f0_pred, n_pred, ref.squeeze().unsqueeze(0))
 
-        return out.squeeze().cpu().numpy()[..., :-50]
+        return _sanitize_audio_for_playback(out.squeeze().cpu().numpy()[..., :-50])
 
 
 
@@ -2907,21 +2773,107 @@ _warmed_tts_engine_keys: dict[tuple[str, str], tuple[str, str]] = {}
 _warmed_lipsync_profiles: set[tuple[str, str, str]] = set()
 
 
+def _synthetic_warmup_audio_16k(duration_sec: float) -> np.ndarray:
+    sample_count = max(1, int(round(max(0.1, duration_sec) * 16000)))
+    t = np.arange(sample_count, dtype=np.float32) / 16000.0
+    audio = (
+        0.025 * np.sin(2.0 * np.pi * 180.0 * t)
+        + 0.012 * np.sin(2.0 * np.pi * 360.0 * t)
+    ).astype(np.float32)
+    fade_len = min(sample_count // 4, int(0.02 * 16000))
+    if fade_len > 1:
+        fade = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+        audio[:fade_len] *= fade
+        audio[-fade_len:] *= fade[::-1]
+    return audio
+
+
+def _prepare_lipsync_warmup_audio(
+    audio_16k: np.ndarray | None,
+    sample_count: int,
+) -> np.ndarray:
+    sample_count = max(1, int(sample_count))
+    if audio_16k is None or np.asarray(audio_16k).size == 0:
+        return _synthetic_warmup_audio_16k(sample_count / 16000.0)
+    audio = np.asarray(audio_16k, dtype=np.float32).flatten()
+    audio = _sanitize_audio_for_playback(audio)
+    if audio.size >= sample_count:
+        return audio[:sample_count].astype(np.float32, copy=False)
+    padded = np.zeros(sample_count, dtype=np.float32)
+    padded[: audio.size] = audio
+    return padded
+
+
 def _warmup_lipsync(
     profile: str,
     profile_type: str,
     requested_backend: str | None = None,
     warmup_audio_16k: np.ndarray | None = None,
+    *,
+    mobile_profile: bool = False,
+    avatar_fps: float | None = None,
+    musetalk_infer_fps: float | None = None,
+    musetalk_stream_window_sec: float | None = None,
+    musetalk_lookahead_sec: float | None = None,
 ) -> str:
     backend = _resolve_lipsync_backend(requested_backend)
     try:
         with _acquire_lipsync_engine(backend) as lipsync:
             with _lipsync_lock:
                 lipsync.load_profile(profile, profile_type)
-                audio_16k = warmup_audio_16k
-                if audio_16k is None or audio_16k.size == 0:
-                    audio_16k = np.zeros(int(0.45 * 16000), dtype=np.float32)
-                lipsync.sync_chunk(audio_16k.astype(np.float32, copy=False), fps=lipsync.fps)
+                output_fps = float(avatar_fps or lipsync.fps or 25.0)
+                lookahead_16k: np.ndarray | None = None
+                is_musetalk = lipsync.__class__.__name__ == "MuseTalkBridge"
+                if is_musetalk:
+                    if musetalk_infer_fps is not None:
+                        lipsync.infer_fps = max(6.0, min(float(musetalk_infer_fps), 30.0))
+                    elif mobile_profile:
+                        try:
+                            lipsync.infer_fps = max(
+                                6.0,
+                                min(
+                                    float(lipsync.infer_fps),
+                                    float(os.getenv("IOS_STREAM_MUSETALK_INFER_FPS", "20")),
+                                ),
+                            )
+                        except (TypeError, ValueError):
+                            lipsync.infer_fps = max(6.0, min(float(lipsync.infer_fps), 20.0))
+
+                    window_sec = (
+                        float(musetalk_stream_window_sec)
+                        if musetalk_stream_window_sec is not None
+                        else (
+                            float(os.getenv("IOS_STREAM_MUSETALK_WINDOW_SEC", "0.55"))
+                            if mobile_profile
+                            else 0.45
+                        )
+                    )
+                    lookahead_sec = (
+                        float(musetalk_lookahead_sec)
+                        if musetalk_lookahead_sec is not None
+                        else (
+                            float(os.getenv("IOS_STREAM_MUSETALK_LOOKAHEAD_SEC", "0.08"))
+                            if mobile_profile
+                            else 0.0
+                        )
+                    )
+                    window_samples = max(1, int(round(max(0.2, window_sec) * 16000)))
+                    lookahead_samples = max(0, int(round(max(0.0, lookahead_sec) * 16000)))
+                    audio_16k = _prepare_lipsync_warmup_audio(
+                        warmup_audio_16k,
+                        window_samples + lookahead_samples,
+                    )
+                    if lookahead_samples > 0:
+                        lookahead_16k = audio_16k[window_samples : window_samples + lookahead_samples]
+                    audio_16k = audio_16k[:window_samples]
+                    lipsync.sync_chunk(
+                        audio_16k.astype(np.float32, copy=False),
+                        fps=output_fps,
+                        lookahead_16k=lookahead_16k,
+                    )
+                else:
+                    audio_16k = _prepare_lipsync_warmup_audio(warmup_audio_16k, int(0.45 * 16000))
+                    lipsync.sync_chunk(audio_16k.astype(np.float32, copy=False), fps=output_fps)
         print(f"Lipsync warmup completed ({backend}).")
         return backend
     except Exception as exc:
@@ -2934,15 +2886,25 @@ def _warmup_profile(
     profile_type: str,
     requested_backend: str | None = None,
     force: bool = False,
+    mobile_profile: bool = False,
+    avatar_fps: float | None = None,
+    musetalk_infer_fps: float | None = None,
+    musetalk_stream_window_sec: float | None = None,
+    musetalk_lookahead_sec: float | None = None,
 ) -> dict[str, object]:
     with _warmup_profile_lock:
         tts_key = (profile, profile_type)
         warmup_audio_16k: np.ndarray | None = None
         warmed_tts = False
         tts_hot_before = False
+        tts_ready = False
         resolved_backend: str | None = None
         lipsync_hot_before = False
         warmed_lipsync = False
+        lipsync_ready = profile_type != PROFILE_TYPE_AVATAR
+        model_path: Path | None = None
+        config_path: Path | None = None
+        ref_wav_path: Path | None = None
         try:
             model_path = _resolve_model_path(None, profile, profile_type)
             config_path = _resolve_config_path(model_path, None, profile, profile_type)
@@ -2973,6 +2935,7 @@ def _warmup_profile(
             else:
                 _warmed_tts_profiles.add(tts_key)
                 _warmed_tts_engine_keys[tts_key] = (str(model_path), str(config_path))
+            tts_ready = _tts_engine_is_hot(model_path, config_path, ref_wav_path)
         except HTTPException:
             logger.info(
                 "component=backend op=warmup_profile skip=tts profile=%s profile_type=%s reason=model_unset",
@@ -3002,17 +2965,25 @@ def _warmup_profile(
                     profile_type,
                     backend,
                     warmup_audio_16k=warmup_audio_16k,
+                    mobile_profile=mobile_profile,
+                    avatar_fps=avatar_fps,
+                    musetalk_infer_fps=musetalk_infer_fps,
+                    musetalk_stream_window_sec=musetalk_stream_window_sec,
+                    musetalk_lookahead_sec=musetalk_lookahead_sec,
                 )
                 warmed_lipsync = True
                 _warmed_lipsync_profiles.add(lipsync_key)
             else:
                 warmed_backend = backend
+            lipsync_ready = _lipsync_profile_is_hot(profile, profile_type, backend)
         return {
             "lipsync_backend": warmed_backend,
             "tts_hot_before": tts_hot_before,
             "tts_warmed": warmed_tts,
+            "tts_ready": tts_ready,
             "lipsync_hot_before": lipsync_hot_before,
             "lipsync_warmed": warmed_lipsync,
+            "lipsync_ready": lipsync_ready,
             "runtime_instance_id": _RUNTIME_INSTANCE_ID,
             "profile": profile,
             "profile_type": profile_type,
@@ -3057,33 +3028,44 @@ def warmup(req: WarmupRequest):
         profile_type,
         requested_backend=req.lipsync_backend,
         force=bool(req.force),
+        mobile_profile=bool(req.mobile_profile),
+        avatar_fps=req.avatar_fps,
+        musetalk_infer_fps=req.musetalk_infer_fps,
+        musetalk_stream_window_sec=req.musetalk_stream_window_sec,
+        musetalk_lookahead_sec=req.musetalk_lookahead_sec,
     )
     llm_hot_before = None
     llm_warmed = False
+    llm_ready = None
     if req.include_llm:
         try:
             llm = _get_llm_service()
             llm_hot_before = llm.stream_warmed
             if not llm_hot_before or bool(req.force):
                 llm_warmed = llm.warmup()
+            llm_ready = llm.stream_warmed
         except Exception:
             logger.exception(
                 "component=backend op=warmup_llm status=error profile=%s profile_type=%s",
                 profile,
                 profile_type,
             )
+            llm_ready = False
     elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
     logger.info(
-        "component=backend op=warmup status=ok profile=%s profile_type=%s runtime=%s tts_hot_before=%s tts_warmed=%s lipsync_hot_before=%s lipsync_warmed=%s llm_hot_before=%s llm_warmed=%s elapsed_ms=%s",
+        "component=backend op=warmup status=ok profile=%s profile_type=%s runtime=%s tts_hot_before=%s tts_warmed=%s tts_ready=%s lipsync_hot_before=%s lipsync_warmed=%s lipsync_ready=%s llm_hot_before=%s llm_warmed=%s llm_ready=%s elapsed_ms=%s",
         profile,
         profile_type,
         warmup_state.get("runtime_instance_id"),
         warmup_state.get("tts_hot_before"),
         warmup_state.get("tts_warmed"),
+        warmup_state.get("tts_ready"),
         warmup_state.get("lipsync_hot_before"),
         warmup_state.get("lipsync_warmed"),
+        warmup_state.get("lipsync_ready"),
         llm_hot_before,
         llm_warmed,
+        llm_ready,
         elapsed_ms,
     )
     return {
@@ -3094,10 +3076,13 @@ def warmup(req: WarmupRequest):
         "runtime_instance_id": warmup_state.get("runtime_instance_id"),
         "tts_hot_before": warmup_state.get("tts_hot_before"),
         "tts_warmed": warmup_state.get("tts_warmed"),
+        "tts_ready": warmup_state.get("tts_ready"),
         "lipsync_hot_before": warmup_state.get("lipsync_hot_before"),
         "lipsync_warmed": warmup_state.get("lipsync_warmed"),
+        "lipsync_ready": warmup_state.get("lipsync_ready"),
         "llm_hot_before": llm_hot_before,
         "llm_warmed": llm_warmed,
+        "llm_ready": llm_ready,
         "elapsed_ms": elapsed_ms,
     }
 

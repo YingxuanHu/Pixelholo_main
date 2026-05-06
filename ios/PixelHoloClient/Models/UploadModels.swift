@@ -25,12 +25,24 @@ struct WarmupRequest: Codable, Hashable {
     let profileType: ProfileType
     var lipsyncBackend: LipsyncBackend?
     var force: Bool = false
+    var includeLLM: Bool = false
+    var mobileProfile: Bool = false
+    var avatarFPS: Double?
+    var musetalkInferFPS: Double?
+    var musetalkStreamWindowSec: Double?
+    var musetalkLookaheadSec: Double?
 
     enum CodingKeys: String, CodingKey {
         case profile
         case profileType = "profile_type"
         case lipsyncBackend = "lipsync_backend"
         case force
+        case includeLLM = "include_llm"
+        case mobileProfile = "mobile_profile"
+        case avatarFPS = "avatar_fps"
+        case musetalkInferFPS = "musetalk_infer_fps"
+        case musetalkStreamWindowSec = "musetalk_stream_window_sec"
+        case musetalkLookaheadSec = "musetalk_lookahead_sec"
     }
 }
 
@@ -42,10 +54,13 @@ struct WarmupResponse: Codable, Hashable {
     let runtimeInstanceID: String?
     let ttsHotBefore: Bool?
     let ttsWarmed: Bool?
+    let ttsReady: Bool?
     let lipsyncHotBefore: Bool?
     let lipsyncWarmed: Bool?
+    let lipsyncReady: Bool?
     let llmHotBefore: Bool?
     let llmWarmed: Bool?
+    let llmReady: Bool?
     let elapsedMS: Double?
 
     enum CodingKeys: String, CodingKey {
@@ -56,10 +71,13 @@ struct WarmupResponse: Codable, Hashable {
         case runtimeInstanceID = "runtime_instance_id"
         case ttsHotBefore = "tts_hot_before"
         case ttsWarmed = "tts_warmed"
+        case ttsReady = "tts_ready"
         case lipsyncHotBefore = "lipsync_hot_before"
         case lipsyncWarmed = "lipsync_warmed"
+        case lipsyncReady = "lipsync_ready"
         case llmHotBefore = "llm_hot_before"
         case llmWarmed = "llm_warmed"
+        case llmReady = "llm_ready"
         case elapsedMS = "elapsed_ms"
     }
 }
