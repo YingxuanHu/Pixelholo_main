@@ -80,6 +80,9 @@ struct AvatarChatView: View {
         .onChange(of: viewModel.endpoint) { _, _ in
             viewModel.prepareSelectedProfileWarmup(baseURL: serverConfig.baseURL)
         }
+        .onChange(of: viewModel.llmMode) { _, _ in
+            viewModel.prepareSelectedProfileWarmup(baseURL: serverConfig.baseURL)
+        }
         .onChange(of: serverConfig.baseURL?.absoluteString) { _, _ in
             viewModel.prepareSelectedProfileWarmup(baseURL: serverConfig.baseURL)
             Task {
@@ -306,6 +309,17 @@ struct AvatarChatView: View {
                                 Text("Speak").tag(StreamEndpoint.speak)
                             }
                             .pickerStyle(.segmented)
+                        }
+
+                        if viewModel.endpoint == .chat {
+                            AppKeyValueRow("LLM Mode") {
+                                Picker("LLM Mode", selection: $viewModel.llmMode) {
+                                    ForEach(LLMMode.allCases) { mode in
+                                        Text(mode.displayName).tag(mode)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                            }
                         }
 
                         if viewModel.profileType == .avatar {

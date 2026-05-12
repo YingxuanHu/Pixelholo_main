@@ -29,6 +29,7 @@ type TrainParams = {
 };
 
 type ProfileType = 'voice' | 'avatar';
+type LLMMode = 'legacy_fast' | 'fresh_fast' | 'research' | 'auto';
 type VoiceControlBackendDefaults = {
   pitchShift: number;
   f0Scale: number;
@@ -41,6 +42,13 @@ const DEFAULT_API_BASE = 'http://127.0.0.1:8000';
 const LOCAL_STORAGE_API_BASE_KEY = 'voxclone_api_base';
 const DEFAULT_PROFILE_TYPE: 'voice' | 'avatar' = 'voice';
 const DEFAULT_OUTPUT_MODE: 'voice' | 'avatar' = 'voice';
+const DEFAULT_LLM_MODE: LLMMode = 'legacy_fast';
+const LLM_MODE_OPTIONS: { value: LLMMode; label: string }[] = [
+  { value: 'legacy_fast', label: 'Legacy Fast' },
+  { value: 'fresh_fast', label: 'Fresh Fast' },
+  { value: 'research', label: 'Research' },
+  { value: 'auto', label: 'Auto' },
+];
 const DEFAULT_AVATAR_START_SEC = 5;
 const BLUR_KERNEL_BY_LEVEL = { low: 60, medium: 75, high: 90 } as const;
 const DEFAULT_AVATAR_BLUR_LEVEL: keyof typeof BLUR_KERNEL_BY_LEVEL = 'medium';
@@ -144,6 +152,7 @@ const App: React.FC = () => {
   const [refOverride, setRefOverride] = useState('');
   const [avatarBackend, setAvatarBackend] = useState<'wav2lip' | 'musetalk'>('musetalk');
   const [outputMode, setOutputMode] = useState<'voice' | 'avatar'>(DEFAULT_OUTPUT_MODE);
+  const [llmMode, setLlmMode] = useState<LLMMode>(DEFAULT_LLM_MODE);
   const [voiceControlBackendDefaults, setVoiceControlBackendDefaults] = useState<VoiceControlBackendDefaults | null>(null);
   const [voiceControlDefaults, setVoiceControlDefaults] = useState<VoiceControlValues | null>(null);
   const [voiceControlValues, setVoiceControlValues] = useState<VoiceControlValues | null>(null);
@@ -360,8 +369,14 @@ const App: React.FC = () => {
   );
 
   const warmupKeyFor = useCallback(
-    (profileName: string, type: ProfileType, backend: 'wav2lip' | 'musetalk', runtimeId: string | null) =>
-      `${runtimeId || 'unknown'}|${apiBase}|${type}|${profileName}|${type === 'avatar' ? backend : '-'}`,
+    (
+      profileName: string,
+      type: ProfileType,
+      backend: 'wav2lip' | 'musetalk',
+      mode: LLMMode,
+      runtimeId: string | null,
+    ) =>
+      `${runtimeId || 'unknown'}|${apiBase}|${type}|${profileName}|${type === 'avatar' ? backend : '-'}|${mode}`,
     [apiBase],
   );
 
@@ -387,7 +402,7 @@ const App: React.FC = () => {
   const warmupProfile = useCallback(async (profileName: string, type: ProfileType) => {
     if (!profileName) return;
     const runtimeId = backendRuntimeIdRef.current;
-    const key = warmupKeyFor(profileName, type, avatarBackend, runtimeId);
+    const key = warmupKeyFor(profileName, type, avatarBackend, llmMode, runtimeId);
     if (hasFreshWarmup(key)) return;
 
     const inFlight = warmupInFlightRef.current.get(key);
@@ -409,6 +424,7 @@ const App: React.FC = () => {
             profile_type: type,
             lipsync_backend: type === 'avatar' ? avatarBackend : null,
             include_llm: true,
+            llm_mode: llmMode,
           }),
         });
         if (!res.ok) throw new Error(await res.text());
@@ -425,7 +441,7 @@ const App: React.FC = () => {
             : avatarBackend;
         if (isWarmupSatisfied(data, type)) {
           warmedProfilesRef.current.set(
-            warmupKeyFor(profileName, type, resolvedBackend, resolvedRuntimeId ?? backendRuntimeIdRef.current),
+            warmupKeyFor(profileName, type, resolvedBackend, llmMode, resolvedRuntimeId ?? backendRuntimeIdRef.current),
             Date.now(),
           );
         }
@@ -441,7 +457,7 @@ const App: React.FC = () => {
 
     warmupInFlightRef.current.set(key, promise);
     await promise;
-  }, [apiBase, avatarBackend, hasFreshWarmup, isWarmupSatisfied, warmupKeyFor]);
+  }, [apiBase, avatarBackend, hasFreshWarmup, isWarmupSatisfied, llmMode, warmupKeyFor]);
 
   useEffect(() => {
     loadProfiles();
@@ -1143,6 +1159,9 @@ const App: React.FC = () => {
       model_path: modelOverride || null,
       ref_wav_path: refOverride || null,
     };
+    if (endpoint === '/chat') {
+      payload.llm_mode = llmMode;
+    }
     if (voiceControlsStatus === 'ready' && voiceControlValues) {
       payload.pitch_shift = voiceControlValues.pitch;
       payload.pace_scale = resolvePaceScale(voiceControlValues.pace);
@@ -1238,6 +1257,7 @@ const App: React.FC = () => {
     avatarBackend,
     enqueueFrames,
     interruptBackend,
+    llmMode,
     modelOverride,
     outputMode,
     profile.name,
@@ -1990,6 +2010,23 @@ const App: React.FC = () => {
                   </div>
 
                   <div className="xl:col-span-5 space-y-4">
+                    <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                        LLM Mode
+                      </p>
+                      <select
+                        value={llmMode}
+                        onChange={(event) => setLlmMode(event.target.value as LLMMode)}
+                        className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700"
+                      >
+                        {LLM_MODE_OPTIONS.map(option => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
                     <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
                       <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
                         Lip Sync Model

@@ -1919,6 +1919,8 @@ def _stream_voice_from_text_iter(
 
 class GenerateRequest(BaseModel):
     text: str
+    llm_mode: str | None = None
+    llm_model: str | None = None
     lipsync_backend: str | None = None
     model_path: str | None = None
     config_path: str | None = None
@@ -1999,6 +2001,8 @@ class WarmupRequest(BaseModel):
     lipsync_backend: str | None = None
     force: bool = False
     include_llm: bool = False
+    llm_mode: str | None = None
+    llm_model: str | None = None
     mobile_profile: bool = False
     avatar_fps: float | None = None
     musetalk_infer_fps: float | None = None
@@ -3040,10 +3044,10 @@ def warmup(req: WarmupRequest):
     if req.include_llm:
         try:
             llm = _get_llm_service()
-            llm_hot_before = llm.stream_warmed
+            llm_hot_before = llm.is_warmed(req.llm_mode, req.llm_model)
             if not llm_hot_before or bool(req.force):
-                llm_warmed = llm.warmup()
-            llm_ready = llm.stream_warmed
+                llm_warmed = llm.warmup(req.llm_mode, req.llm_model)
+            llm_ready = llm.is_warmed(req.llm_mode, req.llm_model)
         except Exception:
             logger.exception(
                 "component=backend op=warmup_llm status=error profile=%s profile_type=%s",
@@ -3670,7 +3674,11 @@ def chat(req: GenerateRequest, request: Request):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Text is empty.")
     llm = _get_llm_service()
-    llm_stream = llm.stream_response(req.text)
+    llm_stream = llm.stream_response(
+        req.text,
+        mode=req.llm_mode,
+        model=req.llm_model,
+    )
     # Stabilize LLM mode with conservative defaults if not provided.
     if req.alpha is None:
         req.alpha = 0.2

@@ -27,6 +27,7 @@ final class AvatarChatViewModel: ObservableObject {
     @Published var profileName: String = ""
     @Published var profileType: ProfileType = .avatar
     @Published var endpoint: StreamEndpoint = .chat
+    @Published var llmMode: LLMMode = .legacyFast
     @Published var lipsyncBackend: LipsyncBackend = .musetalk
     @Published var isStreaming = false
     @Published var isWarmingUp = false
@@ -115,13 +116,15 @@ final class AvatarChatViewModel: ObservableObject {
         guard !cleanedProfile.isEmpty else { return }
         let backend = effectiveWarmupBackend
         let includeLLM = shouldWarmupLLM
+        let requestedLLMMode = effectiveWarmupLLMMode
 
         let key = warmupKey(
             baseURL: baseURL,
             profile: cleanedProfile,
             profileType: profileType,
             backend: backend,
-            includeLLM: includeLLM
+            includeLLM: includeLLM,
+            llmMode: requestedLLMMode
         )
         if hasFreshPreparedWarmup(for: key) {
             Task { [weak self] in
@@ -133,6 +136,7 @@ final class AvatarChatViewModel: ObservableObject {
                         profileType: profileType,
                         backend: backend,
                         includeLLM: includeLLM,
+                        llmMode: requestedLLMMode,
                         clearErrors: false
                     )
                 }
@@ -149,6 +153,7 @@ final class AvatarChatViewModel: ObservableObject {
             profileType: profileType,
             backend: backend,
             includeLLM: includeLLM,
+            llmMode: requestedLLMMode,
             clearErrors: false
         )
     }
@@ -163,6 +168,7 @@ final class AvatarChatViewModel: ObservableObject {
         let streamEndpoint = endpoint
         let warmupBackend = effectiveWarmupBackend
         let includeLLM = streamEndpoint == .chat
+        let requestedLLMMode = includeLLM ? llmMode : nil
 
         guard !cleanedText.isEmpty else {
             errorMessage = "Text cannot be empty."
@@ -180,6 +186,8 @@ final class AvatarChatViewModel: ObservableObject {
 
         var request = GenerateRequest(
             text: cleanedText,
+            llmMode: requestedLLMMode,
+            llmModel: nil,
             speaker: cleanedProfile,
             profileType: profileType,
             avatarProfile: nil,
@@ -231,7 +239,8 @@ final class AvatarChatViewModel: ObservableObject {
                 profile: cleanedProfile,
                 profileType: profileType,
                 backend: warmupBackend,
-                includeLLM: includeLLM
+                includeLLM: includeLLM,
+                llmMode: requestedLLMMode
             )
 
             if Task.isCancelled {
@@ -449,6 +458,10 @@ final class AvatarChatViewModel: ObservableObject {
         endpoint == .chat
     }
 
+    private var effectiveWarmupLLMMode: LLMMode? {
+        shouldWarmupLLM ? llmMode : nil
+    }
+
     private func resolvedWarmupAvatarFPS(for backend: LipsyncBackend?) -> Double {
         backend == .wav2lip ? MobileAvatarStreamProfile.wav2lipFPS : MobileAvatarStreamProfile.museTalkFPS
     }
@@ -494,10 +507,11 @@ final class AvatarChatViewModel: ObservableObject {
         profile: String,
         profileType: ProfileType,
         backend: LipsyncBackend?,
-        includeLLM: Bool
+        includeLLM: Bool,
+        llmMode: LLMMode?
     ) -> String {
         let backendValue = backend?.rawValue ?? "-"
-        let llmValue = includeLLM ? "llm" : "no-llm"
+        let llmValue = includeLLM ? (llmMode?.rawValue ?? LLMMode.legacyFast.rawValue) : "no-llm"
         return "\(baseURL.absoluteString)|\(profileType.rawValue):\(profile):\(backendValue):\(llmValue)"
     }
 
@@ -612,14 +626,16 @@ final class AvatarChatViewModel: ObservableObject {
         profile: String,
         profileType: ProfileType,
         backend: LipsyncBackend?,
-        includeLLM: Bool
+        includeLLM: Bool,
+        llmMode: LLMMode?
     ) async {
         let key = warmupKey(
             baseURL: baseURL,
             profile: profile,
             profileType: profileType,
             backend: backend,
-            includeLLM: includeLLM
+            includeLLM: includeLLM,
+            llmMode: llmMode
         )
         if await hasValidPreparedWarmup(for: key, baseURL: baseURL) {
             return
@@ -635,6 +651,7 @@ final class AvatarChatViewModel: ObservableObject {
             profileType: profileType,
             backend: backend,
             includeLLM: includeLLM,
+            llmMode: llmMode,
             clearErrors: true
         )
         await warmupTask?.value
@@ -646,6 +663,7 @@ final class AvatarChatViewModel: ObservableObject {
         profileType: ProfileType,
         backend: LipsyncBackend?,
         includeLLM: Bool,
+        llmMode: LLMMode?,
         clearErrors: Bool
     ) {
         let key = warmupKey(
@@ -653,7 +671,8 @@ final class AvatarChatViewModel: ObservableObject {
             profile: profile,
             profileType: profileType,
             backend: backend,
-            includeLLM: includeLLM
+            includeLLM: includeLLM,
+            llmMode: llmMode
         )
         let stateKey = profileStateKey(profile: profile, profileType: profileType, backend: backend)
         warmupTask?.cancel()
@@ -673,6 +692,8 @@ final class AvatarChatViewModel: ObservableObject {
             lipsyncBackend: backend,
             force: false,
             includeLLM: includeLLM,
+            llmMode: includeLLM ? llmMode : nil,
+            llmModel: nil,
             mobileProfile: true,
             avatarFPS: profileType == .avatar ? resolvedWarmupAvatarFPS(for: backend) : nil,
             musetalkInferFPS: backend == .musetalk ? MobileAvatarStreamProfile.museTalkInferFPS : nil,

@@ -26,6 +26,8 @@ struct WarmupRequest: Codable, Hashable {
     var lipsyncBackend: LipsyncBackend?
     var force: Bool = false
     var includeLLM: Bool = false
+    var llmMode: LLMMode?
+    var llmModel: String?
     var mobileProfile: Bool = false
     var avatarFPS: Double?
     var musetalkInferFPS: Double?
@@ -38,6 +40,8 @@ struct WarmupRequest: Codable, Hashable {
         case lipsyncBackend = "lipsync_backend"
         case force
         case includeLLM = "include_llm"
+        case llmMode = "llm_mode"
+        case llmModel = "llm_model"
         case mobileProfile = "mobile_profile"
         case avatarFPS = "avatar_fps"
         case musetalkInferFPS = "musetalk_infer_fps"
