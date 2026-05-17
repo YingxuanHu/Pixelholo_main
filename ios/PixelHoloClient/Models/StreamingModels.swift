@@ -14,8 +14,7 @@ enum LipsyncBackend: String, Codable, CaseIterable {
 
 enum LLMMode: String, Codable, CaseIterable, Identifiable {
     case legacyFast = "legacy_fast"
-    case freshFast = "fresh_fast"
-    case research
+    case liveSearch = "live_search"
     case auto
 
     var id: String { rawValue }
@@ -24,10 +23,8 @@ enum LLMMode: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .legacyFast:
             return "Legacy Fast"
-        case .freshFast:
-            return "Fresh Fast"
-        case .research:
-            return "Research"
+        case .liveSearch:
+            return "Live Search"
         case .auto:
             return "Auto"
         }

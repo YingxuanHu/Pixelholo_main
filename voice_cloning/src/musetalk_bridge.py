@@ -77,6 +77,9 @@ class MuseTalkBridge:
         self.detail_sharpen = float(os.getenv("MUSE_TALK_DETAIL_SHARPEN", "0.28"))
         self.color_match_strength = float(os.getenv("MUSE_TALK_COLOR_MATCH_STRENGTH", "0.65"))
         self.cache_version = int(os.getenv("MUSE_TALK_CACHE_VERSION", "9"))
+        self.mask_stabilize = os.getenv("MUSE_TALK_MASK_STABILIZE", "1") != "0"
+        self.mask_stabilize_window = int(os.getenv("MUSE_TALK_MASK_STABILIZE_WINDOW", "5"))
+        self.temporal_smooth = float(os.getenv("MUSE_TALK_TEMPORAL_SMOOTH", "0.08"))
 
         self.frames: np.ndarray | None = None
         self.coords_xyxy: np.ndarray | None = None
@@ -87,6 +90,7 @@ class MuseTalkBridge:
         self._loaded_cache_dir: Path | None = None
         self._coord_sha1: str | None = None
         self._vignette_cache: dict[tuple[int, int, int, int], np.ndarray] = {}
+        self._prev_generated_face: np.ndarray | None = None
 
         self.musetalk_dir = LIP_SYNCING_DIR / "lib" / "MuseTalk"
         if not self.musetalk_dir.exists():
@@ -250,6 +254,109 @@ class MuseTalkBridge:
         if ny2 <= ny1:
             ny1, ny2 = y1, y2
         return nx1, ny1, nx2, ny2
+
+    @classmethod
+    def _smooth_xyxy_boxes(
+        cls,
+        boxes: np.ndarray,
+        width: int,
+        height: int,
+        window: int,
+    ) -> np.ndarray:
+        if boxes.size == 0:
+            return boxes.astype(np.int32, copy=True)
+        window = max(1, int(window))
+        if len(boxes) < 3 or window <= 1:
+            return boxes.astype(np.int32, copy=True)
+
+        arr = boxes.astype(np.float32, copy=False)
+        centers_sizes = np.column_stack(
+            (
+                (arr[:, 0] + arr[:, 2]) * 0.5,
+                (arr[:, 1] + arr[:, 3]) * 0.5,
+                np.maximum(1.0, arr[:, 2] - arr[:, 0]),
+                np.maximum(1.0, arr[:, 3] - arr[:, 1]),
+            )
+        )
+        radius = window // 2
+        padded = np.pad(centers_sizes, ((radius, radius), (0, 0)), mode="edge")
+        smoothed = np.empty_like(centers_sizes)
+        for idx in range(len(smoothed)):
+            smoothed[idx] = padded[idx : idx + window].mean(axis=0)
+
+        out: list[tuple[int, int, int, int]] = []
+        for cx, cy, bw, bh in smoothed:
+            x1 = int(round(cx - bw * 0.5))
+            y1 = int(round(cy - bh * 0.5))
+            x2 = int(round(cx + bw * 0.5))
+            y2 = int(round(cy + bh * 0.5))
+            out.append(cls._sanitize_xyxy([x1, y1, x2, y2], width, height))
+        return np.array(out, dtype=np.int32)
+
+    @staticmethod
+    def _remap_mask_to_crop(
+        mask: np.ndarray,
+        old_box: list[int] | np.ndarray,
+        new_box: list[int] | np.ndarray,
+    ) -> np.ndarray:
+        ox1, oy1, ox2, oy2 = [int(v) for v in old_box]
+        nx1, ny1, nx2, ny2 = [int(v) for v in new_box]
+        new_w = max(1, nx2 - nx1)
+        new_h = max(1, ny2 - ny1)
+        canvas = np.zeros((new_h, new_w), dtype=np.uint8)
+        if ox2 <= ox1 or oy2 <= oy1:
+            return canvas
+
+        mask_arr = np.asarray(mask)
+        if mask_arr.ndim != 2:
+            mask_arr = np.squeeze(mask_arr)
+        old_w = max(1, ox2 - ox1)
+        old_h = max(1, oy2 - oy1)
+        if mask_arr.shape[:2] != (old_h, old_w):
+            mask_arr = cv2.resize(mask_arr.astype(np.uint8), (old_w, old_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            mask_arr = mask_arr.astype(np.uint8, copy=False)
+
+        ix1 = max(ox1, nx1)
+        iy1 = max(oy1, ny1)
+        ix2 = min(ox2, nx2)
+        iy2 = min(oy2, ny2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return canvas
+
+        src_x1 = ix1 - ox1
+        src_y1 = iy1 - oy1
+        src_x2 = ix2 - ox1
+        src_y2 = iy2 - oy1
+        dst_x1 = ix1 - nx1
+        dst_y1 = iy1 - ny1
+        dst_x2 = ix2 - nx1
+        dst_y2 = iy2 - ny1
+        canvas[dst_y1:dst_y2, dst_x1:dst_x2] = mask_arr[src_y1:src_y2, src_x1:src_x2]
+        return canvas
+
+    def _stabilize_mask_sequence(
+        self,
+        mask_arrays: list[np.ndarray],
+        mask_crop_boxes: list[list[int]],
+        frame_w: int,
+        frame_h: int,
+    ) -> tuple[list[np.ndarray], list[list[int]]]:
+        if not self.mask_stabilize or len(mask_arrays) < 3 or len(mask_arrays) != len(mask_crop_boxes):
+            return mask_arrays, mask_crop_boxes
+
+        old_boxes = np.array(mask_crop_boxes, dtype=np.int32)
+        new_boxes = self._smooth_xyxy_boxes(
+            old_boxes,
+            frame_w,
+            frame_h,
+            self.mask_stabilize_window,
+        )
+        remapped_masks = [
+            self._remap_mask_to_crop(mask, old_box, new_box)
+            for mask, old_box, new_box in zip(mask_arrays, old_boxes, new_boxes)
+        ]
+        return remapped_masks, [[int(v) for v in box] for box in new_boxes.tolist()]
 
     @staticmethod
     def _align_mask_to_crop(
@@ -514,7 +621,10 @@ class MuseTalkBridge:
 
         if self._loaded_cache_dir == cache_dir and self.frames is not None and self._latents:
             self.frame_idx = 0
+            self.frame_accumulator = 0.0
+            self.infer_frame_accumulator = 0.0
             self.audio_history = np.array([], dtype=np.float32)
+            self._prev_generated_face = None
             return
 
         frames = np.load(frames_path)
@@ -573,6 +683,13 @@ class MuseTalkBridge:
         else:
             latents, mask_arrays, mask_crop_boxes = cached
 
+        mask_arrays, mask_crop_boxes = self._stabilize_mask_sequence(
+            mask_arrays,
+            mask_crop_boxes,
+            frame_w,
+            frame_h,
+        )
+
         self.frames = frames
         self.coords_xyxy = coords_xyxy
         self._latents = latents
@@ -584,6 +701,24 @@ class MuseTalkBridge:
         self.frame_accumulator = 0.0
         self.infer_frame_accumulator = 0.0
         self.audio_history = np.array([], dtype=np.float32)
+        self._prev_generated_face = None
+
+    def _smooth_generated_face(self, generated_face: np.ndarray) -> np.ndarray:
+        strength = float(np.clip(self.temporal_smooth, 0.0, 0.35))
+        current = generated_face.astype(np.uint8, copy=False)
+        if strength <= 1e-4:
+            self._prev_generated_face = current.copy()
+            return current
+
+        previous = self._prev_generated_face
+        if previous is None:
+            self._prev_generated_face = current.copy()
+            return current
+        if previous.shape[:2] != current.shape[:2]:
+            previous = cv2.resize(previous, (current.shape[1], current.shape[0]), interpolation=cv2.INTER_LINEAR)
+        blended = cv2.addWeighted(current, 1.0 - strength, previous, strength, 0.0)
+        self._prev_generated_face = blended.copy()
+        return blended
 
     def _compute_target_frames(self, audio_16k: np.ndarray, fps: float) -> int:
         expected_frames = (len(audio_16k) / 16000.0) * fps
@@ -725,8 +860,9 @@ class MuseTalkBridge:
         if local_x2 <= local_x1 or local_y2 <= local_y1:
             return frame
 
+        generated_face = self._smooth_generated_face(generated_face)
         resized = cv2.resize(
-            generated_face.astype(np.uint8),
+            generated_face,
             (local_x2 - local_x1, local_y2 - local_y1),
             interpolation=cv2.INTER_LANCZOS4,
         )
@@ -815,7 +951,6 @@ class MuseTalkBridge:
         history_append = audio_chunk
         lookahead_infer_frames = 0.0
         if lookahead_chunk.size:
-            history_append = np.concatenate([history_append, lookahead_chunk])
             lookahead_infer_frames = (len(lookahead_chunk) / 16000.0) * infer_fps
 
         self.audio_history = np.concatenate([self.audio_history, history_append])
@@ -823,13 +958,22 @@ class MuseTalkBridge:
         if len(self.audio_history) > max_history + len(history_append):
             self.audio_history = self.audio_history[-(max_history + len(history_append)) :]
 
-        total_buffer_frames = (len(self.audio_history) / 16000.0) * infer_fps
+        # Lookahead is context for the current inference window only. Do not store it
+        # in the rolling history, because the same samples become real audio on the
+        # next call and double-counting them pushes mouth motion ahead of speech.
+        audio_context = (
+            np.concatenate([self.audio_history, lookahead_chunk])
+            if lookahead_chunk.size
+            else self.audio_history
+        )
+
+        total_buffer_frames = (len(audio_context) / 16000.0) * infer_fps
         start_frame_offset = max(
             0,
             int(math.floor(total_buffer_frames - lookahead_infer_frames - infer_target_frames)),
         )
         whisper_chunks = self._extract_whisper_prompts(
-            self.audio_history,
+            audio_context,
             infer_fps,
             infer_target_frames,
             start_frame_offset,
@@ -903,6 +1047,7 @@ class MuseTalkBridge:
         self.audio_history = np.array([], dtype=np.float32)
         self._loaded_cache_dir = None
         self._coord_sha1 = None
+        self._prev_generated_face = None
         self._vignette_cache.clear()
         for attr in (
             "face_parser",

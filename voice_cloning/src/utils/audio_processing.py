@@ -100,8 +100,8 @@ def sanitize_audio_for_playback(
     max_rms: float = 0.25,
     corrupt_nonfinite_fraction: float = 0.02,
     corrupt_clipped_fraction: float = 0.20,
-    corrupt_noise_rms: float = 0.18,
-    corrupt_zero_cross_fraction: float = 0.35,
+    corrupt_noise_rms: float = 0.10,
+    corrupt_zero_cross_fraction: float = 0.45,
 ) -> np.ndarray:
     """Prevent invalid or runaway samples from becoming full-scale PCM noise."""
     if hasattr(audio, "detach"):

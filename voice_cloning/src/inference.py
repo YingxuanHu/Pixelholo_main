@@ -1502,6 +1502,10 @@ def _stream_avatar_from_text_iter(
             lookahead_16k: np.ndarray | None = None,
         ) -> Iterator[str | bytes]:
             nonlocal last_frame, emit_index, musetalk_prev_tail_frames
+            # Skip chunks too small to decode cleanly — avoids decodeAudioData failures and static.
+            min_emit_samples = int(engine.sample_rate * 0.010)  # 10ms minimum
+            if sub_audio is None or sub_audio.size < min_emit_samples:
+                return
             rms = (
                 float(np.sqrt(np.mean(np.square(sub_audio))))
                 if sub_audio is not None and sub_audio.size
@@ -2286,6 +2290,7 @@ class StyleTTS2RepoEngine:
         if seed is not None:
             _seed_everything(seed)
 
+        _t0 = time.perf_counter()
         phonemes = self._phonemize(text, phonemizer_lang, lexicon)
         tokens = " ".join(self._tokenize(phonemes))
         if self._text_symbols:
@@ -2295,10 +2300,13 @@ class StyleTTS2RepoEngine:
             raise ValueError("Text normalization produced an empty token stream.")
         token_ids = self._text_cleaner(tokens)
         token_ids.insert(0, 0)
+        _t1 = time.perf_counter()
 
         tokens_tensor = torch.LongTensor(token_ids).to(self.device).unsqueeze(0)
+        _ntok = tokens_tensor.shape[-1]
 
         ref_s = self._compute_style(ref_wav_path)
+        _t2 = time.perf_counter()
         style_dim = ref_s.shape[-1] // 2
 
         with torch.no_grad():
@@ -2306,7 +2314,9 @@ class StyleTTS2RepoEngine:
             text_mask = self._length_to_mask(input_lengths).to(self.device)
 
             t_en = self.model.text_encoder(tokens_tensor, input_lengths, text_mask)
+            _t3 = time.perf_counter()
             bert_dur = self.model.bert(tokens_tensor, attention_mask=(~text_mask).int())
+            _t4 = time.perf_counter()
             d_en = self.model.bert_encoder(bert_dur).transpose(-1, -2)
 
             noise = torch.randn((1, style_dim * 2)).unsqueeze(1).to(self.device)
@@ -2317,6 +2327,7 @@ class StyleTTS2RepoEngine:
                 features=ref_s,
                 num_steps=diffusion_steps,
             ).squeeze(1)
+            _t5 = time.perf_counter()
 
             s = s_pred[:, style_dim:]
             ref = s_pred[:, :style_dim]
@@ -2365,7 +2376,16 @@ class StyleTTS2RepoEngine:
                 asr = asr_new
 
             out = self.model.decoder(asr, f0_pred, n_pred, ref.squeeze().unsqueeze(0))
+            _t6 = time.perf_counter()
 
+        _total = _t6 - _t0
+        print(
+            f"[TTS timing] ntok={_ntok} total={_total:.3f}s | "
+            f"phonemize={_t1-_t0:.3f} style={_t2-_t1:.3f} "
+            f"text_enc={_t3-_t2:.3f} bert={_t4-_t3:.3f} "
+            f"diffusion={_t5-_t4:.3f} decoder={_t6-_t5:.3f}",
+            flush=True,
+        )
         return _sanitize_audio_for_playback(out.squeeze().cpu().numpy()[..., :-50])
 
 
@@ -2744,27 +2764,34 @@ def _warmup_engine(
             "embedding_scale": profile.get("embedding_scale", DEFAULT_EMBEDDING_SCALE),
             "f0_scale": profile.get("f0_scale", DEFAULT_F0_SCALE),
         }
-        text = os.getenv(
-            "STYLE_TTS2_WARMUP_TEXT",
-            "This is a quick warmup for streaming speech.",
-        )
+        chat_steps = int(os.getenv("STYLE_TTS2_CHAT_DIFFUSION_STEPS", "10"))
+        # Two texts at different lengths pre-allocate CUDA memory for the range of
+        # token counts seen in real inference without over-extending warmup time.
+        warmup_texts_raw = [
+            os.getenv("STYLE_TTS2_WARMUP_TEXT", "This is a warmup."),
+            "The weather is mild today with partly cloudy skies and temperatures around 72 degrees.",
+        ]
+        # Run through clean_text_for_tts to mirror the real pipeline and trigger NeMo FST compile.
+        warmup_texts = [clean_text_for_tts(t) for t in warmup_texts_raw]
+        audio = None
         with _acquire_engine(model_path, config_path) as engine:
-            future = _AI_EXECUTOR.submit(
-                _generate_with_seed,
-                engine,
-                1234,
-                text,
-                ref_wav,
-                float(params["alpha"]),
-                float(params["beta"]),
-                int(params["diffusion_steps"]),
-                float(params["embedding_scale"]),
-                float(params["f0_scale"]),
-                profile.get("phonemizer_lang"),
-                None,
-                profile_type == PROFILE_TYPE_AVATAR,
-            )
-            audio = future.result()
+            for warmup_text in warmup_texts:
+                future = _AI_EXECUTOR.submit(
+                    _generate_with_seed,
+                    engine,
+                    1234,
+                    warmup_text,
+                    ref_wav,
+                    float(params["alpha"]),
+                    float(params["beta"]),
+                    chat_steps,
+                    float(params["embedding_scale"]),
+                    float(params["f0_scale"]),
+                    profile.get("phonemizer_lang"),
+                    None,
+                    profile_type == PROFILE_TYPE_AVATAR,
+                )
+                audio = future.result()
         print("Warmup completed.")
         return True, audio, engine.sample_rate
     except Exception as exc:
@@ -3687,7 +3714,7 @@ def chat(req: GenerateRequest, request: Request):
     if req.embedding_scale is None:
         req.embedding_scale = 1.2
     if req.diffusion_steps is None:
-        req.diffusion_steps = 10
+        req.diffusion_steps = int(os.getenv("STYLE_TTS2_CHAT_DIFFUSION_STEPS", "10"))
     if req.seed is None:
         req.seed = 1234
     if req.pad_text is None:

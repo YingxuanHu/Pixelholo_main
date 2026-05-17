@@ -29,7 +29,7 @@ type TrainParams = {
 };
 
 type ProfileType = 'voice' | 'avatar';
-type LLMMode = 'legacy_fast' | 'fresh_fast' | 'research' | 'auto';
+type LLMMode = 'legacy_fast' | 'live_search' | 'auto';
 type VoiceControlBackendDefaults = {
   pitchShift: number;
   f0Scale: number;
@@ -45,8 +45,7 @@ const DEFAULT_OUTPUT_MODE: 'voice' | 'avatar' = 'voice';
 const DEFAULT_LLM_MODE: LLMMode = 'legacy_fast';
 const LLM_MODE_OPTIONS: { value: LLMMode; label: string }[] = [
   { value: 'legacy_fast', label: 'Legacy Fast' },
-  { value: 'fresh_fast', label: 'Fresh Fast' },
-  { value: 'research', label: 'Research' },
+  { value: 'live_search', label: 'Live Search' },
   { value: 'auto', label: 'Auto' },
 ];
 const DEFAULT_AVATAR_START_SEC = 5;
@@ -61,6 +60,19 @@ const normalizeVoiceControls = (controls: VoiceControlValues): VoiceControlValue
   pace: Math.round(clamp(controls.pace, -100, 100)),
   tone: Math.round(clamp(controls.tone, -100, 100)),
   volume: Math.round(clamp(controls.volume, -100, 100)),
+});
+const DEFAULT_VOICE_CONTROL_BACKEND_DEFAULTS: VoiceControlBackendDefaults = {
+  pitchShift: 0,
+  f0Scale: 1,
+  embeddingScale: 1.2,
+  paceScale: 1,
+  volumeGain: 1,
+};
+const DEFAULT_VOICE_CONTROL_VALUES = normalizeVoiceControls({
+  pitch: 0,
+  pace: 0,
+  tone: 0,
+  volume: 0,
 });
 const formatBytes = (value: number) => {
   if (!Number.isFinite(value) || value <= 0) return '0 MB';
@@ -153,11 +165,14 @@ const App: React.FC = () => {
   const [avatarBackend, setAvatarBackend] = useState<'wav2lip' | 'musetalk'>('musetalk');
   const [outputMode, setOutputMode] = useState<'voice' | 'avatar'>(DEFAULT_OUTPUT_MODE);
   const [llmMode, setLlmMode] = useState<LLMMode>(DEFAULT_LLM_MODE);
-  const [voiceControlBackendDefaults, setVoiceControlBackendDefaults] = useState<VoiceControlBackendDefaults | null>(null);
-  const [voiceControlDefaults, setVoiceControlDefaults] = useState<VoiceControlValues | null>(null);
-  const [voiceControlValues, setVoiceControlValues] = useState<VoiceControlValues | null>(null);
-  const [voiceControlsStatus, setVoiceControlsStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [voiceControlBackendDefaults, setVoiceControlBackendDefaults] = useState<VoiceControlBackendDefaults>(
+    DEFAULT_VOICE_CONTROL_BACKEND_DEFAULTS,
+  );
+  const [voiceControlDefaults, setVoiceControlDefaults] = useState<VoiceControlValues>(DEFAULT_VOICE_CONTROL_VALUES);
+  const [voiceControlValues, setVoiceControlValues] = useState<VoiceControlValues>(DEFAULT_VOICE_CONTROL_VALUES);
+  const [voiceControlsStatus, setVoiceControlsStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('ready');
   const [voiceControlsError, setVoiceControlsError] = useState<string | null>(null);
+  const [voiceControlsDirty, setVoiceControlsDirty] = useState(false);
   const [videoState, setVideoState] = useState<'idle' | 'buffering' | 'playing'>('idle');
   const [videoFps, setVideoFps] = useState(DEFAULT_VIDEO_FPS);
   const [videoQueue, setVideoQueue] = useState(0);
@@ -183,6 +198,7 @@ const App: React.FC = () => {
   const audioStartDelayRef = useRef<number>(DEFAULT_AUDIO_START_DELAY_SEC);
   const videoFpsRef = useRef<number>(DEFAULT_VIDEO_FPS);
   const frameQueueRef = useRef<{ img: string; t: number }[]>([]);
+  const stopListeningRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     setTrainParams(trainPreset);
@@ -544,34 +560,36 @@ const App: React.FC = () => {
     [voiceControlBackendDefaults],
   );
   const handleVoiceControlsChange = useCallback((patch: Partial<VoiceControlValues>) => {
+    setVoiceControlsDirty(true);
     setVoiceControlValues((prev) => {
-      const base = prev ?? voiceControlDefaults;
-      if (!base) return prev;
+      const base = prev ?? voiceControlDefaults ?? DEFAULT_VOICE_CONTROL_VALUES;
       return normalizeVoiceControls({ ...base, ...patch });
     });
   }, [voiceControlDefaults]);
   const resetVoiceControls = useCallback(() => {
-    if (!voiceControlDefaults) return;
-    setVoiceControlValues(voiceControlDefaults);
+    setVoiceControlValues(voiceControlDefaults ?? DEFAULT_VOICE_CONTROL_VALUES);
+    setVoiceControlsDirty(false);
   }, [voiceControlDefaults]);
 
   useEffect(() => {
     if (apiStatus !== 'online' || !profile.name || !hasTrainedProfile) {
-      setVoiceControlBackendDefaults(null);
-      setVoiceControlDefaults(null);
-      setVoiceControlValues(null);
-      setVoiceControlsStatus('idle');
+      setVoiceControlBackendDefaults(DEFAULT_VOICE_CONTROL_BACKEND_DEFAULTS);
+      setVoiceControlDefaults(DEFAULT_VOICE_CONTROL_VALUES);
+      setVoiceControlValues(DEFAULT_VOICE_CONTROL_VALUES);
+      setVoiceControlsStatus('ready');
       setVoiceControlsError(null);
+      setVoiceControlsDirty(false);
       return;
     }
 
     let cancelled = false;
     const controller = new AbortController();
-    setVoiceControlBackendDefaults(null);
-    setVoiceControlDefaults(null);
-    setVoiceControlValues(null);
+    setVoiceControlBackendDefaults(DEFAULT_VOICE_CONTROL_BACKEND_DEFAULTS);
+    setVoiceControlDefaults(DEFAULT_VOICE_CONTROL_VALUES);
+    setVoiceControlValues(DEFAULT_VOICE_CONTROL_VALUES);
     setVoiceControlsStatus('loading');
     setVoiceControlsError(null);
+    setVoiceControlsDirty(false);
 
     fetch(
       `${apiBase}/profiles/${encodeURIComponent(profile.name)}/voice-controls?profile_type=${profileType}`,
@@ -600,14 +618,16 @@ const App: React.FC = () => {
         setVoiceControlDefaults(controls);
         setVoiceControlValues(controls);
         setVoiceControlsStatus('ready');
+        setVoiceControlsDirty(false);
       })
       .catch((err) => {
         if (cancelled || (err as Error)?.name === 'AbortError') return;
-        setVoiceControlBackendDefaults(null);
-        setVoiceControlDefaults(null);
-        setVoiceControlValues(null);
+        setVoiceControlBackendDefaults(DEFAULT_VOICE_CONTROL_BACKEND_DEFAULTS);
+        setVoiceControlDefaults(DEFAULT_VOICE_CONTROL_VALUES);
+        setVoiceControlValues(DEFAULT_VOICE_CONTROL_VALUES);
         setVoiceControlsStatus('error');
         setVoiceControlsError(String(err));
+        setVoiceControlsDirty(false);
       });
 
     return () => {
@@ -1125,7 +1145,9 @@ const App: React.FC = () => {
       setUiNotice('Safari blocked audio. Click again to enable sound.');
       return;
     }
-    await warmupProfile(profile.name, profileType);
+    // Fire warmup in background — startup useEffect already triggers it.
+    // Awaiting here would block the first inference for the full warmup duration (~5s).
+    void warmupProfile(profile.name, profileType);
     // End any existing stream immediately.
     streamSessionRef.current += 1;
     stopAllAudio();
@@ -1162,7 +1184,7 @@ const App: React.FC = () => {
     if (endpoint === '/chat') {
       payload.llm_mode = llmMode;
     }
-    if (voiceControlsStatus === 'ready' && voiceControlValues) {
+    if ((voiceControlsStatus === 'ready' || voiceControlsDirty) && voiceControlValues) {
       payload.pitch_shift = voiceControlValues.pitch;
       payload.pace_scale = resolvePaceScale(voiceControlValues.pace);
       const toneOverrides = resolveToneOverrides(voiceControlValues.tone);
@@ -1225,7 +1247,16 @@ const App: React.FC = () => {
         for (let i = 0; i < binary.length; i += 1) {
           bytes[i] = binary.charCodeAt(i);
         }
-        const buffer = await audioContextRef.current!.decodeAudioData(bytes.buffer);
+        let buffer: AudioBuffer;
+        try {
+          buffer = await audioContextRef.current!.decodeAudioData(bytes.buffer);
+        } catch {
+          // Malformed or empty WAV — skip this chunk rather than crashing the stream.
+          return;
+        }
+        // Zero-duration buffer would not advance nextStartTimeRef, causing all
+        // subsequent chunks to pile up at the same start time and play as static.
+        if (buffer.duration < 0.005) return;
         const schedule = scheduleBuffer(buffer);
         if (outputMode === 'avatar' && schedule && videoStartTimeRef.current === null) {
           videoStartTimeRef.current = schedule.startAt;
@@ -1267,6 +1298,7 @@ const App: React.FC = () => {
     unlockAudio,
     voiceControlValues,
     voiceControlsStatus,
+    voiceControlsDirty,
     resolvePaceScale,
     resolveToneOverrides,
     resolveVolumeGain,
@@ -1277,6 +1309,7 @@ const App: React.FC = () => {
   }, [inferenceText, runInference]);
 
   const stopInference = async () => {
+    stopListeningRef.current?.();
     if (streamAbortRef.current) streamAbortRef.current.abort();
     streamAbortRef.current = null;
     streamRunningRef.current = false;
@@ -2051,6 +2084,7 @@ const App: React.FC = () => {
                       <ControlPanel
                         variant="embedded"
                         onInterrupt={stopInference}
+                        stopListeningRef={stopListeningRef}
                         onSendChat={async (text) => runInference(text, '/chat')}
                         onSendDirect={async (text) => {
                           setInferenceText(text);

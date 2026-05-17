@@ -87,6 +87,13 @@ const SLIDERS: SliderConfig[] = [
   },
 ];
 
+const FALLBACK_VALUES: VoiceControlValues = {
+  pitch: 0,
+  pace: 0,
+  tone: 0,
+  volume: 0,
+};
+
 const VoiceControlsPanel: React.FC<VoiceControlsPanelProps> = ({
   values,
   defaults,
@@ -95,6 +102,9 @@ const VoiceControlsPanel: React.FC<VoiceControlsPanelProps> = ({
   onChange,
   onReset,
 }) => {
+  const effectiveValues = values ?? defaults ?? FALLBACK_VALUES;
+  const effectiveDefaults = defaults ?? FALLBACK_VALUES;
+
   return (
     <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-4">
       <div className="flex items-center justify-between gap-3">
@@ -107,7 +117,7 @@ const VoiceControlsPanel: React.FC<VoiceControlsPanelProps> = ({
         <button
           type="button"
           onClick={onReset}
-          disabled={!defaults || status !== 'ready'}
+          disabled={!defaults}
           className="rounded-lg border border-slate-200 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-slate-600 disabled:cursor-not-allowed disabled:opacity-40"
         >
           Reset
@@ -126,44 +136,41 @@ const VoiceControlsPanel: React.FC<VoiceControlsPanelProps> = ({
         </div>
       )}
 
-      {status !== 'error' && values && defaults && (
-        <div className="space-y-4">
-          {SLIDERS.map((slider) => {
-            const value = values[slider.key];
-            const defaultValue = defaults[slider.key];
-            return (
-              <div key={slider.key} className="space-y-2">
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <p className="text-sm font-semibold text-slate-800">{slider.label}</p>
-                    <p className="text-[11px] text-slate-500">{slider.hint}</p>
-                  </div>
-                  <div className="text-right">
-                    <p className="text-sm font-bold text-teal-700">{slider.describe(value)}</p>
-                    <p className="text-[10px] text-slate-400">{describeDefault(slider.describe(defaultValue))}</p>
-                  </div>
+      <div className="space-y-4">
+        {SLIDERS.map((slider) => {
+          const value = effectiveValues[slider.key];
+          const defaultValue = effectiveDefaults[slider.key];
+          return (
+            <div key={slider.key} className="space-y-2">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-sm font-semibold text-slate-800">{slider.label}</p>
+                  <p className="text-[11px] text-slate-500">{slider.hint}</p>
                 </div>
-                <input
-                  type="range"
-                  min={slider.min}
-                  max={slider.max}
-                  step={slider.step}
-                  value={value}
-                  onChange={(event) =>
-                    onChange({ [slider.key]: Number(event.target.value) } as Partial<VoiceControlValues>)
-                  }
-                  className="w-full accent-teal-600"
-                  disabled={status !== 'ready'}
-                />
-                <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-widest text-slate-400">
-                  <span>{slider.minLabel}</span>
-                  <span>{slider.maxLabel}</span>
+                <div className="text-right">
+                  <p className="text-sm font-bold text-teal-700">{slider.describe(value)}</p>
+                  <p className="text-[10px] text-slate-400">{describeDefault(slider.describe(defaultValue))}</p>
                 </div>
               </div>
-            );
-          })}
-        </div>
-      )}
+              <input
+                type="range"
+                min={slider.min}
+                max={slider.max}
+                step={slider.step}
+                value={value}
+                onChange={(event) =>
+                  onChange({ [slider.key]: Number(event.target.value) } as Partial<VoiceControlValues>)
+                }
+                className="w-full accent-teal-600"
+              />
+              <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-widest text-slate-400">
+                <span>{slider.minLabel}</span>
+                <span>{slider.maxLabel}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 };

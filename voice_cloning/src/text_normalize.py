@@ -12,8 +12,73 @@ except Exception:
 _CURRENCY_RE = re.compile(r"(?P<sign>[$£€])\s?(?P<amount>\d[\d,]*)(?:\.(?P<cents>\d{1,2}))?")
 _NUMBER_RE = re.compile(r"\d[\d,]*")
 _DOTTED_INITIALISM_RE = re.compile(r"\b(?:[A-Za-z]\.){2,}[A-Za-z]?\.?")
+_TEMP_RE = re.compile(
+    r"(?P<value>[+-]?\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:°\s*)?(?P<unit>[CF])\b",
+    re.IGNORECASE,
+)
+_STANDALONE_TEMP_UNIT_RE = re.compile(r"°\s*(?P<unit>[CF])\b", re.IGNORECASE)
+_TEMP_CONTEXT_RE = re.compile(
+    r"\b(?:temperature|weather|forecast|currently|current|feels?\s+like|high|low|degrees?)\b",
+    re.IGNORECASE,
+)
+_TEMP_UNIT_PAIR_RE = re.compile(
+    r"\b(?P<first>[CF])\s*(?P<joiner>/|and|or)\s*(?P<second>[CF])\b",
+    re.IGNORECASE,
+)
+_DEGREES_SINGLE_UNIT_RE = re.compile(r"\bdegrees?\s+(?P<unit>[CF])\b", re.IGNORECASE)
+_UNIT_REPLACEMENTS = (
+    (re.compile(r"\bkm\s*/\s*h\b", re.IGNORECASE), "kilometers per hour"),
+    (re.compile(r"\bkmh\b", re.IGNORECASE), "kilometers per hour"),
+    (re.compile(r"\bkph\b", re.IGNORECASE), "kilometers per hour"),
+    (re.compile(r"\bmph\b", re.IGNORECASE), "miles per hour"),
+    (re.compile(r"\bm\s*/\s*s\b", re.IGNORECASE), "meters per second"),
+    (re.compile(r"\bhpa\b", re.IGNORECASE), "hectopascals"),
+    (re.compile(r"\bmb\b"), "millibars"),
+    (re.compile(r"\buv\b", re.IGNORECASE), "U V"),
+    (re.compile(r"\baqi\b", re.IGNORECASE), "A Q I"),
+    (re.compile(r"\bpm\s*2\s*\.?\s*5\b", re.IGNORECASE), "P M two point five"),
+    (re.compile(r"(?:µ|μ|u)g\s*/\s*m(?:³|\^3|3)\b", re.IGNORECASE), "micrograms per cubic meter"),
+)
+_WIND_DIRECTIONS = {
+    "N": "north",
+    "NNE": "north northeast",
+    "NE": "northeast",
+    "ENE": "east northeast",
+    "E": "east",
+    "ESE": "east southeast",
+    "SE": "southeast",
+    "SSE": "south southeast",
+    "S": "south",
+    "SSW": "south southwest",
+    "SW": "southwest",
+    "WSW": "west southwest",
+    "W": "west",
+    "WNW": "west northwest",
+    "NW": "northwest",
+    "NNW": "north northwest",
+}
+_WIND_DIRECTION_PATTERN = re.compile(
+    r"\b(?P<prefix>winds?|wind\s+(?:is|are|from|out\s+of)?|from|towards?|gusts?)"
+    r"(?P<space>\s+(?:the\s+)?)"
+    r"(?P<direction>NNE|NNW|ENE|ESE|SSE|SSW|WSW|WNW|NE|NW|SE|SW|N|E|S|W)\b",
+    re.IGNORECASE,
+)
+_DIRECTION_WIND_PATTERN = re.compile(
+    r"\b(?P<direction>NNE|NNW|ENE|ESE|SSE|SSW|WSW|WNW|NE|NW|SE|SW|N|E|S|W)"
+    r"(?P<space>\s+)"
+    r"(?P<suffix>winds?|gusts?)\b",
+    re.IGNORECASE,
+)
 
 _ACRONYMS = {
+    "US": "U S",
+    "USA": "U S A",
+    "UK": "U K",
+    "UAE": "U A E",
+    "EU": "E U",
+    "UN": "U N",
+    "NYC": "N Y C",
+    "DC": "D C",
     "LLM": "L L M",
     "API": "A P I",
     "AWS": "A W S",
@@ -41,7 +106,18 @@ def _get_nemo_normalizer():
 
 
 def warmup_text_normalizer() -> None:
-    _get_nemo_normalizer()
+    normalizer = _get_nemo_normalizer()
+    # Instantiating the normalizer doesn't compile the OpenFST grammars —
+    # only the first normalize() call does. Run it here so first inference is fast.
+    sample = (
+        "The temperature is 72 degrees F with winds at 15 mph. "
+        "There are 3 items costing $12.50 each."
+    )
+    try:
+        if normalizer is not None:
+            normalizer.normalize(sample)
+    except Exception:
+        pass
 
 
 def _strip_commas(value: str) -> str:
@@ -81,6 +157,64 @@ def _replace_number(match: re.Match, year_hint: Callable[[int], bool]) -> str:
 def _expand_dotted_initialism(match: re.Match) -> str:
     letters = re.findall(r"[A-Za-z]", match.group(0))
     return " ".join(letter.upper() for letter in letters)
+
+
+def _replace_temperature(match: re.Match) -> str:
+    unit = match.group("unit").upper()
+    unit_word = "Fahrenheit" if unit == "F" else "Celsius"
+    return f"{match.group('value')} degrees {unit_word}"
+
+
+def _replace_standalone_temperature_unit(match: re.Match) -> str:
+    unit = match.group("unit").upper()
+    unit_word = "Fahrenheit" if unit == "F" else "Celsius"
+    return f"degrees {unit_word}"
+
+
+def _temperature_unit_word(unit: str) -> str:
+    return "Fahrenheit" if unit.upper() == "F" else "Celsius"
+
+
+def _replace_temperature_unit_pair(match: re.Match) -> str:
+    first = _temperature_unit_word(match.group("first"))
+    second = _temperature_unit_word(match.group("second"))
+    joiner = match.group("joiner").lower()
+    spoken_joiner = "or" if joiner == "or" else "and"
+    return f"{first} {spoken_joiner} {second}"
+
+
+def _normalize_bare_temperature_units(text: str) -> str:
+    text = _DEGREES_SINGLE_UNIT_RE.sub(
+        lambda match: f"degrees {_temperature_unit_word(match.group('unit'))}",
+        text,
+    )
+    if _TEMP_CONTEXT_RE.search(text):
+        text = _TEMP_UNIT_PAIR_RE.sub(_replace_temperature_unit_pair, text)
+    return text
+
+
+def _normalize_spoken_units(text: str) -> str:
+    text = _TEMP_RE.sub(_replace_temperature, text)
+    text = _STANDALONE_TEMP_UNIT_RE.sub(_replace_standalone_temperature_unit, text)
+    text = _normalize_bare_temperature_units(text)
+    text = re.sub(r"%", " percent", text)
+    for pattern, replacement in _UNIT_REPLACEMENTS:
+        text = pattern.sub(replacement, text)
+    text = _WIND_DIRECTION_PATTERN.sub(
+        lambda match: (
+            f"{match.group('prefix')}{match.group('space')}"
+            f"{_WIND_DIRECTIONS[match.group('direction').upper()]}"
+        ),
+        text,
+    )
+    text = _DIRECTION_WIND_PATTERN.sub(
+        lambda match: (
+            f"{_WIND_DIRECTIONS[match.group('direction').upper()]}"
+            f"{match.group('space')}{match.group('suffix')}"
+        ),
+        text,
+    )
+    return text
 
 
 def clean_text_for_tts(text: str) -> str:
@@ -148,6 +282,8 @@ def clean_text_for_tts(text: str) -> str:
     }
     for contraction, expansion in contractions.items():
         text = re.sub(rf"(?i)\b{re.escape(contraction)}\b", expansion, text)
+
+    text = _normalize_spoken_units(text)
 
     # Remove repeated punctuation that can trigger artifacts.
     text = re.sub(r"\.{2,}", ".", text)
