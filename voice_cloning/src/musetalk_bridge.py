@@ -907,7 +907,7 @@ class MuseTalkBridge:
         self._blend_alphas = [self._prepare_alpha(mask) for mask in self._mask_arrays]
         self._loaded_cache_dir = cache_dir
         self._loaded_coord_source = coord_source
-        self._loaded_runtime_max_frame_edge = runtime_edge
+        self._loaded_runtime_max_frame_edge = self._runtime_edge()
         self.frame_idx = 0
         self.frame_accumulator = 0.0
         self.infer_frame_accumulator = 0.0
