@@ -29,7 +29,8 @@ type TrainParams = {
 };
 
 type ProfileType = 'voice' | 'avatar';
-type LLMMode = 'legacy_fast' | 'live_search' | 'auto';
+type LLMMode = 'legacy_fast' | 'live_search' | 'gemini_search' | 'auto';
+type MuseTalkPreset = 'realistic' | 'low_latency' | 'balanced' | 'stable';
 type VoiceControlBackendDefaults = {
   pitchShift: number;
   f0Scale: number;
@@ -37,24 +38,73 @@ type VoiceControlBackendDefaults = {
   paceScale: number;
   volumeGain: number;
 };
+type BinaryStreamPacketMetadata = {
+  event?: string;
+  detail?: string;
+  inference_ms?: number;
+  chunk_index?: number;
+  sample_rate?: number;
+  fps?: number;
+  duration_sec?: number;
+  audio_bytes_len?: number;
+  audio_format?: 'wav' | 'pcm_s16le';
+  audio_channels?: number;
+  audio_samples?: number;
+  frame_lengths?: number[];
+};
+type BinaryStreamPacket = {
+  metadata: BinaryStreamPacketMetadata;
+  payload: Uint8Array;
+};
+type VideoFrameSource = string | {
+  url: string;
+  bitmap?: ImageBitmap;
+  bitmapPromise?: Promise<ImageBitmap | null>;
+  bitmapState?: 'pending' | 'ready' | 'failed';
+  drawn?: boolean;
+};
+type QueuedVideoFrame = {
+  frame: VideoFrameSource;
+  t: number;
+};
 
-const DEFAULT_API_BASE = 'http://127.0.0.1:8000';
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+const env = (import.meta as any).env ?? {};
+const envNumber = (key: string, fallback: number, min?: number, max?: number) => {
+  const raw = (env[key] as string | undefined)?.trim();
+  const parsed = raw ? Number(raw) : fallback;
+  const value = Number.isFinite(parsed) ? parsed : fallback;
+  return clamp(value, min ?? Number.NEGATIVE_INFINITY, max ?? Number.POSITIVE_INFINITY);
+};
+const DEFAULT_API_BASE = (env.VITE_PIXELHOLO_API_BASE as string | undefined)?.trim() || 'http://127.0.0.1:8000';
+const BINARY_STREAM_MEDIA_TYPE = 'application/vnd.pixelholo.stream-v1';
+const BINARY_STREAM_MAGIC = [80, 72, 83, 49]; // PHS1
+const BINARY_STREAM_HEADER_BYTES = 12;
+const BINARY_STREAM_ENABLED = (env.VITE_PIXELHOLO_BINARY_STREAM as string | undefined) !== '0';
+const BINARY_PCM_AUDIO_ENABLED = (env.VITE_PIXELHOLO_BINARY_PCM_AUDIO as string | undefined) !== '0';
 const LOCAL_STORAGE_API_BASE_KEY = 'voxclone_api_base';
 const DEFAULT_PROFILE_TYPE: 'voice' | 'avatar' = 'voice';
 const DEFAULT_OUTPUT_MODE: 'voice' | 'avatar' = 'voice';
 const DEFAULT_LLM_MODE: LLMMode = 'legacy_fast';
+const DEFAULT_MUSETALK_PRESET: MuseTalkPreset = 'realistic';
 const LLM_MODE_OPTIONS: { value: LLMMode; label: string }[] = [
-  { value: 'legacy_fast', label: 'Legacy Fast' },
-  { value: 'live_search', label: 'Live Search' },
-  { value: 'auto', label: 'Auto' },
+  { value: 'legacy_fast', label: 'Llama 3.1 8B Instant (Cutoff)' },
+  { value: 'live_search', label: 'GPT-4o Mini Search Preview (Live Search)' },
+  { value: 'gemini_search', label: 'Gemini 2.5 Flash Lite (Live Search)' },
+  { value: 'auto', label: 'Auto (Mixed)' },
 ];
 const DEFAULT_AVATAR_START_SEC = 5;
 const BLUR_KERNEL_BY_LEVEL = { low: 60, medium: 75, high: 90 } as const;
 const DEFAULT_AVATAR_BLUR_LEVEL: keyof typeof BLUR_KERNEL_BY_LEVEL = 'medium';
 const DEFAULT_VIDEO_FPS = 25;
-const DEFAULT_AUDIO_START_DELAY_SEC = 0.05;
+const DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE = Number(
+  (env.VITE_PIXELHOLO_AVATAR_MAX_FRAME_EDGE as string | undefined)?.trim() || '853',
+);
+const DEFAULT_AUDIO_START_DELAY_SEC = envNumber('VITE_PIXELHOLO_AUDIO_START_DELAY_SEC', 0.04, 0.02, 0.25);
+const AVATAR_AUDIO_START_DELAY_SEC = envNumber('VITE_PIXELHOLO_AVATAR_AUDIO_START_DELAY_SEC', 0.34, 0.12, 1.0);
+const AVATAR_AUDIO_CHUNK_LEAD_SEC = envNumber('VITE_PIXELHOLO_AVATAR_AUDIO_CHUNK_LEAD_SEC', 0.08, 0.02, 0.5);
+const VIDEO_FRAME_DECODE_PREWAIT_MS = envNumber('VITE_PIXELHOLO_VIDEO_PREDECODE_PREWAIT_MS', 45, 0, 200);
 const WARMUP_CACHE_MAX_AGE_MS = 120_000;
-const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 const normalizeVoiceControls = (controls: VoiceControlValues): VoiceControlValues => ({
   pitch: Number(clamp(controls.pitch, -4, 4).toFixed(1)),
   pace: Math.round(clamp(controls.pace, -100, 100)),
@@ -84,6 +134,58 @@ const formatBytes = (value: number) => {
     idx += 1;
   }
   return `${size.toFixed(idx <= 1 ? 0 : 1)} ${units[idx]}`;
+};
+const concatBytes = (left: Uint8Array, right: Uint8Array) => {
+  if (!left.length) return right;
+  if (!right.length) return left;
+  const combined = new Uint8Array(left.length + right.length);
+  combined.set(left, 0);
+  combined.set(right, left.length);
+  return combined;
+};
+const readUInt32BE = (bytes: Uint8Array, offset: number) => (
+  ((bytes[offset] << 24) >>> 0) +
+  ((bytes[offset + 1] << 16) >>> 0) +
+  ((bytes[offset + 2] << 8) >>> 0) +
+  (bytes[offset + 3] >>> 0)
+);
+const isBinaryStreamResponse = (response: Response) =>
+  response.headers.get('content-type')?.includes(BINARY_STREAM_MEDIA_TYPE) ?? false;
+const uint8ToArrayBuffer = (bytes: Uint8Array) =>
+  bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+const decodeBinaryStream = async (
+  response: Response,
+  onPacket: (packet: BinaryStreamPacket) => Promise<void> | void,
+  signal?: AbortSignal,
+) => {
+  if (!response.body) return;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = new Uint8Array(0);
+  while (true) {
+    if (signal?.aborted) break;
+    const { value, done } = await reader.read();
+    if (signal?.aborted) break;
+    if (done) break;
+    if (value) pending = concatBytes(pending, value);
+    while (pending.length >= BINARY_STREAM_HEADER_BYTES) {
+      if (!BINARY_STREAM_MAGIC.every((byte, index) => pending[index] === byte)) {
+        throw new Error('Invalid PixelHolo binary stream packet.');
+      }
+      const metadataLength = readUInt32BE(pending, 4);
+      const payloadLength = readUInt32BE(pending, 8);
+      const packetLength = BINARY_STREAM_HEADER_BYTES + metadataLength + payloadLength;
+      if (pending.length < packetLength) break;
+      const metadataStart = BINARY_STREAM_HEADER_BYTES;
+      const payloadStart = metadataStart + metadataLength;
+      const metadataBytes = pending.slice(metadataStart, payloadStart);
+      const payload = pending.slice(payloadStart, packetLength);
+      const metadata = JSON.parse(decoder.decode(metadataBytes)) as BinaryStreamPacketMetadata;
+      pending = pending.slice(packetLength);
+      await onPacket({ metadata, payload });
+      if (signal?.aborted) break;
+    }
+  }
 };
 const DEFAULT_STEP_STATUSES: Record<string, StepStatus> = {
   upload: 'idle',
@@ -163,6 +265,7 @@ const App: React.FC = () => {
   const [modelOverride, setModelOverride] = useState('');
   const [refOverride, setRefOverride] = useState('');
   const [avatarBackend, setAvatarBackend] = useState<'wav2lip' | 'musetalk'>('musetalk');
+  const [museTalkPreset] = useState<MuseTalkPreset>(DEFAULT_MUSETALK_PRESET);
   const [outputMode, setOutputMode] = useState<'voice' | 'avatar'>(DEFAULT_OUTPUT_MODE);
   const [llmMode, setLlmMode] = useState<LLMMode>(DEFAULT_LLM_MODE);
   const [voiceControlBackendDefaults, setVoiceControlBackendDefaults] = useState<VoiceControlBackendDefaults>(
@@ -195,10 +298,30 @@ const App: React.FC = () => {
   const videoRafRef = useRef<number | null>(null);
   const videoStartTimeRef = useRef<number | null>(null);
   const videoNextFrameTimeRef = useRef<number | null>(null);
+  const videoStateRef = useRef<'idle' | 'buffering' | 'playing'>('idle');
+  const videoDrawSerialRef = useRef(0);
   const audioStartDelayRef = useRef<number>(DEFAULT_AUDIO_START_DELAY_SEC);
   const videoFpsRef = useRef<number>(DEFAULT_VIDEO_FPS);
-  const frameQueueRef = useRef<{ img: string; t: number }[]>([]);
+  const frameQueueRef = useRef<QueuedVideoFrame[]>([]);
   const stopListeningRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    videoStateRef.current = videoState;
+  }, [videoState]);
+
+  const releaseFrameSource = useCallback((source?: VideoFrameSource | null) => {
+    if (!source) return;
+    if (typeof source === 'string') {
+      if (source.startsWith('blob:')) URL.revokeObjectURL(source);
+      return;
+    }
+    source.drawn = true;
+    source.bitmap?.close();
+    source.bitmap = undefined;
+    if (source.url.startsWith('blob:')) {
+      URL.revokeObjectURL(source.url);
+    }
+  }, []);
 
   useEffect(() => {
     setTrainParams(trainPreset);
@@ -390,9 +513,10 @@ const App: React.FC = () => {
       type: ProfileType,
       backend: 'wav2lip' | 'musetalk',
       mode: LLMMode,
+      preset: MuseTalkPreset,
       runtimeId: string | null,
     ) =>
-      `${runtimeId || 'unknown'}|${apiBase}|${type}|${profileName}|${type === 'avatar' ? backend : '-'}|${mode}`,
+      `${runtimeId || 'unknown'}|${apiBase}|${type}|${profileName}|${type === 'avatar' ? `${backend}:${preset}` : '-'}|${mode}`,
     [apiBase],
   );
 
@@ -418,7 +542,7 @@ const App: React.FC = () => {
   const warmupProfile = useCallback(async (profileName: string, type: ProfileType) => {
     if (!profileName) return;
     const runtimeId = backendRuntimeIdRef.current;
-    const key = warmupKeyFor(profileName, type, avatarBackend, llmMode, runtimeId);
+    const key = warmupKeyFor(profileName, type, avatarBackend, llmMode, museTalkPreset, runtimeId);
     if (hasFreshWarmup(key)) return;
 
     const inFlight = warmupInFlightRef.current.get(key);
@@ -439,6 +563,11 @@ const App: React.FC = () => {
             profile: profileName,
             profile_type: type,
             lipsync_backend: type === 'avatar' ? avatarBackend : null,
+            avatar_max_frame_edge:
+              type === 'avatar' && Number.isFinite(DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE) && DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE > 0
+                ? Math.round(DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE)
+                : null,
+            musetalk_preset: type === 'avatar' && avatarBackend === 'musetalk' ? museTalkPreset : null,
             include_llm: true,
             llm_mode: llmMode,
           }),
@@ -457,7 +586,7 @@ const App: React.FC = () => {
             : avatarBackend;
         if (isWarmupSatisfied(data, type)) {
           warmedProfilesRef.current.set(
-            warmupKeyFor(profileName, type, resolvedBackend, llmMode, resolvedRuntimeId ?? backendRuntimeIdRef.current),
+            warmupKeyFor(profileName, type, resolvedBackend, llmMode, museTalkPreset, resolvedRuntimeId ?? backendRuntimeIdRef.current),
             Date.now(),
           );
         }
@@ -473,7 +602,7 @@ const App: React.FC = () => {
 
     warmupInFlightRef.current.set(key, promise);
     await promise;
-  }, [apiBase, avatarBackend, hasFreshWarmup, isWarmupSatisfied, llmMode, warmupKeyFor]);
+  }, [apiBase, avatarBackend, hasFreshWarmup, isWarmupSatisfied, llmMode, museTalkPreset, warmupKeyFor]);
 
   useEffect(() => {
     loadProfiles();
@@ -689,7 +818,10 @@ const App: React.FC = () => {
     void warmupProfile(profile.name, profileType);
   }, [apiStatus, hasTrainedProfile, profile.name, profileType, warmupProfile]);
 
-  const streamResponseLines = async (response: Response, onLine: (line: string) => void) => {
+  const streamResponseLines = async (
+    response: Response,
+    onLine: (line: string) => Promise<void> | void,
+  ) => {
     if (!response.body) return;
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -702,12 +834,12 @@ const App: React.FC = () => {
       while (index !== -1) {
         const line = buffer.slice(0, index).trim();
         buffer = buffer.slice(index + 1);
-        if (line) onLine(line);
+        if (line) await onLine(line);
         index = buffer.indexOf('\n');
       }
     }
     if (buffer.trim()) {
-      onLine(buffer.trim());
+      await onLine(buffer.trim());
     }
   };
 
@@ -1040,8 +1172,13 @@ const App: React.FC = () => {
       window.cancelAnimationFrame(videoRafRef.current);
       videoRafRef.current = null;
     }
+    videoDrawSerialRef.current += 1;
+    for (const item of frameQueueRef.current) {
+      releaseFrameSource(item.frame);
+    }
     frameQueueRef.current = [];
     setVideoQueue(0);
+    videoStateRef.current = 'idle';
     setVideoState('idle');
     videoStartTimeRef.current = null;
     videoNextFrameTimeRef.current = null;
@@ -1050,19 +1187,70 @@ const App: React.FC = () => {
       const ctx = canvas.getContext('2d');
       if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
     }
+  }, [releaseFrameSource]);
+
+  const isFramePendingDecode = useCallback((frameSource: VideoFrameSource) => (
+    typeof frameSource !== 'string'
+    && !!frameSource.bitmapPromise
+    && frameSource.bitmapState === 'pending'
+  ), []);
+
+  const waitForFramePredecode = useCallback(async (frames?: VideoFrameSource[]) => {
+    const pending = (frames ?? [])
+      .filter((frame): frame is Exclude<VideoFrameSource, string> => (
+        typeof frame !== 'string'
+        && !!frame.bitmapPromise
+        && frame.bitmapState === 'pending'
+      ))
+      .slice(0, 4)
+      .map(frame => frame.bitmapPromise!);
+    if (!pending.length) return;
+    await Promise.race([
+      Promise.allSettled(pending),
+      new Promise(resolve => window.setTimeout(resolve, VIDEO_FRAME_DECODE_PREWAIT_MS)),
+    ]);
   }, []);
 
-  const drawFrame = useCallback((frameBase64: string) => {
+  const drawFrame = useCallback((frameSource: VideoFrameSource) => {
     const canvas = videoCanvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+    const drawSerial = ++videoDrawSerialRef.current;
+    const sourceUrl = typeof frameSource === 'string' ? frameSource : frameSource.url;
+    const bitmap = typeof frameSource === 'string' ? undefined : frameSource.bitmap;
+    const cleanup = () => {
+      releaseFrameSource(frameSource);
+    };
+    if (bitmap) {
+      if (drawSerial === videoDrawSerialRef.current) {
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      }
+      cleanup();
+      return;
+    }
+    if (
+      typeof frameSource !== 'string'
+      && frameSource.bitmapPromise
+      && frameSource.bitmapState === 'pending'
+    ) {
+      cleanup();
+      return;
+    }
     const img = new Image();
     img.onload = () => {
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      if (drawSerial === videoDrawSerialRef.current) {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      }
+      cleanup();
     };
-    img.src = `data:image/jpeg;base64,${frameBase64}`;
-  }, []);
+    img.onerror = () => {
+      cleanup();
+    };
+    img.src = sourceUrl.startsWith('blob:') || sourceUrl.startsWith('data:')
+      ? sourceUrl
+      : `data:image/jpeg;base64,${sourceUrl}`;
+  }, [releaseFrameSource]);
 
   const startVideoLoop = useCallback(() => {
     if (videoRafRef.current !== null) return;
@@ -1075,21 +1263,30 @@ const App: React.FC = () => {
       const startAt = videoStartTimeRef.current;
       if (startAt !== null) {
         const fps = Math.max(5, videoFpsRef.current || 25);
-        const frameInterval = 1 / fps;
         if (videoNextFrameTimeRef.current === null) {
           videoNextFrameTimeRef.current = startAt;
         }
         const now = ctx.currentTime;
-        let frameToDraw: { img: string; t: number } | null = null;
+        let frameToDraw: QueuedVideoFrame | null = null;
         while (frameQueueRef.current.length > 0 && frameQueueRef.current[0].t <= now) {
-          frameToDraw = frameQueueRef.current.shift() || null;
+          const candidate = frameQueueRef.current[0];
+          if (isFramePendingDecode(candidate.frame)) {
+            break;
+          }
+          const shifted = frameQueueRef.current.shift() || null;
+          if (frameToDraw) {
+            releaseFrameSource(frameToDraw.frame);
+          }
+          frameToDraw = shifted;
         }
         if (frameToDraw) {
-          drawFrame(frameToDraw.img);
+          drawFrame(frameToDraw.frame);
         }
-        if (!frameQueueRef.current.length && videoState === 'playing') {
+        if (!frameQueueRef.current.length && videoStateRef.current === 'playing') {
+          videoStateRef.current = 'buffering';
           setVideoState('buffering');
-        } else if (frameQueueRef.current.length && videoState !== 'playing') {
+        } else if (frameQueueRef.current.length && videoStateRef.current !== 'playing') {
+          videoStateRef.current = 'playing';
           setVideoState('playing');
         }
         setVideoQueue(frameQueueRef.current.length);
@@ -1097,9 +1294,9 @@ const App: React.FC = () => {
       videoRafRef.current = window.requestAnimationFrame(tick);
     };
     videoRafRef.current = window.requestAnimationFrame(tick);
-  }, [drawFrame, videoState]);
+  }, [drawFrame, isFramePendingDecode, releaseFrameSource]);
 
-  const enqueueFrames = useCallback((frames: string[], startAt: number, duration: number, fps?: number) => {
+  const enqueueFrames = useCallback((frames: VideoFrameSource[], startAt: number, duration: number, fps?: number) => {
     if (!frames || frames.length === 0) return;
     if (fps && fps > 0) {
       setVideoFps(fps);
@@ -1107,13 +1304,16 @@ const App: React.FC = () => {
     }
     const frameCount = frames.length;
     const frameDuration = frameCount > 0 ? duration / frameCount : 0;
-    frames.forEach((img, i) => {
-      frameQueueRef.current.push({ img, t: startAt + i * frameDuration });
+    frames.forEach((frame, i) => {
+      frameQueueRef.current.push({ frame, t: startAt + i * frameDuration });
     });
     setVideoQueue(frameQueueRef.current.length);
-    if (videoState === 'idle') setVideoState('buffering');
+    if (videoStateRef.current === 'idle') {
+      videoStateRef.current = 'buffering';
+      setVideoState('buffering');
+    }
     startVideoLoop();
-  }, [startVideoLoop, videoState]);
+  }, [startVideoLoop]);
 
   const scheduleBuffer = (buffer: AudioBuffer) => {
     if (!audioContextRef.current) return;
@@ -1127,7 +1327,7 @@ const App: React.FC = () => {
     // Backend already handles chunk-boundary stitching/crossfades.
     // Frontend should focus on stable scheduling with enough lead time.
     const desiredStart = nextStartTimeRef.current;
-    const minLead = outputMode === 'avatar' ? 0.05 : 0.03;
+    const minLead = outputMode === 'avatar' ? AVATAR_AUDIO_CHUNK_LEAD_SEC : 0.03;
     const startAt = Math.max(ctx.currentTime + minLead, desiredStart);
     const endAt = startAt + buffer.duration;
 
@@ -1145,9 +1345,8 @@ const App: React.FC = () => {
       setUiNotice('Safari blocked audio. Click again to enable sound.');
       return;
     }
-    // Fire warmup in background — startup useEffect already triggers it.
-    // Awaiting here would block the first inference for the full warmup duration (~5s).
-    void warmupProfile(profile.name, profileType);
+    // Startup/profile-switch warmup handles cache preparation. Starting a warmup
+    // here can compete with the inference worker and make identical prompts slower.
     // End any existing stream immediately.
     streamSessionRef.current += 1;
     stopAllAudio();
@@ -1157,7 +1356,7 @@ const App: React.FC = () => {
     setLatency(null);
     setInferenceStageIndex(inferenceSteps.length > 0 ? 0 : null);
     // Set lead first, then schedule against it.
-    audioStartDelayRef.current = outputMode === 'avatar' ? 0.35 : 0.08;
+    audioStartDelayRef.current = outputMode === 'avatar' ? AVATAR_AUDIO_START_DELAY_SEC : 0.08;
     nextStartTimeRef.current = (audioContextRef.current?.currentTime || 0) + audioStartDelayRef.current;
     audioEndTimeRef.current = nextStartTimeRef.current;
     let sawError = false;
@@ -1195,83 +1394,208 @@ const App: React.FC = () => {
     if (outputMode === 'avatar') {
       payload.avatar_profile = profile.name;
       payload.lipsync_backend = avatarBackend;
+      if (Number.isFinite(DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE) && DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE > 0) {
+        payload.avatar_max_frame_edge = Math.round(DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE);
+      }
+      if (avatarBackend === 'musetalk') {
+        payload.musetalk_preset = museTalkPreset;
+      }
     }
 
-    try {
-      const res = await fetch(`${apiBase}${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-      if (!res.ok) throw new Error(await res.text());
-      await streamResponseLines(res, async line => {
-        if (sessionId !== streamSessionRef.current) {
-          return;
+    const finishStream = (inferenceMs?: number) => {
+      if (sawError) return;
+      setLatency(prev => prev ? { ...prev, total: inferenceMs ?? Math.round(performance.now() - startTime) } : null);
+      setStepStatuses(prev => ({ ...prev, inference: 'done' }));
+      setInferenceStageIndex(inferenceSteps.length ? inferenceSteps.length - 1 : null);
+      if (streamAbortRef.current === controller) {
+        streamAbortRef.current = null;
+      }
+      streamRunningRef.current = false;
+    };
+
+    const failStream = () => {
+      sawError = true;
+      setStepStatuses(prev => ({ ...prev, inference: 'error' }));
+      setInferenceStageIndex(null);
+    };
+
+    const decodeBase64 = (value: string) => {
+      const binary = atob(value);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    };
+
+    const revokeFrameSources = (sources?: VideoFrameSource[]) => {
+      for (const source of sources ?? []) {
+        releaseFrameSource(source);
+      }
+    };
+
+    const isSessionActive = () => (
+      sessionId === streamSessionRef.current
+      && streamAbortRef.current === controller
+      && !controller.signal.aborted
+      && !sawError
+    );
+
+    const decodeAudioChunk = async (data: BinaryStreamPacketMetadata | any, bytes: Uint8Array) => {
+      const audioContext = audioContextRef.current!;
+      if (data.audio_format === 'pcm_s16le') {
+        const sampleRate = Math.max(1, Math.round(data.sample_rate || audioContext.sampleRate));
+        const channels = Math.max(1, Math.round(data.audio_channels || 1));
+        const availableSamples = Math.floor(bytes.byteLength / (2 * channels));
+        const sampleCount = Math.max(0, Math.min(Math.round(data.audio_samples || availableSamples), availableSamples));
+        const buffer = audioContext.createBuffer(channels, sampleCount, sampleRate);
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        for (let channel = 0; channel < channels; channel += 1) {
+          const output = buffer.getChannelData(channel);
+          for (let i = 0; i < sampleCount; i += 1) {
+            const offset = ((i * channels) + channel) * 2;
+            output[i] = view.getInt16(offset, true) / 32768;
+          }
         }
-        if (sawError) return;
-        let data: any;
-        try {
-          data = JSON.parse(line);
-        } catch (parseErr) {
-          sawError = true;
-          setStepStatuses(prev => ({ ...prev, inference: 'error' }));
-          setInferenceStageIndex(null);
+        return buffer;
+      }
+      return audioContext.decodeAudioData(uint8ToArrayBuffer(bytes));
+    };
+
+    const processChunk = async (data: any, audioBytes?: Uint8Array, frames?: VideoFrameSource[]) => {
+        if (!isSessionActive()) {
+          revokeFrameSources(frames);
           return;
         }
         if (data.event === 'error') {
-          sawError = true;
-          setStepStatuses(prev => ({ ...prev, inference: 'error' }));
-          setInferenceStageIndex(null);
+          revokeFrameSources(frames);
+          failStream();
           return;
         }
         if (data.event === 'done') {
-          if (sawError) return;
-          setLatency(prev => prev ? { ...prev, total: data.inference_ms ?? Math.round(performance.now() - startTime) } : null);
-          setStepStatuses(prev => ({ ...prev, inference: 'done' }));
-          setInferenceStageIndex(inferenceSteps.length ? inferenceSteps.length - 1 : null);
-          if (streamAbortRef.current === controller) {
-            streamAbortRef.current = null;
-          }
-          streamRunningRef.current = false;
+          revokeFrameSources(frames);
+          finishStream(data.inference_ms);
           return;
         }
-        if (!data.audio_base64) return;
+        const bytes = audioBytes ?? (data.audio_base64 ? decodeBase64(data.audio_base64) : null);
+        if (!bytes || bytes.byteLength === 0) {
+          revokeFrameSources(frames);
+          return;
+        }
         if (firstChunk) {
           firstChunk = false;
           setLatency({ ttfa: Math.round(performance.now() - startTime), total: 0 });
           setInferenceStageIndex(Math.min(2, inferenceSteps.length - 1));
         }
-        const binary = atob(data.audio_base64);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i += 1) {
-          bytes[i] = binary.charCodeAt(i);
-        }
         let buffer: AudioBuffer;
         try {
-          buffer = await audioContextRef.current!.decodeAudioData(bytes.buffer);
+          buffer = await decodeAudioChunk(data, bytes);
         } catch {
-          // Malformed or empty WAV — skip this chunk rather than crashing the stream.
+          // Malformed or empty audio — skip this chunk rather than crashing the stream.
+          revokeFrameSources(frames);
+          return;
+        }
+        if (!isSessionActive()) {
+          revokeFrameSources(frames);
           return;
         }
         // Zero-duration buffer would not advance nextStartTimeRef, causing all
         // subsequent chunks to pile up at the same start time and play as static.
-        if (buffer.duration < 0.005) return;
+        if (buffer.duration < 0.005) {
+          revokeFrameSources(frames);
+          return;
+        }
+        const frameSources = frames ?? data.frames_base64;
         const schedule = scheduleBuffer(buffer);
         if (outputMode === 'avatar' && schedule && videoStartTimeRef.current === null) {
           videoStartTimeRef.current = schedule.startAt;
           videoNextFrameTimeRef.current = schedule.startAt;
         }
-        if (outputMode === 'avatar' && schedule && Array.isArray(data.frames_base64)) {
+        if (outputMode === 'avatar' && schedule && Array.isArray(frameSources)) {
           const duration = typeof data.duration_sec === 'number' ? data.duration_sec : buffer.duration;
-          enqueueFrames(data.frames_base64, schedule.startAt, duration, data.fps);
+          enqueueFrames(frameSources, schedule.startAt, duration, data.fps);
+          void waitForFramePredecode(frameSources);
           setInferenceStageIndex(Math.min(3, inferenceSteps.length - 1));
         }
         if (outputMode === 'voice') {
           setInferenceStageIndex(Math.min(4, inferenceSteps.length - 1));
         }
         setInferenceChunks(prev => [...prev, { index: data.chunk_index, duration: buffer.duration, receivedAt: Date.now() }]);
+    };
+
+    try {
+      const res = await fetch(`${apiBase}${endpoint}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(BINARY_STREAM_ENABLED
+            ? {
+                Accept: BINARY_STREAM_MEDIA_TYPE,
+                'X-PixelHolo-Transport': 'binary',
+                'X-PixelHolo-Client': 'web',
+                ...(BINARY_PCM_AUDIO_ENABLED ? { 'X-PixelHolo-Audio-Format': 'pcm_s16le' } : {}),
+              }
+            : {}),
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
       });
+      if (!res.ok) throw new Error(await res.text());
+      if (BINARY_STREAM_ENABLED && isBinaryStreamResponse(res)) {
+        await decodeBinaryStream(res, async packet => {
+          if (!isSessionActive()) return;
+          const audioLength = Math.max(0, packet.metadata.audio_bytes_len ?? 0);
+          if (packet.payload.length < audioLength) {
+            throw new Error('Invalid PixelHolo binary audio payload.');
+          }
+          const audioBytes = packet.payload.slice(0, audioLength);
+          const framePayload = packet.payload.slice(audioLength);
+          const frameSources: VideoFrameSource[] = [];
+          let cursor = 0;
+          for (const frameLength of packet.metadata.frame_lengths ?? []) {
+            if (frameLength < 0 || cursor + frameLength > framePayload.length) {
+              throw new Error('Invalid PixelHolo binary frame payload.');
+            }
+            const frameBytes = framePayload.slice(cursor, cursor + frameLength);
+            cursor += frameLength;
+            const blob = new Blob([frameBytes], { type: 'image/jpeg' });
+            const frameSource: Exclude<VideoFrameSource, string> = {
+              url: URL.createObjectURL(blob),
+            };
+            if ('createImageBitmap' in window) {
+              frameSource.bitmapState = 'pending';
+              frameSource.bitmapPromise = createImageBitmap(blob)
+                .then(bitmap => {
+                  if (frameSource.drawn) {
+                    bitmap.close();
+                    frameSource.bitmapState = 'failed';
+                    return null;
+                  }
+                  frameSource.bitmap = bitmap;
+                  frameSource.bitmapState = 'ready';
+                  return bitmap;
+                })
+                .catch(() => {
+                  frameSource.bitmapState = 'failed';
+                  return null;
+                });
+            }
+            frameSources.push(frameSource);
+          }
+          await processChunk(packet.metadata, audioBytes, frameSources);
+        }, controller.signal);
+      } else {
+        await streamResponseLines(res, async line => {
+          let data: any;
+          try {
+            data = JSON.parse(line);
+          } catch {
+            failStream();
+            return;
+          }
+          await processChunk(data);
+        });
+      }
     } catch (err) {
       if ((err as Error).name !== 'AbortError') {
         setStepStatuses(prev => ({ ...prev, inference: 'error' }));
@@ -1289,13 +1613,16 @@ const App: React.FC = () => {
     enqueueFrames,
     interruptBackend,
     llmMode,
+    museTalkPreset,
     modelOverride,
     outputMode,
     profile.name,
     profileType,
     refOverride,
+    releaseFrameSource,
     resetVideo,
     unlockAudio,
+    waitForFramePredecode,
     voiceControlValues,
     voiceControlsStatus,
     voiceControlsDirty,

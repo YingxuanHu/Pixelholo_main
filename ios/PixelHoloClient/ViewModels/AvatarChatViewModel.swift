@@ -696,6 +696,13 @@ final class AvatarChatViewModel: ObservableObject {
             llmModel: nil,
             mobileProfile: true,
             avatarFPS: profileType == .avatar ? resolvedWarmupAvatarFPS(for: backend) : nil,
+            avatarMaxFrameEdge: profileType == .avatar
+                ? (
+                    backend == .wav2lip
+                    ? MobileAvatarStreamProfile.wav2lipMaxFrameEdge
+                    : MobileAvatarStreamProfile.museTalkMaxFrameEdge
+                )
+                : nil,
             musetalkInferFPS: backend == .musetalk ? MobileAvatarStreamProfile.museTalkInferFPS : nil,
             musetalkStreamWindowSec: backend == .musetalk ? MobileAvatarStreamProfile.museTalkWindowSec : nil,
             musetalkLookaheadSec: backend == .musetalk ? MobileAvatarStreamProfile.museTalkLookaheadSec : nil

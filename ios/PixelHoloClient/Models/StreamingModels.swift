@@ -15,18 +15,28 @@ enum LipsyncBackend: String, Codable, CaseIterable {
 enum LLMMode: String, Codable, CaseIterable, Identifiable {
     case legacyFast = "legacy_fast"
     case liveSearch = "live_search"
+    case geminiFlash = "gemini_flash"
+    case geminiSearch = "gemini_search"
     case auto
+
+    static var allCases: [LLMMode] {
+        [.legacyFast, .liveSearch, .geminiSearch, .auto]
+    }
 
     var id: String { rawValue }
 
     var displayName: String {
         switch self {
         case .legacyFast:
-            return "Legacy Fast"
+            return "Llama 3.1 8B Instant (Cutoff)"
         case .liveSearch:
-            return "Live Search"
+            return "GPT-4o Mini Search Preview (Live Search)"
+        case .geminiFlash:
+            return "Gemini 2.5 Flash Lite (Cutoff)"
+        case .geminiSearch:
+            return "Gemini 2.5 Flash Lite (Live Search)"
         case .auto:
-            return "Auto"
+            return "Auto (Mixed)"
         }
     }
 }

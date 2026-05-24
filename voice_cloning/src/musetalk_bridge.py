@@ -28,6 +28,26 @@ def _odd_kernel(size: int) -> int:
     return size
 
 
+def _env_int(name: str, default: int, minimum: int = 0, maximum: int | None = None) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning(
+            "component=musetalk op=env_config status=invalid name=%s value=%s default=%s",
+            name,
+            raw_value,
+            default,
+        )
+        return default
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(value, maximum)
+    return value
+
+
 class MuseTalkBridge:
     def __init__(
         self,
@@ -55,10 +75,16 @@ class MuseTalkBridge:
         self.infer_frame_accumulator = 0.0
         self.fps = 25.0
         self.audio_history = np.array([], dtype=np.float32)
-        self.audio_history_sec = float(os.getenv("MUSE_TALK_AUDIO_HISTORY_SEC", "2.0"))
+        self.default_audio_history_sec = float(os.getenv("MUSE_TALK_AUDIO_HISTORY_SEC", "2.0"))
+        self.audio_history_sec = self.default_audio_history_sec
         # Keep default infer fps equal to output/avatar fps to avoid apparent slow-motion
         # (low infer fps + frame upsampling reduces base-frame progression speed).
-        self.infer_fps = float(os.getenv("MUSE_TALK_INFER_FPS", "25.0"))
+        self.default_infer_fps = float(os.getenv("MUSE_TALK_INFER_FPS", "25.0"))
+        self.infer_fps = self.default_infer_fps
+        self.default_coord_source = self._normalize_coord_source(
+            os.getenv("MUSE_TALK_COORD_SOURCE", "legacy")
+        )
+        self.coord_source = self.default_coord_source
 
         # Keep MuseTalk box expansion conservative. This avoids chin cut lines without
         # shifting the mouth target area too far from the model's expected region.
@@ -79,7 +105,15 @@ class MuseTalkBridge:
         self.cache_version = int(os.getenv("MUSE_TALK_CACHE_VERSION", "9"))
         self.mask_stabilize = os.getenv("MUSE_TALK_MASK_STABILIZE", "1") != "0"
         self.mask_stabilize_window = int(os.getenv("MUSE_TALK_MASK_STABILIZE_WINDOW", "5"))
-        self.temporal_smooth = float(os.getenv("MUSE_TALK_TEMPORAL_SMOOTH", "0.08"))
+        self.default_temporal_smooth = float(os.getenv("MUSE_TALK_TEMPORAL_SMOOTH", "0.08"))
+        self.temporal_smooth = self.default_temporal_smooth
+        self.default_runtime_max_frame_edge = _env_int(
+            "MUSE_TALK_RUNTIME_MAX_FRAME_EDGE",
+            0,
+            minimum=0,
+            maximum=1280,
+        )
+        self.runtime_max_frame_edge = self.default_runtime_max_frame_edge
 
         self.frames: np.ndarray | None = None
         self.coords_xyxy: np.ndarray | None = None
@@ -88,6 +122,8 @@ class MuseTalkBridge:
         self._mask_crop_boxes: list[list[int]] = []
         self._blend_alphas: list[np.ndarray] = []
         self._loaded_cache_dir: Path | None = None
+        self._loaded_coord_source: str | None = None
+        self._loaded_runtime_max_frame_edge = 0
         self._coord_sha1: str | None = None
         self._vignette_cache: dict[tuple[int, int, int, int], np.ndarray] = {}
         self._prev_generated_face: np.ndarray | None = None
@@ -176,6 +212,28 @@ class MuseTalkBridge:
                 )
 
         self.face_parser = _FaceParsingWithPaths(face_parse_resnet, face_parse_model)
+
+    @staticmethod
+    def _normalize_coord_source(value: str | None) -> str:
+        source = (value or "legacy").strip().lower().replace("-", "_")
+        aliases = {
+            "default": "legacy",
+            "coords": "legacy",
+            "runtime": "legacy",
+            "musetalk": "baked",
+            "mt": "baked",
+            "musetalk_coords": "baked",
+            "landmark": "baked",
+            "landmark_stabilized": "baked",
+        }
+        source = aliases.get(source, source)
+        if source not in {"legacy", "baked", "auto"}:
+            logger.warning(
+                "component=musetalk op=coord_source status=invalid value=%s fallback=legacy",
+                value,
+            )
+            return "legacy"
+        return source
 
     @staticmethod
     def _coords_sha1(coords: np.ndarray) -> str:
@@ -489,14 +547,132 @@ class MuseTalkBridge:
             "coord_expand_down": self.coord_expand_down,
             "upper_boundary_ratio": self.upper_boundary_ratio,
             "blend_expand": self.blend_expand,
-            "face_scale": self.face_scale,
             "alpha_blur_ratio": self.alpha_blur_ratio,
             "vignette_margin_ratio": self.vignette_margin_ratio,
             "alpha_gamma": self.alpha_gamma,
-            "detail_sharpen": self.detail_sharpen,
-            "color_match_strength": self.color_match_strength,
             "frame_shape": list(frame_shape),
         }
+
+    def _runtime_edge(self, frame_w: int | None = None, frame_h: int | None = None) -> int:
+        edge = max(0, min(int(self.runtime_max_frame_edge or 0), 1280))
+        if edge <= 0 or frame_w is None or frame_h is None:
+            return edge
+        if max(frame_w, frame_h) <= edge:
+            return 0
+        return edge
+
+    @staticmethod
+    def _runtime_cache_meta(
+        frames_path: Path,
+        coords_path: Path,
+        coord_source: str,
+        max_frame_edge: int,
+    ) -> dict[str, object]:
+        frames_stat = frames_path.stat()
+        coords_stat = coords_path.stat()
+        return {
+            "cache_version": 1,
+            "source_frames": frames_path.name,
+            "source_frames_size": frames_stat.st_size,
+            "source_frames_mtime_ns": frames_stat.st_mtime_ns,
+            "source_coords": coords_path.name,
+            "source_coords_size": coords_stat.st_size,
+            "source_coords_mtime_ns": coords_stat.st_mtime_ns,
+            "coord_source": coord_source,
+            "max_frame_edge": int(max_frame_edge),
+        }
+
+    @staticmethod
+    def _scale_coords(coords_xyxy: np.ndarray, scale: float, frame_w: int, frame_h: int) -> np.ndarray:
+        scaled = np.rint(coords_xyxy.astype(np.float32, copy=False) * float(scale)).astype(np.int32)
+        scaled[:, 0] = np.clip(scaled[:, 0], 0, max(0, frame_w - 1))
+        scaled[:, 1] = np.clip(scaled[:, 1], 0, max(0, frame_h - 1))
+        scaled[:, 2] = np.clip(scaled[:, 2], 1, frame_w)
+        scaled[:, 3] = np.clip(scaled[:, 3], 1, frame_h)
+        too_narrow = scaled[:, 2] <= scaled[:, 0]
+        too_short = scaled[:, 3] <= scaled[:, 1]
+        scaled[too_narrow, 2] = np.minimum(frame_w, scaled[too_narrow, 0] + 1)
+        scaled[too_short, 3] = np.minimum(frame_h, scaled[too_short, 1] + 1)
+        return scaled
+
+    def _load_or_build_runtime_frame_cache(
+        self,
+        cache_dir: Path,
+        frames_path: Path,
+        coords_path: Path,
+        raw_coords: np.ndarray,
+        coord_source: str,
+        max_frame_edge: int,
+    ) -> tuple[np.ndarray, np.ndarray, str, int]:
+        original_frames = np.load(frames_path, mmap_mode="r")
+        if original_frames.ndim != 4 or len(original_frames) == 0:
+            raise ValueError(f"Invalid avatar cache layout in {cache_dir}")
+        frame_h, frame_w = original_frames.shape[1:3]
+        coords_xyxy, source_fmt = self._convert_coords_to_xyxy(raw_coords, frame_w, frame_h)
+        previous_edge = self.runtime_max_frame_edge
+        self.runtime_max_frame_edge = max_frame_edge
+        try:
+            runtime_edge = self._runtime_edge(frame_w, frame_h)
+        finally:
+            self.runtime_max_frame_edge = previous_edge
+        if runtime_edge <= 0:
+            return np.asarray(original_frames), coords_xyxy, source_fmt, 0
+
+        scale = float(runtime_edge) / float(max(frame_w, frame_h))
+        runtime_w = max(1, int(round(frame_w * scale)))
+        runtime_h = max(1, int(round(frame_h * scale)))
+        suffix = f"{coord_source}_edge{runtime_edge}"
+        runtime_frames_path = cache_dir / f"musetalk_frames_{suffix}.npy"
+        runtime_coords_path = cache_dir / f"musetalk_coords_xyxy_{suffix}.npy"
+        runtime_meta_path = cache_dir / f"musetalk_frames_{suffix}.json"
+        expected_meta = self._runtime_cache_meta(frames_path, coords_path, coord_source, runtime_edge)
+        expected_meta.update(
+            {
+                "source_shape": list(original_frames.shape),
+                "runtime_shape": [len(original_frames), runtime_h, runtime_w, original_frames.shape[3]],
+                "scale": round(scale, 8),
+                "source_coord_format": source_fmt,
+            }
+        )
+
+        if runtime_frames_path.exists() and runtime_coords_path.exists() and runtime_meta_path.exists():
+            try:
+                runtime_meta = json.loads(runtime_meta_path.read_text())
+                if all(runtime_meta.get(key) == value for key, value in expected_meta.items()):
+                    frames = np.load(runtime_frames_path)
+                    coords = np.load(runtime_coords_path).astype(np.int32, copy=False)
+                    if (
+                        frames.ndim == 4
+                        and coords.ndim == 2
+                        and len(frames) == len(original_frames)
+                        and frames.shape[1] == runtime_h
+                        and frames.shape[2] == runtime_w
+                    ):
+                        return frames, coords, source_fmt, runtime_edge
+            except Exception:
+                logger.debug(
+                    "component=musetalk op=runtime_frame_cache status=load_error path=%s",
+                    runtime_frames_path,
+                    exc_info=True,
+                )
+
+        logger.info(
+            "component=musetalk op=runtime_frame_cache status=build edge=%s source_shape=%s runtime_shape=%s",
+            runtime_edge,
+            tuple(original_frames.shape),
+            (len(original_frames), runtime_h, runtime_w, original_frames.shape[3]),
+        )
+        resized_frames = np.empty(
+            (len(original_frames), runtime_h, runtime_w, original_frames.shape[3]),
+            dtype=np.uint8,
+        )
+        for idx, frame in enumerate(original_frames):
+            resized_frames[idx] = cv2.resize(frame, (runtime_w, runtime_h), interpolation=cv2.INTER_AREA)
+        scaled_coords = self._scale_coords(coords_xyxy, scale, runtime_w, runtime_h)
+        np.save(runtime_frames_path, resized_frames)
+        np.save(runtime_coords_path, scaled_coords)
+        runtime_meta_path.write_text(json.dumps(expected_meta, indent=2))
+        return resized_frames, scaled_coords, source_fmt, runtime_edge
 
     def _load_cached_assets(
         self,
@@ -612,14 +788,32 @@ class MuseTalkBridge:
     def load_profile(self, profile: str, profile_type: str = PROFILE_TYPE_AVATAR) -> None:
         cache_dir = avatar_cache_dir(profile, profile_type)
         frames_path = cache_dir / "frames.npy"
-        coords_path = cache_dir / "coords.npy"
+        legacy_coords_path = cache_dir / "coords.npy"
+        baked_coords_path = cache_dir / "musetalk_coords.npy"
+        coord_source = self._normalize_coord_source(self.coord_source)
+        if coord_source == "auto":
+            coord_source = "baked" if baked_coords_path.exists() else "legacy"
+        coords_path = baked_coords_path if coord_source == "baked" and baked_coords_path.exists() else legacy_coords_path
+        if coord_source == "baked" and coords_path != baked_coords_path:
+            logger.warning(
+                "component=musetalk op=load_profile status=coord_fallback requested=baked fallback=legacy profile=%s profile_type=%s",
+                profile,
+                profile_type,
+            )
+            coord_source = "legacy"
         meta_path = cache_dir / "meta.json"
         if not frames_path.exists() or not coords_path.exists():
             raise FileNotFoundError(
                 f"Avatar cache missing for {profile}. Run preprocess with avatar baking."
             )
 
-        if self._loaded_cache_dir == cache_dir and self.frames is not None and self._latents:
+        if (
+            self._loaded_cache_dir == cache_dir
+            and self._loaded_coord_source == coord_source
+            and self._loaded_runtime_max_frame_edge == self._runtime_edge()
+            and self.frames is not None
+            and self._latents
+        ):
             self.frame_idx = 0
             self.frame_accumulator = 0.0
             self.infer_frame_accumulator = 0.0
@@ -627,8 +821,15 @@ class MuseTalkBridge:
             self._prev_generated_face = None
             return
 
-        frames = np.load(frames_path)
         raw_coords = np.load(coords_path).astype(np.int32)
+        frames, coords_xyxy, source_fmt, runtime_edge = self._load_or_build_runtime_frame_cache(
+            cache_dir,
+            frames_path,
+            coords_path,
+            raw_coords,
+            coord_source,
+            self._runtime_edge(),
+        )
         if frames.ndim != 4 or raw_coords.ndim != 2 or len(frames) == 0:
             raise ValueError(f"Invalid avatar cache layout in {cache_dir}")
         if len(frames) != len(raw_coords):
@@ -649,18 +850,26 @@ class MuseTalkBridge:
                 )
 
         frame_h, frame_w = frames.shape[1:3]
-        coords_xyxy, source_fmt = self._convert_coords_to_xyxy(raw_coords, frame_w, frame_h)
         self._coord_sha1 = self._coords_sha1(coords_xyxy)
         logger.info(
-            "component=musetalk op=load_profile status=coords profile=%s profile_type=%s source_format=%s",
+            "component=musetalk op=load_profile status=coords profile=%s profile_type=%s coord_source=%s source_format=%s runtime_edge=%s frame_shape=%s",
             profile,
             profile_type,
+            coord_source,
             source_fmt,
+            runtime_edge or "full",
+            tuple(frames.shape),
         )
 
-        latents_path = cache_dir / "musetalk_latents.pt"
-        masks_path = cache_dir / "musetalk_masks.pkl"
-        runtime_meta_path = cache_dir / "musetalk_runtime_meta.json"
+        suffix_parts: list[str] = []
+        if coord_source != "legacy":
+            suffix_parts.append(coord_source)
+        if runtime_edge > 0:
+            suffix_parts.append(f"edge{runtime_edge}")
+        cache_suffix = "" if not suffix_parts else "_" + "_".join(suffix_parts)
+        latents_path = cache_dir / f"musetalk_latents{cache_suffix}.pt"
+        masks_path = cache_dir / f"musetalk_masks{cache_suffix}.pkl"
+        runtime_meta_path = cache_dir / f"musetalk_runtime_meta{cache_suffix}.json"
 
         cached = self._load_cached_assets(
             latents_path,
@@ -697,6 +906,8 @@ class MuseTalkBridge:
         self._mask_crop_boxes = mask_crop_boxes
         self._blend_alphas = [self._prepare_alpha(mask) for mask in self._mask_arrays]
         self._loaded_cache_dir = cache_dir
+        self._loaded_coord_source = coord_source
+        self._loaded_runtime_max_frame_edge = runtime_edge
         self.frame_idx = 0
         self.frame_accumulator = 0.0
         self.infer_frame_accumulator = 0.0
@@ -1046,6 +1257,8 @@ class MuseTalkBridge:
         self._blend_alphas = []
         self.audio_history = np.array([], dtype=np.float32)
         self._loaded_cache_dir = None
+        self._loaded_coord_source = None
+        self._loaded_runtime_max_frame_edge = 0
         self._coord_sha1 = None
         self._prev_generated_face = None
         self._vignette_cache.clear()

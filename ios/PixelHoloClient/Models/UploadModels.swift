@@ -30,6 +30,7 @@ struct WarmupRequest: Codable, Hashable {
     var llmModel: String?
     var mobileProfile: Bool = false
     var avatarFPS: Double?
+    var avatarMaxFrameEdge: Int?
     var musetalkInferFPS: Double?
     var musetalkStreamWindowSec: Double?
     var musetalkLookaheadSec: Double?
@@ -44,6 +45,7 @@ struct WarmupRequest: Codable, Hashable {
         case llmModel = "llm_model"
         case mobileProfile = "mobile_profile"
         case avatarFPS = "avatar_fps"
+        case avatarMaxFrameEdge = "avatar_max_frame_edge"
         case musetalkInferFPS = "musetalk_infer_fps"
         case musetalkStreamWindowSec = "musetalk_stream_window_sec"
         case musetalkLookaheadSec = "musetalk_lookahead_sec"
