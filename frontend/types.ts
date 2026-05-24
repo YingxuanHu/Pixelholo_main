@@ -1,5 +1,6 @@
 
 export type StepStatus = 'idle' | 'running' | 'done' | 'error';
+export type ProfileType = 'voice' | 'avatar';
 
 export interface LogEntry {
   id: string;

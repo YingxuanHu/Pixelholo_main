@@ -12,6 +12,7 @@ import {
   TrainStats,
   InferenceChunk,
   ProfileInfo,
+  ProfileType,
   VoiceControlValues,
 } from './types';
 
@@ -28,7 +29,6 @@ type TrainParams = {
   maxLen: number;
 };
 
-type ProfileType = 'voice' | 'avatar';
 type LLMMode = 'legacy_fast' | 'live_search' | 'gemini_search' | 'auto';
 type MuseTalkPreset = 'realistic' | 'low_latency' | 'balanced' | 'stable';
 type VoiceControlBackendDefaults = {
