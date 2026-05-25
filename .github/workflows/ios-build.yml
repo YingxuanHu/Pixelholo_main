@@ -22,16 +22,21 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Build
         run: |
           set -o pipefail
+          mkdir -p build
+          xcodebuild -list -project pixelholo_2_ios.xcodeproj
           xcodebuild \
             -project pixelholo_2_ios.xcodeproj \
-            -target pixelholo_2_ios \
+            -scheme pixelholo_2_ios \
             -configuration Debug \
-            -destination 'generic/platform=iOS' \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build/DerivedData \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
             build

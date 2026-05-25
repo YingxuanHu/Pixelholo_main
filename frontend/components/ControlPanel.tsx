@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useSpeechToText } from '../hooks/useSpeechToText';
 
 type Mode = 'chat' | 'tts';
@@ -9,9 +9,10 @@ type ControlPanelProps = {
   onInterrupt?: () => Promise<void> | void;
   disabled?: boolean;
   variant?: 'card' | 'embedded';
+  stopListeningRef?: React.MutableRefObject<(() => void) | null>;
 };
 
-const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, onInterrupt, disabled, variant = 'card' }) => {
+const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, onInterrupt, disabled, variant = 'card', stopListeningRef }) => {
   const [mode, setMode] = useState<Mode>('chat');
   const [text, setText] = useState('');
   const [chatText, setChatText] = useState('');
@@ -43,7 +44,12 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
     [handleSend],
   );
 
-  const { isListening, startListening, hasSupport, transcript } = useSpeechToText(onSpeechResult);
+  const { isListening, startListening, stopListening, hasSupport, transcript } = useSpeechToText(onSpeechResult);
+
+  useEffect(() => {
+    if (stopListeningRef) stopListeningRef.current = stopListening;
+  }, [stopListening, stopListeningRef]);
+
   const startListeningSafe = useCallback(() => {
     if (onInterrupt) {
       // Keep mic start inside the click gesture path.
@@ -102,13 +108,12 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
         <div className="flex items-center gap-2">
           {mode === 'chat' && hasSupport && (
             <button
-              onClick={startListeningSafe}
-              disabled={isDisabled}
+              onClick={isListening ? stopListening : startListeningSafe}
               className={`rounded-lg px-3 py-2 text-xs font-bold ${
                 isListening ? 'bg-rose-500 text-white' : 'bg-slate-800 text-slate-200'
               }`}
             >
-              {isListening ? 'Listening...' : 'Voice Input'}
+              {isListening ? '⏹ Stop Listening' : 'Voice Input'}
             </button>
           )}
           <button

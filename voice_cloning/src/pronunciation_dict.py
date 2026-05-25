@@ -45,6 +45,12 @@ _ARPABET_BASE_TO_IPA = {
     "ZH": "ʒ",
 }
 
+_WORD_OVERRIDES = {
+    "are": "ɑːɹ",
+    "r": "ˈɑːɹ",
+    "er": "ˈɝ",
+}
+
 
 def _try_load_cmudict() -> dict[str, list[list[str]]]:
     try:
@@ -78,8 +84,13 @@ def _arpabet_token_to_ipa(token: str) -> str:
         base = token[:-1]
         if base == "AH" and token[-1] == "0":
             return "ə"
-        if base == "ER" and token[-1] == "0":
-            return "ɚ"
+        if base == "ER":
+            if token[-1] == "0":
+                return "ɚ"
+            if token[-1] == "1":
+                return "ˈɝ"
+            if token[-1] == "2":
+                return "ˌɝ"
         if token[-1] == "1":
             stress = "ˈ"
         elif token[-1] == "2":
@@ -96,12 +107,16 @@ def arpabet_to_ipa(symbols: list[str]) -> str:
 
 
 def lookup_base_pronunciation(word: str) -> str | None:
-    entries = load_cmudict_entries()
-    if not entries:
-        return None
-
     key = word.strip().lower()
     if not key:
+        return None
+
+    override = _WORD_OVERRIDES.get(key)
+    if override:
+        return override
+
+    entries = load_cmudict_entries()
+    if not entries:
         return None
 
     pronunciations = entries.get(key)

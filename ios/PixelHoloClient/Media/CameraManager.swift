@@ -262,49 +262,18 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             frameDuration = CMTime(value: 1, timescale: 30)
         }
 
-        let filterComposition: AVVideoComposition
-        if #available(iOS 26.0, *) {
-            let centeredCrop = CGRect(
-                x: transformed.origin.x + cropRect.origin.x,
-                y: transformed.origin.y + cropRect.origin.y,
-                width: cropRect.width,
-                height: cropRect.height
-            )
-
-            var layerConfig = AVVideoCompositionLayerInstruction.Configuration(assetTrack: track)
-            layerConfig.setTransform(
-                preferredTransform.translatedBy(x: -centeredCrop.origin.x, y: -centeredCrop.origin.y),
-                at: .zero
-            )
-            let layerInstruction = AVVideoCompositionLayerInstruction(configuration: layerConfig)
-            let instruction = AVVideoCompositionInstruction(
-                configuration: .init(
-                    layerInstructions: [layerInstruction],
-                    timeRange: CMTimeRange(start: .zero, duration: duration)
-                )
-            )
-
-            var compositionConfig = try await AVVideoComposition.Configuration(for: asset)
-            compositionConfig.instructions = [instruction]
-            compositionConfig.frameDuration = frameDuration
-            compositionConfig.renderSize = CGSize(width: cropRect.width, height: cropRect.height)
-            compositionConfig.sourceTrackIDForFrameTiming = track.trackID
-            filterComposition = AVVideoComposition(configuration: compositionConfig)
-        } else {
-            let legacyComposition = AVMutableVideoComposition(asset: asset) { request in
-                let source = request.sourceImage
-                let sourceExtent = source.extent
-                let x = sourceExtent.origin.x + cropRect.origin.x
-                let y = sourceExtent.origin.y + cropRect.origin.y
-                let centeredCrop = CGRect(x: x, y: y, width: cropRect.width, height: cropRect.height)
-                let clamped = source.clampedToExtent()
-                let cropped = clamped.cropped(to: centeredCrop)
-                request.finish(with: cropped, context: nil)
-            }
-            legacyComposition.renderSize = CGSize(width: cropRect.width, height: cropRect.height)
-            legacyComposition.frameDuration = frameDuration
-            filterComposition = legacyComposition
+        let filterComposition = AVMutableVideoComposition(asset: asset) { request in
+            let source = request.sourceImage
+            let sourceExtent = source.extent
+            let x = sourceExtent.origin.x + cropRect.origin.x
+            let y = sourceExtent.origin.y + cropRect.origin.y
+            let centeredCrop = CGRect(x: x, y: y, width: cropRect.width, height: cropRect.height)
+            let clamped = source.clampedToExtent()
+            let cropped = clamped.cropped(to: centeredCrop)
+            request.finish(with: cropped, context: nil)
         }
+        filterComposition.renderSize = CGSize(width: cropRect.width, height: cropRect.height)
+        filterComposition.frameDuration = frameDuration
 
         let outputURL = makeCroppedVideoURL(inputURL: inputURL)
         try? FileManager.default.removeItem(at: outputURL)
