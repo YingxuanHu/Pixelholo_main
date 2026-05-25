@@ -100,8 +100,8 @@ def sanitize_audio_for_playback(
     max_rms: float = 0.25,
     corrupt_nonfinite_fraction: float = 0.02,
     corrupt_clipped_fraction: float = 0.20,
-    corrupt_noise_rms: float = 0.18,
-    corrupt_zero_cross_fraction: float = 0.35,
+    corrupt_noise_rms: float = 0.10,
+    corrupt_zero_cross_fraction: float = 0.45,
 ) -> np.ndarray:
     """Prevent invalid or runaway samples from becoming full-scale PCM noise."""
     if hasattr(audio, "detach"):
@@ -262,3 +262,34 @@ def smart_vad_trim(
     start = max(0, start - pad)
     end = min(audio.size, end + pad)
     return audio[start:end]
+
+
+def trim_leading_silence(
+    audio: np.ndarray,
+    sample_rate: int,
+    top_db: float = 30.0,
+    frame_length: int = 1024,
+    hop_length: int = 256,
+    pad_ms: float = 12.0,
+    max_trim_ms: float = 220.0,
+) -> np.ndarray:
+    try:
+        import librosa
+    except Exception:
+        return audio
+    if audio.size == 0 or top_db <= 0 or max_trim_ms <= 0:
+        return audio
+    rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
+    if rms.size == 0 or float(np.max(rms)) <= 1e-8:
+        return audio
+    rms_db = librosa.power_to_db(rms * rms, ref=np.max)
+    non_silent = np.flatnonzero(rms_db > -top_db)
+    if non_silent.size == 0:
+        return audio
+    start = librosa.frames_to_samples(non_silent[0], hop_length=hop_length)
+    pad = int(sample_rate * (pad_ms / 1000.0))
+    max_trim = int(sample_rate * (max_trim_ms / 1000.0))
+    trim_to = min(max(0, start - pad), max_trim)
+    if trim_to <= 0:
+        return audio
+    return audio[trim_to:]

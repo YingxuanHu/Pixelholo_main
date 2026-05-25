@@ -11,6 +11,7 @@ export const useSpeechToText = (onFinalText: SpeechResultHandler) => {
   const committedTextRef = useRef('');
   const lastEmittedTextRef = useRef('');
   const latestTranscriptRef = useRef('');
+  const stoppedByUserRef = useRef(false);
 
   useEffect(() => {
     onFinalTextRef.current = onFinalText;
@@ -61,13 +62,15 @@ export const useSpeechToText = (onFinalText: SpeechResultHandler) => {
       setIsListening(false);
     };
     recognition.onend = () => {
-      // Some browsers end on silence without firing a useful final result.
-      // Ensure we still auto-submit when speaking stops.
-      const finalText = committedTextRef.current.trim() || latestTranscriptRef.current.trim();
-      if (finalText && finalText !== lastEmittedTextRef.current) {
-        lastEmittedTextRef.current = finalText;
-        onFinalTextRef.current(finalText);
+      // If the user explicitly stopped, discard partial transcript instead of submitting.
+      if (!stoppedByUserRef.current) {
+        const finalText = committedTextRef.current.trim() || latestTranscriptRef.current.trim();
+        if (finalText && finalText !== lastEmittedTextRef.current) {
+          lastEmittedTextRef.current = finalText;
+          onFinalTextRef.current(finalText);
+        }
       }
+      stoppedByUserRef.current = false;
       setIsListening(false);
     };
 
@@ -87,6 +90,7 @@ export const useSpeechToText = (onFinalText: SpeechResultHandler) => {
   const startListening = () => {
     if (!recognitionRef.current || isListening) return;
     try {
+      stoppedByUserRef.current = false;
       committedTextRef.current = '';
       lastEmittedTextRef.current = '';
       latestTranscriptRef.current = '';
@@ -98,10 +102,21 @@ export const useSpeechToText = (onFinalText: SpeechResultHandler) => {
     }
   };
 
+  const stopListening = () => {
+    if (!recognitionRef.current || !isListening) return;
+    stoppedByUserRef.current = true;
+    try {
+      recognitionRef.current.stop();
+    } catch {
+      // ignore
+    }
+  };
+
   return {
     isListening,
     transcript,
     startListening,
+    stopListening,
     hasSupport,
   };
 };

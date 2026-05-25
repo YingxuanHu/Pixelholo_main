@@ -25,6 +25,7 @@ rembg
 num2words
 nemo_text_processing
 groq
+openai>=1.50.0
 python-dotenv
 click
 tensorboard

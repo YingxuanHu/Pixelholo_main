@@ -12,8 +12,39 @@ enum LipsyncBackend: String, Codable, CaseIterable {
     case musetalk
 }
 
+enum LLMMode: String, Codable, CaseIterable, Identifiable {
+    case legacyFast = "legacy_fast"
+    case liveSearch = "live_search"
+    case geminiFlash = "gemini_flash"
+    case geminiSearch = "gemini_search"
+    case auto
+
+    static var allCases: [LLMMode] {
+        [.legacyFast, .liveSearch, .geminiSearch, .auto]
+    }
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .legacyFast:
+            return "Llama 3.1 8B Instant (Cutoff)"
+        case .liveSearch:
+            return "GPT-4o Mini Search Preview (Live Search)"
+        case .geminiFlash:
+            return "Gemini 2.5 Flash Lite (Cutoff)"
+        case .geminiSearch:
+            return "Gemini 2.5 Flash Lite (Live Search)"
+        case .auto:
+            return "Auto (Mixed)"
+        }
+    }
+}
+
 struct GenerateRequest: Codable, Hashable {
     let text: String
+    var llmMode: LLMMode?
+    var llmModel: String?
     var speaker: String?
     var profileType: ProfileType?
     var avatarProfile: String?
@@ -43,6 +74,8 @@ struct GenerateRequest: Codable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case text
+        case llmMode = "llm_mode"
+        case llmModel = "llm_model"
         case speaker
         case profileType = "profile_type"
         case avatarProfile = "avatar_profile"
