@@ -137,7 +137,7 @@ Important runtime details:
 | Mode | Code | Model/provider | Behavior |
 | --- | --- | --- | --- |
 | Legacy Fast | `LLM_MODE_LEGACY_FAST` in `llm_service.py` | Groq `llama-3.1-8b-instant` | Fast general answers. No true live web/search access. |
-| Live Search | `LLM_MODE_LIVE_SEARCH` | OpenAI `gpt-4o-mini-search-preview` by default | Current facts, weather, news, prices, post-2023 info. Weather can bypass LLM via Open-Meteo direct response. |
+| Live Search | `LLM_MODE_LIVE_SEARCH` | OpenAI `gpt-4o-mini` with Responses API web search by default | Current facts, weather, news, prices, post-2023 info. Weather can bypass LLM via Open-Meteo direct response. |
 | Auto | `LLM_MODE_AUTO` | Chooses one of the above | `_needs_current_info` checks strong and weak live-signal regexes. Strong signals always use live search; weak signals can be suppressed by legacy-prefer patterns. After a live answer, short follow-up-style prompts can stay on live search for a limited number of turns. |
 
 LLM processing path:
@@ -146,7 +146,7 @@ LLM processing path:
 2. `LLMService.stream_response` appends the user message to in-memory conversation history.
 3. `resolve_route` normalizes mode aliases and applies auto routing.
 4. If live search and weather query, `_direct_weather_answer` calls Open-Meteo geocoding and forecast APIs.
-5. Otherwise `_stream_from_route` streams tokens from OpenAI or Groq.
+5. Otherwise `_stream_from_route` streams tokens from OpenAI Responses API web search, Gemini, or Groq.
 6. `_stream_from_route` buffers tokens into sentence-like spoken chunks and avoids splitting protected abbreviations.
 7. Those chunks feed TTS as soon as they are yielded.
 

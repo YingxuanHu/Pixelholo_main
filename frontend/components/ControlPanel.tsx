@@ -44,7 +44,7 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
     [handleSend],
   );
 
-  const { isListening, startListening, stopListening, hasSupport, transcript } = useSpeechToText(onSpeechResult);
+  const { isListening, startListening, stopListening, hasSupport } = useSpeechToText(onSpeechResult);
 
   useEffect(() => {
     if (stopListeningRef) stopListeningRef.current = stopListening;
@@ -91,7 +91,7 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
       </div>
 
       <textarea
-        value={mode === 'chat' ? (transcript || chatText) : text}
+        value={mode === 'chat' ? chatText : text}
         onChange={(e) => (mode === 'chat' ? setChatText(e.target.value) : setText(e.target.value))}
         placeholder={mode === 'chat' ? 'Ask the assistant...' : 'Type what to say...'}
         className={inputClass}

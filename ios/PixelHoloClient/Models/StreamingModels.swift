@@ -30,7 +30,7 @@ enum LLMMode: String, Codable, CaseIterable, Identifiable {
         case .legacyFast:
             return "Llama 3.1 8B Instant (Cutoff)"
         case .liveSearch:
-            return "GPT-4o Mini Search Preview (Live Search)"
+            return "GPT-4o Mini (Live Search)"
         case .geminiFlash:
             return "Gemini 2.5 Flash Lite (Cutoff)"
         case .geminiSearch:

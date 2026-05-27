@@ -14,6 +14,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -21,7 +22,7 @@ import time
 import uuid
 import warnings
 from pathlib import Path
-from typing import Callable, Iterator, Protocol
+from typing import Any, Callable, Iterator, Protocol
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 import numpy as np
@@ -37,7 +38,6 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.text_normalize import clean_text_for_tts, warmup_text_normalizer
-from src.pronunciation_dict import lookup_base_pronunciation
 from src.utils.smart_buffer import SmartStreamBuffer
 from src.utils.prosody_chunker import prosody_split
 from src.llm.llm_service import LLMService
@@ -214,7 +214,7 @@ DEFAULT_MAX_CHUNK_CHARS = 180
 DEFAULT_MAX_CHUNK_WORDS = 45
 DEFAULT_PAUSE_MS = 40
 DEFAULT_MUSETALK_PRESET = "realistic"
-MUSE_TALK_PRESET_CONFIGS: dict[str, dict[str, float | int | str]] = {
+MUSE_TALK_PRESET_CONFIGS: dict[str, dict[str, float | int | str | list[float]]] = {
     # Product default: prioritize stable, natural-looking motion over the earliest
     # possible first frame. Faster presets remain available for internal testing.
     "realistic": {
@@ -222,6 +222,10 @@ MUSE_TALK_PRESET_CONFIGS: dict[str, dict[str, float | int | str]] = {
         "first_window_sec": 0.55,
         "startup_window_sec": 0.55,
         "startup_window_chunks": 2,
+        "adaptive_window_sec": 0.85,
+        "adaptive_window_secs": [0.85, 1.15, 1.45],
+        "adaptive_window_chunks": 3,
+        "adaptive_min_lookahead_sec": 0.08,
         "lookahead_sec": 0.28,
         "temporal_smooth": 0.20,
         "frame_crossfade": 0,
@@ -245,6 +249,10 @@ MUSE_TALK_PRESET_CONFIGS: dict[str, dict[str, float | int | str]] = {
         "stream_window_sec": 1.25,
         "startup_window_sec": 0.60,
         "startup_window_chunks": 2,
+        "adaptive_window_sec": 0.85,
+        "adaptive_window_secs": [0.85, 1.05],
+        "adaptive_window_chunks": 2,
+        "adaptive_min_lookahead_sec": 0.06,
         "lookahead_sec": 0.16,
         "temporal_smooth": 0.12,
         "frame_crossfade": 0,
@@ -256,6 +264,10 @@ MUSE_TALK_PRESET_CONFIGS: dict[str, dict[str, float | int | str]] = {
         "stream_window_sec": 1.6,
         "startup_window_sec": 0.70,
         "startup_window_chunks": 2,
+        "adaptive_window_sec": 0.95,
+        "adaptive_window_secs": [0.95, 1.20, 1.40],
+        "adaptive_window_chunks": 3,
+        "adaptive_min_lookahead_sec": 0.10,
         "lookahead_sec": 0.24,
         "temporal_smooth": 0.18,
         "frame_crossfade": 0,
@@ -265,6 +277,7 @@ MUSE_TALK_PRESET_CONFIGS: dict[str, dict[str, float | int | str]] = {
     },
 }
 MUSE_TALK_COORD_SOURCES = {"legacy", "baked", "auto"}
+RUNTIME_SETTINGS_KEY = "runtime_settings"
 
 _WORD_RE = re.compile(r"[A-Za-z']+|[^A-Za-z']+")
 _WORD_ONLY_RE = re.compile(r"[A-Za-z']+$")
@@ -361,6 +374,64 @@ def _musetalk_int_setting(
         return max(minimum, min(int(fallback), maximum))
 
 
+def _parse_musetalk_window_secs(
+    value,
+    *,
+    minimum: float,
+    maximum: float,
+    max_items: int = 12,
+) -> list[float]:
+    if value is None:
+        return []
+    raw_items: list[object]
+    if isinstance(value, str):
+        raw_items = [item for item in re.split(r"[\s,]+", value.strip()) if item]
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+
+    out: list[float] = []
+    for item in raw_items:
+        try:
+            parsed = float(item)
+        except (TypeError, ValueError):
+            continue
+        if parsed <= 0:
+            continue
+        parsed = max(minimum, min(parsed, maximum))
+        out.append(parsed)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _musetalk_window_sequence_setting(
+    explicit_value,
+    profile_defaults: dict,
+    profile_key: str,
+    preset: str,
+    preset_key: str,
+    env_name: str,
+    fallback,
+    *,
+    minimum: float,
+    maximum: float,
+    max_items: int = 12,
+) -> list[float]:
+    value = explicit_value
+    if value is None:
+        if profile_key in profile_defaults:
+            value = profile_defaults.get(profile_key)
+        else:
+            preset_value = _musetalk_preset_value(preset, preset_key)
+            value = preset_value if preset_value is not None else os.getenv(env_name)
+    parsed = _parse_musetalk_window_secs(value, minimum=minimum, maximum=maximum, max_items=max_items)
+    if parsed:
+        return parsed
+    return _parse_musetalk_window_secs(fallback, minimum=minimum, maximum=maximum, max_items=max_items)
+
+
 def _musetalk_profile_float_setting(
     explicit_value: float | int | None,
     profile_defaults: dict,
@@ -436,6 +507,7 @@ _active_stream_lock = threading.Lock()
 _active_stream_stop_events: set[threading.Event] = set()
 _active_warmup_stop_events: set[threading.Event] = set()
 _warmup_profile_lock = threading.Lock()
+_runtime_settings_lock = threading.Lock()
 _runtime_cleanup_thread_started = False
 
 
@@ -958,6 +1030,48 @@ def _generate_with_seed(
     return audio
 
 
+def _terminate_process_tree(process: subprocess.Popen, op_name: str) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            process.terminate()
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=5)
+        logger.info(
+            "component=backend op=%s status=terminated pid=%s",
+            op_name,
+            process.pid,
+        )
+        return
+    except Exception:
+        logger.debug(
+            "component=backend op=%s status=terminate_error pid=%s",
+            op_name,
+            process.pid,
+            exc_info=True,
+        )
+    try:
+        if os.name == "nt":
+            process.kill()
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+        logger.info(
+            "component=backend op=%s status=killed pid=%s",
+            op_name,
+            process.pid,
+        )
+    except Exception:
+        logger.warning(
+            "component=backend op=%s status=kill_error pid=%s",
+            op_name,
+            process.pid,
+            exc_info=True,
+        )
+
+
 def _stream_subprocess(command: list[str], cwd: Path) -> Iterator[str]:
     process = subprocess.Popen(
         command,
@@ -966,22 +1080,26 @@ def _stream_subprocess(command: list[str], cwd: Path) -> Iterator[str]:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=(os.name != "nt"),
     )
-    assert process.stdout is not None
-    for line in process.stdout:
-        yield f"{line.rstrip()}\n"
-    exit_code = process.wait()
-    if exit_code != 0:
-        logger.error(
-            "component=backend op=subprocess_stream status=error exit_code=%s cwd=%s cmd=%s",
-            exit_code,
-            cwd,
-            command,
-        )
-        yield f"[process exited {exit_code}]\n"
-        yield "ERROR: Subprocess failed. See logs above for details.\n"
-    else:
-        yield f"[process exited {exit_code}]\n"
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            yield f"{line.rstrip()}\n"
+        exit_code = process.wait()
+        if exit_code != 0:
+            logger.error(
+                "component=backend op=subprocess_stream status=error exit_code=%s cwd=%s cmd=%s",
+                exit_code,
+                cwd,
+                command,
+            )
+            yield f"[process exited {exit_code}]\n"
+            yield "ERROR: Subprocess failed. See logs above for details.\n"
+        else:
+            yield f"[process exited {exit_code}]\n"
+    finally:
+        _terminate_process_tree(process, "subprocess_stream")
 
 
 def _resolve_path(base_dir: Path, value: str | None) -> Path | None:
@@ -1211,6 +1329,72 @@ def _profile_paths(profile_name: str, profile_type: str) -> list[Path]:
         seen.add(key)
         deduped.append(path)
     return deduped
+
+
+def _profile_json_path_for_runtime_settings(profile_name: str, profile_type: str) -> Path:
+    return resolve_training_dir(profile_name, profile_type) / "profile.json"
+
+
+def _read_profile_json(profile_name: str, profile_type: str) -> tuple[Path, dict[str, Any]]:
+    path = _profile_json_path_for_runtime_settings(profile_name, profile_type)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Profile model not found")
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"Profile JSON is invalid: {path}") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail=f"Profile JSON must contain an object: {path}")
+    return path, data
+
+
+def _clamp_runtime_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    parsed = max(minimum, min(maximum, parsed))
+    return round(parsed, 3)
+
+
+def _normalize_runtime_settings(settings: Any) -> dict[str, Any]:
+    if not isinstance(settings, dict):
+        return {}
+    normalized: dict[str, Any] = {}
+    controls = settings.get("voice_controls")
+    if isinstance(controls, dict):
+        normalized["voice_controls"] = {
+            "pitch": _clamp_runtime_float(controls.get("pitch"), 0.0, -4.0, 4.0),
+            "pace": int(round(_clamp_runtime_float(controls.get("pace"), 0.0, -100.0, 100.0))),
+            "tone": int(round(_clamp_runtime_float(controls.get("tone"), 0.0, -100.0, 100.0))),
+            "volume": int(round(_clamp_runtime_float(controls.get("volume"), 0.0, -100.0, 100.0))),
+        }
+    return normalized
+
+
+def _load_profile_runtime_settings(profile_name: str, profile_type: str) -> dict[str, Any]:
+    try:
+        _path, data = _read_profile_json(profile_name, profile_type)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return {}
+        raise
+    return _normalize_runtime_settings(data.get(RUNTIME_SETTINGS_KEY))
+
+
+def _save_profile_runtime_settings(
+    profile_name: str,
+    profile_type: str,
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    with _runtime_settings_lock:
+        path, data = _read_profile_json(profile_name, profile_type)
+        normalized = _normalize_runtime_settings(settings)
+        data[RUNTIME_SETTINGS_KEY] = normalized
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        tmp_path.replace(path)
+        return normalized
 
 
 def _rewrite_profile_refs_in_dir(
@@ -1857,6 +2041,79 @@ def _stream_avatar_from_text_iter(
             minimum=0,
             maximum=8,
         )
+    musetalk_adaptive_window_sec = 0.0
+    musetalk_adaptive_window_secs: list[float] = []
+    musetalk_adaptive_window_chunks = 0
+    musetalk_adaptive_min_lookahead_sec = 0.0
+    if is_musetalk:
+        default_adaptive_window_sec = float(
+            profile_defaults.get(
+                "musetalk_adaptive_window_sec",
+                _musetalk_preset_value(musetalk_preset, "adaptive_window_sec")
+                or os.getenv("MUSE_TALK_ADAPTIVE_WINDOW_SEC", "0.0"),
+            )
+        )
+        musetalk_adaptive_window_sec = _musetalk_float_setting(
+            req.musetalk_adaptive_window_sec,
+            musetalk_preset,
+            "adaptive_window_sec",
+            default_adaptive_window_sec,
+            minimum=0.0,
+            maximum=3.0,
+        )
+        if musetalk_window_sec > 0 and musetalk_adaptive_window_sec > 0:
+            musetalk_adaptive_window_sec = min(
+                float(musetalk_adaptive_window_sec),
+                float(musetalk_window_sec),
+            )
+        musetalk_adaptive_window_secs = _musetalk_window_sequence_setting(
+            req.musetalk_adaptive_window_secs,
+            profile_defaults,
+            "musetalk_adaptive_window_secs",
+            musetalk_preset,
+            "adaptive_window_secs",
+            "MUSE_TALK_ADAPTIVE_WINDOW_SECS",
+            [],
+            minimum=0.2,
+            maximum=max(0.2, float(musetalk_window_sec or 3.0)),
+            max_items=12,
+        )
+        default_adaptive_window_chunks = int(
+            profile_defaults.get(
+                "musetalk_adaptive_window_chunks",
+                _musetalk_preset_value(musetalk_preset, "adaptive_window_chunks")
+                or os.getenv("MUSE_TALK_ADAPTIVE_WINDOW_CHUNKS", "0"),
+            )
+        )
+        musetalk_adaptive_window_chunks = _musetalk_int_setting(
+            req.musetalk_adaptive_window_chunks,
+            musetalk_preset,
+            "adaptive_window_chunks",
+            default_adaptive_window_chunks,
+            minimum=0,
+            maximum=12,
+        )
+        if not musetalk_adaptive_window_secs and musetalk_adaptive_window_sec > 0 and musetalk_adaptive_window_chunks > 0:
+            musetalk_adaptive_window_secs = [
+                float(musetalk_adaptive_window_sec)
+            ] * musetalk_adaptive_window_chunks
+        elif musetalk_adaptive_window_secs:
+            musetalk_adaptive_window_chunks = len(musetalk_adaptive_window_secs)
+        default_adaptive_min_lookahead_sec = float(
+            profile_defaults.get(
+                "musetalk_adaptive_min_lookahead_sec",
+                _musetalk_preset_value(musetalk_preset, "adaptive_min_lookahead_sec")
+                or os.getenv("MUSE_TALK_ADAPTIVE_MIN_LOOKAHEAD_SEC", "0.0"),
+            )
+        )
+        musetalk_adaptive_min_lookahead_sec = _musetalk_float_setting(
+            req.musetalk_adaptive_min_lookahead_sec,
+            musetalk_preset,
+            "adaptive_min_lookahead_sec",
+            default_adaptive_min_lookahead_sec,
+            minimum=0.0,
+            maximum=0.8,
+        )
     musetalk_lookahead_sec = 0.0
     if is_musetalk:
         default_lookahead_sec = float(
@@ -1925,7 +2182,7 @@ def _stream_avatar_from_text_iter(
         except (TypeError, ValueError):
             musetalk_frame_crossfade = 0
     logger.info(
-        "component=stream op=avatar_stream_config profile=%s backend=%s mobile=%s web=%s preset=%s coord_source=%s fps=%.2f max_chars=%s max_words=%s infer_fps=%s window_sec=%s first_window_sec=%s startup_window_sec=%s startup_window_chunks=%s lookahead_sec=%s temporal_smooth=%s frame_crossfade=%s face_scale=%s detail_sharpen=%s color_match=%s first_chunk_chars=%s jpeg_quality=%s max_frame_edge=%s audio_format=%s",
+        "component=stream op=avatar_stream_config profile=%s backend=%s mobile=%s web=%s preset=%s coord_source=%s fps=%.2f max_chars=%s max_words=%s infer_fps=%s window_sec=%s first_window_sec=%s startup_window_sec=%s startup_window_chunks=%s adaptive_window_secs=%s adaptive_min_lookahead_sec=%s lookahead_sec=%s temporal_smooth=%s frame_crossfade=%s face_scale=%s detail_sharpen=%s color_match=%s first_chunk_chars=%s jpeg_quality=%s max_frame_edge=%s audio_format=%s",
         profile,
         req.lipsync_backend or "default",
         mobile_profile,
@@ -1940,6 +2197,8 @@ def _stream_avatar_from_text_iter(
         round(float(musetalk_first_window_sec), 3) if is_musetalk else "n/a",
         round(float(musetalk_startup_window_sec), 3) if is_musetalk else "n/a",
         musetalk_startup_window_chunks if is_musetalk else "n/a",
+        ",".join(f"{sec:.2f}" for sec in musetalk_adaptive_window_secs) if is_musetalk else "n/a",
+        round(float(musetalk_adaptive_min_lookahead_sec), 3) if is_musetalk else "n/a",
         round(float(musetalk_lookahead_sec), 3) if is_musetalk else "n/a",
         round(float(getattr(lipsync, "temporal_smooth", 0.0)), 3) if is_musetalk else "n/a",
         musetalk_frame_crossfade if is_musetalk else "n/a",
@@ -2132,6 +2391,10 @@ def _stream_avatar_from_text_iter(
         first_window_tgt_samples = 0
         startup_window_src_samples = 0
         startup_window_tgt_samples = 0
+        adaptive_window_src_samples: list[int] = []
+        adaptive_window_tgt_samples: list[int] = []
+        adaptive_min_lookahead_src_samples = 0
+        adaptive_min_lookahead_tgt_samples = 0
         lookahead_src_samples = 0
         lookahead_tgt_samples = 0
         pending_audio = np.zeros(0, dtype=np.float32)
@@ -2270,6 +2533,98 @@ def _stream_avatar_from_text_iter(
                 ) + "\n"
             emit_index += 1
 
+        def _emit_ready_musetalk_windows(*, allow_adaptive: bool) -> Iterator[str | bytes]:
+            nonlocal pending_audio, pending_audio_16k
+            if not is_musetalk or window_src_samples <= 0 or window_tgt_samples <= 0:
+                return
+            while True:
+                emit_src_samples = window_src_samples
+                emit_tgt_samples = window_tgt_samples
+                adaptive_selected = False
+                if emit_index == 0 and first_window_src_samples > 0 and first_window_tgt_samples > 0:
+                    emit_src_samples = first_window_src_samples
+                    emit_tgt_samples = first_window_tgt_samples
+                elif (
+                    0 < emit_index <= musetalk_startup_window_chunks
+                    and startup_window_src_samples > 0
+                    and startup_window_tgt_samples > 0
+                ):
+                    emit_src_samples = startup_window_src_samples
+                    emit_tgt_samples = startup_window_tgt_samples
+                elif (
+                    (
+                        allow_adaptive
+                        or (
+                            musetalk_adaptive_window_chunks > 0
+                            and emit_index <= musetalk_startup_window_chunks + musetalk_adaptive_window_chunks
+                        )
+                    )
+                    and adaptive_window_src_samples
+                    and adaptive_window_tgt_samples
+                ):
+                    full_ready = (
+                        pending_audio.size >= window_src_samples + lookahead_src_samples
+                        and pending_audio_16k.size >= window_tgt_samples + lookahead_tgt_samples
+                    )
+                    adaptive_index = max(0, emit_index - musetalk_startup_window_chunks - 1)
+                    force_adaptive = 0 <= adaptive_index < len(adaptive_window_src_samples)
+                    selected_adaptive_index = adaptive_index if force_adaptive else None
+                    if selected_adaptive_index is None and not full_ready:
+                        min_lookahead_src = min(adaptive_min_lookahead_src_samples, lookahead_src_samples)
+                        min_lookahead_tgt = min(adaptive_min_lookahead_tgt_samples, lookahead_tgt_samples)
+                        for candidate_index in range(len(adaptive_window_src_samples) - 1, -1, -1):
+                            if (
+                                pending_audio.size >= adaptive_window_src_samples[candidate_index] + min_lookahead_src
+                                and pending_audio_16k.size >= adaptive_window_tgt_samples[candidate_index] + min_lookahead_tgt
+                            ):
+                                selected_adaptive_index = candidate_index
+                                break
+                    force_adaptive = (
+                        selected_adaptive_index is not None
+                        and 0 <= adaptive_index < len(adaptive_window_src_samples)
+                    )
+                    if selected_adaptive_index is not None and (force_adaptive or not full_ready):
+                        emit_src_samples = adaptive_window_src_samples[selected_adaptive_index]
+                        emit_tgt_samples = adaptive_window_tgt_samples[selected_adaptive_index]
+                        adaptive_selected = True
+
+                if (
+                    pending_audio.size < emit_src_samples
+                    or pending_audio_16k.size < emit_tgt_samples
+                ):
+                    break
+
+                lookahead_16k = None
+                if lookahead_tgt_samples > 0:
+                    available_lookahead_src = max(0, pending_audio.size - emit_src_samples)
+                    available_lookahead_tgt = max(0, pending_audio_16k.size - emit_tgt_samples)
+                    min_lookahead_src = (
+                        min(adaptive_min_lookahead_src_samples, lookahead_src_samples)
+                        if adaptive_selected
+                        else lookahead_src_samples
+                    )
+                    min_lookahead_tgt = (
+                        min(adaptive_min_lookahead_tgt_samples, lookahead_tgt_samples)
+                        if adaptive_selected
+                        else lookahead_tgt_samples
+                    )
+                    if (
+                        available_lookahead_src < min_lookahead_src
+                        or available_lookahead_tgt < min_lookahead_tgt
+                    ):
+                        break
+                    use_lookahead_tgt = min(lookahead_tgt_samples, available_lookahead_tgt)
+                    if use_lookahead_tgt > 0:
+                        lookahead_16k = pending_audio_16k[
+                            emit_tgt_samples : emit_tgt_samples + use_lookahead_tgt
+                        ]
+
+                sub_audio = pending_audio[:emit_src_samples]
+                sub_audio_16k = pending_audio_16k[:emit_tgt_samples]
+                pending_audio = pending_audio[emit_src_samples:]
+                pending_audio_16k = pending_audio_16k[emit_tgt_samples:]
+                yield from _emit_one(sub_audio, sub_audio_16k, lookahead_16k=lookahead_16k)
+
         try:
             engine = engine_cm.__enter__()
             pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
@@ -2295,6 +2650,30 @@ def _stream_avatar_from_text_iter(
                     )
                     startup_window_src_samples = min(startup_window_src_samples, window_src_samples)
                     startup_window_tgt_samples = min(startup_window_tgt_samples, window_tgt_samples)
+                if musetalk_adaptive_window_secs:
+                    adaptive_window_src_samples = [
+                        min(
+                            max(1, int(round(engine.sample_rate * window_sec))),
+                            window_src_samples,
+                        )
+                        for window_sec in musetalk_adaptive_window_secs
+                    ]
+                    adaptive_window_tgt_samples = [
+                        min(
+                            max(1, int(round(16000.0 * window_sec))),
+                            window_tgt_samples,
+                        )
+                        for window_sec in musetalk_adaptive_window_secs
+                    ]
+                    if musetalk_adaptive_min_lookahead_sec > 0:
+                        adaptive_min_lookahead_src_samples = max(
+                            0,
+                            int(round(engine.sample_rate * musetalk_adaptive_min_lookahead_sec)),
+                        )
+                        adaptive_min_lookahead_tgt_samples = max(
+                            0,
+                            int(round(16000.0 * musetalk_adaptive_min_lookahead_sec)),
+                        )
             if is_musetalk and musetalk_lookahead_sec > 0:
                 lookahead_src_samples = max(0, int(round(engine.sample_rate * musetalk_lookahead_sec)))
                 lookahead_tgt_samples = max(0, int(round(16000.0 * musetalk_lookahead_sec)))
@@ -2304,8 +2683,10 @@ def _stream_avatar_from_text_iter(
             audio_worker_thread.start()
             while True:
                 try:
-                    kind, idx, audio, audio_16k = result_queue.get(timeout=0.2)
+                    kind, idx, audio, audio_16k = result_queue.get(timeout=0.05 if is_musetalk else 0.2)
                 except queue.Empty:
+                    if is_musetalk and pending_audio.size and pending_audio_16k.size:
+                        yield from _emit_ready_musetalk_windows(allow_adaptive=True)
                     if stop_event.is_set():
                         break
                     continue
@@ -2333,39 +2714,7 @@ def _stream_avatar_from_text_iter(
                     pending_audio_16k = np.concatenate(
                         [pending_audio_16k, audio_16k.astype(np.float32, copy=False)]
                     )
-                    while True:
-                        emit_src_samples = window_src_samples
-                        emit_tgt_samples = window_tgt_samples
-                        if emit_index == 0 and first_window_src_samples > 0 and first_window_tgt_samples > 0:
-                            emit_src_samples = first_window_src_samples
-                            emit_tgt_samples = first_window_tgt_samples
-                        elif (
-                            0 < emit_index <= musetalk_startup_window_chunks
-                            and startup_window_src_samples > 0
-                            and startup_window_tgt_samples > 0
-                        ):
-                            emit_src_samples = startup_window_src_samples
-                            emit_tgt_samples = startup_window_tgt_samples
-                        if (
-                            pending_audio.size < emit_src_samples
-                            or pending_audio_16k.size < emit_tgt_samples
-                        ):
-                            break
-                        lookahead_16k = None
-                        if lookahead_tgt_samples > 0:
-                            if (
-                                pending_audio.size < (emit_src_samples + lookahead_src_samples)
-                                or pending_audio_16k.size < (emit_tgt_samples + lookahead_tgt_samples)
-                            ):
-                                break
-                            lookahead_16k = pending_audio_16k[
-                                emit_tgt_samples : emit_tgt_samples + lookahead_tgt_samples
-                            ]
-                        sub_audio = pending_audio[:emit_src_samples]
-                        sub_audio_16k = pending_audio_16k[:emit_tgt_samples]
-                        pending_audio = pending_audio[emit_src_samples:]
-                        pending_audio_16k = pending_audio_16k[emit_tgt_samples:]
-                        yield from _emit_one(sub_audio, sub_audio_16k, lookahead_16k=lookahead_16k)
+                    yield from _emit_ready_musetalk_windows(allow_adaptive=False)
                 else:
                     yield from _emit_one(audio, audio_16k)
         except Exception:
@@ -2494,172 +2843,254 @@ def _stream_voice_from_text_iter(
         stop_event = threading.Event()
         _register_stream_stop_event(stop_event)
         resolved_text_iter = text_iter(stop_event) if callable(text_iter) else text_iter
-        idx = 0
-        tts_chunk_index = 0
+        result_queue: queue.Queue[tuple[str, dict[str, object] | str | None, bytes | None]] = queue.Queue(
+            maxsize=3
+        )
+        sentence_queue: queue.Queue[str | None] = queue.Queue(maxsize=10)
         engine_cm = _acquire_engine(model_path, config_path)
         engine: StyleTTS2RepoEngine | None = None
+        stitcher: AudioStitcher | None = None
         interrupted_before_cleanup = False
+
+        def _put_result(
+            kind: str,
+            metadata_or_detail: dict[str, object] | str | None = None,
+            payload: bytes | None = None,
+        ) -> None:
+            while not stop_event.is_set():
+                try:
+                    result_queue.put((kind, metadata_or_detail, payload), timeout=0.2)
+                    return
+                except queue.Full:
+                    continue
+
+        def _sentence_reader() -> None:
+            try:
+                for sentence in resolved_text_iter:
+                    if stop_event.is_set():
+                        break
+                    while not stop_event.is_set():
+                        try:
+                            sentence_queue.put(sentence, timeout=0.2)
+                            break
+                        except queue.Full:
+                            continue
+            except Exception:
+                if not stop_event.is_set():
+                    logger.exception("Voice text stream failed")
+                    _put_result("error", traceback.format_exc(), None)
+            finally:
+                while True:
+                    try:
+                        sentence_queue.put(None, timeout=0.2)
+                        break
+                    except queue.Full:
+                        if stop_event.is_set():
+                            break
+                        continue
+
+        def _build_audio_packet(
+            idx: int,
+            stitched: np.ndarray,
+        ) -> tuple[dict[str, object], bytes] | None:
+            if engine is None:
+                raise RuntimeError("TTS engine is not ready.")
+            if stitched.size < _min_stream_audio_samples(engine.sample_rate):
+                return None
+            emit_started = time.perf_counter()
+            audio_bytes, audio_metadata = _audio_bytes_for_stream(
+                stitched,
+                engine.sample_rate,
+                binary_audio_format if binary_transport else "wav",
+            )
+            duration_sec = float(len(stitched) / engine.sample_rate) if stitched.size else 0.0
+            logger.info(
+                "component=stream op=voice_chunk status=emit chunk=%s audio_encode_ms=%.1f total_emit_ms=%.1f duration_ms=%.1f bytes=%s",
+                idx,
+                (time.perf_counter() - emit_started) * 1000.0,
+                (time.perf_counter() - emit_started) * 1000.0,
+                duration_sec * 1000.0,
+                len(audio_bytes),
+            )
+            metadata = {
+                "event": "chunk",
+                "chunk_index": idx,
+                "sample_rate": engine.sample_rate,
+                "duration_sec": round(duration_sec, 6),
+                "audio_bytes_len": len(audio_bytes),
+                "frame_lengths": [],
+                **audio_metadata,
+            }
+            return metadata, audio_bytes
+
+        def _audio_worker() -> None:
+            idx = 0
+            tts_chunk_index = 0
+            try:
+                if engine is None or stitcher is None:
+                    raise RuntimeError("TTS engine is not ready.")
+                pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
+                comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
+                comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
+                if seed is not None:
+                    _seed_everything(seed)
+                while not stop_event.is_set():
+                    try:
+                        sentence = sentence_queue.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    if sentence is None:
+                        break
+                    clean_sentence = clean_text_for_tts(sentence)
+                    if not re.search(r"[A-Za-z0-9]", clean_sentence):
+                        continue
+                    sentence_ref = ref_wav_path
+                    sentence_chunks = _plan_stream_tts_chunks(
+                        clean_sentence,
+                        max_chars=max_chars,
+                        max_words=max_words,
+                        is_first_global_chunk=(tts_chunk_index == 0),
+                        prefer_prosody_fallback=mobile_profile,
+                    )
+                    for chunk in sentence_chunks:
+                        if stop_event.is_set():
+                            return
+                        punctuation_source = chunk.rstrip()
+                        is_first_tts_chunk = tts_chunk_index == 0
+                        tts_text = _stream_tts_text(
+                            chunk,
+                            bool(pad_text),
+                            pad_text_token,
+                            is_first_tts_chunk,
+                        )
+                        future = _AI_EXECUTOR.submit(
+                            _generate_with_seed,
+                            engine,
+                            seed,
+                            tts_text,
+                            sentence_ref,
+                            params["alpha"],
+                            params["beta"],
+                            params["diffusion_steps"],
+                            params["embedding_scale"],
+                            params["f0_scale"],
+                            phonemizer_lang,
+                            lexicon,
+                            False,
+                            stop_event,
+                        )
+                        tts_started = time.perf_counter()
+                        while True:
+                            if stop_event.is_set():
+                                future.cancel()
+                                return
+                            try:
+                                audio = future.result(timeout=0.2)
+                                break
+                            except _GenerationCancelled:
+                                return
+                            except FutureTimeoutError:
+                                continue
+                        tts_chunk_index += 1
+                        if stop_event.is_set():
+                            return
+                        logger.info(
+                            "component=stream op=voice_tts_chunk status=generated chunk=%s elapsed_ms=%.1f chars=%s first=%s",
+                            tts_chunk_index - 1,
+                            (time.perf_counter() - tts_started) * 1000.0,
+                            len(tts_text),
+                            is_first_tts_chunk,
+                        )
+                        if audio is None or audio.size == 0:
+                            continue
+                        audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+                        if is_first_tts_chunk and stream_start_trim_db > 0:
+                            audio = _trim_first_stream_chunk_start(
+                                audio,
+                                engine.sample_rate,
+                                float(stream_start_trim_db),
+                                float(stream_start_trim_pad_ms),
+                                float(stream_start_trim_max_ms),
+                            )
+                        if smart_trim_db and smart_trim_db > 0:
+                            audio = _smart_vad_trim(
+                                audio,
+                                engine.sample_rate,
+                                top_db=float(smart_trim_db),
+                                pad_ms=float(smart_trim_pad_ms),
+                            )
+                        audio = _apply_audio_controls(audio, engine.sample_rate, req, profile)
+                        audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
+                        suffix = punctuation_source
+                        if suffix.endswith((".", "!", "?")) and pause.size:
+                            audio = np.concatenate([audio, pause])
+                        elif suffix.endswith((",", ";", ":")) and comma_pause.size:
+                            audio = np.concatenate([audio, comma_pause])
+                        stitched = stitcher.process(audio)
+                        if stop_event.is_set():
+                            return
+                        if stitched.size:
+                            packet = _build_audio_packet(idx, stitched)
+                            if packet is not None:
+                                metadata, audio_bytes = packet
+                                _put_result("chunk", metadata, audio_bytes)
+                                idx += 1
+                tail = stitcher.flush()
+                if tail.size and not stop_event.is_set():
+                    packet = _build_audio_packet(idx, tail)
+                    if packet is not None:
+                        metadata, audio_bytes = packet
+                        _put_result("chunk", metadata, audio_bytes)
+                        idx += 1
+                _put_result("done", None, None)
+            except Exception:
+                if stop_event.is_set():
+                    return
+                logger.exception("Voice audio worker failed")
+                _put_result("error", traceback.format_exc(), None)
+
+        sentence_reader_thread: threading.Thread | None = None
+        audio_worker_thread: threading.Thread | None = None
+
         try:
             engine = engine_cm.__enter__()
-            pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
-            comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
-            comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
             stitcher = AudioStitcher(sample_rate=engine.sample_rate, fade_len_ms=15.0)
-            min_emit_samples = _min_stream_audio_samples(engine.sample_rate)
-            if seed is not None:
-                _seed_everything(seed)
-            for sentence in resolved_text_iter:
+            sentence_reader_thread = threading.Thread(target=_sentence_reader, daemon=True)
+            audio_worker_thread = threading.Thread(target=_audio_worker, daemon=True)
+            sentence_reader_thread.start()
+            audio_worker_thread.start()
+            while True:
+                try:
+                    kind, metadata_or_detail, payload = result_queue.get(timeout=0.2)
+                except queue.Empty:
+                    if stop_event.is_set():
+                        break
+                    continue
                 if stop_event.is_set():
                     break
-                clean_sentence = clean_text_for_tts(sentence)
-                sentence_ref = ref_wav_path
-                sentence_chunks = _plan_stream_tts_chunks(
-                    clean_sentence,
-                    max_chars=max_chars,
-                    max_words=max_words,
-                    is_first_global_chunk=(tts_chunk_index == 0),
-                    prefer_prosody_fallback=mobile_profile,
-                )
-                for chunk in sentence_chunks:
-                    if stop_event.is_set():
-                        break
-                    punctuation_source = chunk.rstrip()
-                    is_first_tts_chunk = tts_chunk_index == 0
-                    tts_text = _stream_tts_text(
-                        chunk,
-                        bool(pad_text),
-                        pad_text_token,
-                        is_first_tts_chunk,
-                    )
-                    chunk_seed = seed
-                    tts_started = time.perf_counter()
-                    audio = engine.generate(
-                        tts_text,
-                        ref_wav_path=sentence_ref,
-                        alpha=params["alpha"],
-                        beta=params["beta"],
-                        diffusion_steps=params["diffusion_steps"],
-                        embedding_scale=params["embedding_scale"],
-                        f0_scale=params["f0_scale"],
-                        phonemizer_lang=phonemizer_lang,
-                        lexicon=lexicon,
-                        seed=chunk_seed,
-                        cancel_event=stop_event,
-                    )
-                    if stop_event.is_set():
-                        break
-                    tts_chunk_index += 1
-                    logger.info(
-                        "component=stream op=voice_tts_chunk status=generated chunk=%s elapsed_ms=%.1f chars=%s first=%s",
-                        tts_chunk_index - 1,
-                        (time.perf_counter() - tts_started) * 1000.0,
-                        len(tts_text),
-                        is_first_tts_chunk,
-                    )
-                    if audio is None or audio.size == 0:
-                        continue
-                    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
-                    if is_first_tts_chunk and stream_start_trim_db > 0:
-                        audio = _trim_first_stream_chunk_start(
-                            audio,
-                            engine.sample_rate,
-                            float(stream_start_trim_db),
-                            float(stream_start_trim_pad_ms),
-                            float(stream_start_trim_max_ms),
-                        )
-                    if smart_trim_db and smart_trim_db > 0:
-                        audio = _smart_vad_trim(
-                            audio,
-                            engine.sample_rate,
-                            top_db=float(smart_trim_db),
-                            pad_ms=float(smart_trim_pad_ms),
-                    )
-                    audio = _apply_audio_controls(audio, engine.sample_rate, req, profile)
-                    audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
-                    suffix = punctuation_source
-                    if suffix.endswith((".", "!", "?")) and pause.size:
-                        audio = np.concatenate([audio, pause])
-                    elif suffix.endswith((",", ";", ":")) and comma_pause.size:
-                        audio = np.concatenate([audio, comma_pause])
-                    stitched = stitcher.process(audio)
-                    if stitched.size:
-                        emit_started = time.perf_counter()
-                        audio_bytes, audio_metadata = _audio_bytes_for_stream(
-                            stitched,
-                            engine.sample_rate,
-                            binary_audio_format if binary_transport else "wav",
-                        )
-                        if stop_event.is_set():
-                            break
-                        duration_sec = (
-                            float(len(stitched) / engine.sample_rate) if stitched.size else 0.0
-                        )
-                        logger.info(
-                            "component=stream op=voice_chunk status=emit chunk=%s audio_encode_ms=%.1f total_emit_ms=%.1f duration_ms=%.1f bytes=%s",
-                            idx,
-                            (time.perf_counter() - emit_started) * 1000.0,
-                            (time.perf_counter() - emit_started) * 1000.0,
-                            duration_sec * 1000.0,
-                            len(audio_bytes),
-                        )
-                        if stop_event.is_set():
-                            break
-                        if binary_transport:
-                            yield _pack_binary_stream_packet(
-                                {
-                                    "event": "chunk",
-                                    "chunk_index": idx,
-                                    "sample_rate": engine.sample_rate,
-                                    "duration_sec": round(duration_sec, 6),
-                                    "audio_bytes_len": len(audio_bytes),
-                                    "frame_lengths": [],
-                                    **audio_metadata,
-                                },
-                                audio_bytes,
-                            )
-                        else:
-                            payload = base64.b64encode(audio_bytes).decode("ascii")
-                            yield json.dumps(
-                                {
-                                    "chunk_index": idx,
-                                    "audio_base64": payload,
-                                    "sample_rate": engine.sample_rate,
-                                    "duration_sec": round(duration_sec, 6),
-                                }
-                            ) + "\n"
-                        idx += 1
-            tail = stitcher.flush()
-            if not stop_event.is_set() and tail.size >= min_emit_samples:
-                audio_bytes, audio_metadata = _audio_bytes_for_stream(
-                    tail,
-                    engine.sample_rate,
-                    binary_audio_format if binary_transport else "wav",
-                )
-                duration_sec = float(len(tail) / engine.sample_rate) if tail.size else 0.0
+                if kind == "error":
+                    detail = str(metadata_or_detail or "Voice stream failed.")
+                    if binary_transport:
+                        yield _pack_binary_stream_packet({"event": "error", "detail": detail})
+                    else:
+                        yield json.dumps({"event": "error", "detail": detail}) + "\n"
+                    return
+                if kind == "done":
+                    break
+                if kind != "chunk" or not isinstance(metadata_or_detail, dict):
+                    continue
                 if binary_transport:
-                    yield _pack_binary_stream_packet(
-                        {
-                            "event": "chunk",
-                            "chunk_index": idx,
-                            "sample_rate": engine.sample_rate,
-                            "duration_sec": round(duration_sec, 6),
-                            "audio_bytes_len": len(audio_bytes),
-                            "frame_lengths": [],
-                            **audio_metadata,
-                        },
-                        audio_bytes,
-                    )
+                    yield _pack_binary_stream_packet(metadata_or_detail, payload or b"")
                 else:
-                    payload = base64.b64encode(audio_bytes).decode("ascii")
+                    audio_bytes = payload or b""
                     yield json.dumps(
                         {
-                            "chunk_index": idx,
-                            "audio_base64": payload,
-                            "sample_rate": engine.sample_rate,
-                            "duration_sec": round(duration_sec, 6),
+                            "chunk_index": metadata_or_detail.get("chunk_index", 0),
+                            "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+                            "sample_rate": metadata_or_detail.get("sample_rate", engine.sample_rate),
+                            "duration_sec": metadata_or_detail.get("duration_sec", 0.0),
                         }
                     ) + "\n"
-                idx += 1
         except Exception:
             if stop_event.is_set():
                 return
@@ -2679,6 +3110,12 @@ def _stream_voice_from_text_iter(
                 close_text_iter = getattr(resolved_text_iter, "close", None)
                 if callable(close_text_iter):
                     close_text_iter()
+            with contextlib.suppress(Exception):
+                if sentence_reader_thread is not None:
+                    sentence_reader_thread.join(timeout=0.5)
+            with contextlib.suppress(Exception):
+                if audio_worker_thread is not None:
+                    audio_worker_thread.join(timeout=0.5)
             _unregister_stream_stop_event(stop_event)
 
         if interrupted_before_cleanup:
@@ -2742,6 +3179,10 @@ class GenerateRequest(BaseModel):
     musetalk_first_window_sec: float | None = None
     musetalk_startup_window_sec: float | None = None
     musetalk_startup_window_chunks: int | None = None
+    musetalk_adaptive_window_sec: float | None = None
+    musetalk_adaptive_window_secs: list[float] | str | None = None
+    musetalk_adaptive_window_chunks: int | None = None
+    musetalk_adaptive_min_lookahead_sec: float | None = None
     musetalk_lookahead_sec: float | None = None
     musetalk_jpeg_quality: int | None = None
     musetalk_face_scale: float | None = None
@@ -2805,9 +3246,18 @@ class WarmupRequest(BaseModel):
     musetalk_first_window_sec: float | None = None
     musetalk_startup_window_sec: float | None = None
     musetalk_startup_window_chunks: int | None = None
+    musetalk_adaptive_window_sec: float | None = None
+    musetalk_adaptive_window_secs: list[float] | str | None = None
+    musetalk_adaptive_window_chunks: int | None = None
+    musetalk_adaptive_min_lookahead_sec: float | None = None
     musetalk_lookahead_sec: float | None = None
     musetalk_temporal_smooth: float | None = None
     musetalk_coord_source: str | None = None
+
+
+class ProfileRuntimeSettingsRequest(BaseModel):
+    profile_type: str | None = None
+    voice_controls: dict[str, float | int] | None = None
 
 
 class ProfileRenameRequest(BaseModel):
@@ -3043,11 +3493,10 @@ class StyleTTS2RepoEngine:
                 if key in word_entries:
                     parts.append(word_entries[key])
                 else:
-                    base_pronunciation = lookup_base_pronunciation(token)
-                    if base_pronunciation:
-                        parts.append(base_pronunciation)
-                    else:
-                        parts.append(phonemizer.phonemize([token])[0].strip())
+                    # Runtime fallback should match the eSpeak-style profile
+                    # lexicons. Broad CMU fallback changes vowel/r-coloring and
+                    # can noticeably shift the trained voice character.
+                    parts.append(phonemizer.phonemize([token])[0].strip())
             else:
                 parts.append(token)
             idx = match.end()
@@ -3696,6 +4145,10 @@ def _warmup_lipsync(
     musetalk_first_window_sec: float | None = None,
     musetalk_startup_window_sec: float | None = None,
     musetalk_startup_window_chunks: int | None = None,
+    musetalk_adaptive_window_sec: float | None = None,
+    musetalk_adaptive_window_secs: list[float] | str | None = None,
+    musetalk_adaptive_window_chunks: int | None = None,
+    musetalk_adaptive_min_lookahead_sec: float | None = None,
     musetalk_lookahead_sec: float | None = None,
     musetalk_temporal_smooth: float | None = None,
     musetalk_coord_source: str | None = None,
@@ -3792,6 +4245,40 @@ def _warmup_lipsync(
                     if window_sec > 0:
                         first_window_sec = min(first_window_sec, window_sec)
                         startup_window_sec = min(startup_window_sec, window_sec)
+                    adaptive_window_sec = _musetalk_float_setting(
+                        musetalk_adaptive_window_sec,
+                        resolved_musetalk_preset,
+                        "adaptive_window_sec",
+                        0.0,
+                        minimum=0.0,
+                        maximum=3.0,
+                    )
+                    if window_sec > 0 and adaptive_window_sec > 0:
+                        adaptive_window_sec = min(adaptive_window_sec, window_sec)
+                    adaptive_window_secs = _musetalk_window_sequence_setting(
+                        musetalk_adaptive_window_secs,
+                        {},
+                        "musetalk_adaptive_window_secs",
+                        resolved_musetalk_preset,
+                        "adaptive_window_secs",
+                        "MUSE_TALK_ADAPTIVE_WINDOW_SECS",
+                        [],
+                        minimum=0.2,
+                        maximum=max(0.2, float(window_sec or 3.0)),
+                        max_items=12,
+                    )
+                    adaptive_window_chunks = _musetalk_int_setting(
+                        musetalk_adaptive_window_chunks,
+                        resolved_musetalk_preset,
+                        "adaptive_window_chunks",
+                        0,
+                        minimum=0,
+                        maximum=12,
+                    )
+                    if not adaptive_window_secs and adaptive_window_sec > 0 and adaptive_window_chunks > 0:
+                        adaptive_window_secs = [adaptive_window_sec] * adaptive_window_chunks
+                    elif adaptive_window_secs:
+                        adaptive_window_chunks = len(adaptive_window_secs)
                     lookahead_sec = _musetalk_float_setting(
                         musetalk_lookahead_sec,
                         resolved_musetalk_preset,
@@ -3828,6 +4315,8 @@ def _warmup_lipsync(
                         warmup_windows.append(first_window_sec)
                     if startup_window_sec > 0 and startup_window_chunks > 0:
                         warmup_windows.extend([startup_window_sec] * min(startup_window_chunks, 2))
+                    if adaptive_window_secs:
+                        warmup_windows.extend(adaptive_window_secs[: max(1, min(adaptive_window_chunks, 2))])
                     warmup_windows.append(window_sec)
                     for window_duration_sec in warmup_windows:
                         _warmup_musetalk_window(window_duration_sec)
@@ -3860,6 +4349,10 @@ def _warmup_profile(
     musetalk_first_window_sec: float | None = None,
     musetalk_startup_window_sec: float | None = None,
     musetalk_startup_window_chunks: int | None = None,
+    musetalk_adaptive_window_sec: float | None = None,
+    musetalk_adaptive_window_secs: list[float] | str | None = None,
+    musetalk_adaptive_window_chunks: int | None = None,
+    musetalk_adaptive_min_lookahead_sec: float | None = None,
     musetalk_lookahead_sec: float | None = None,
     musetalk_temporal_smooth: float | None = None,
     musetalk_coord_source: str | None = None,
@@ -3971,6 +4464,10 @@ def _warmup_profile(
                     musetalk_first_window_sec=musetalk_first_window_sec,
                     musetalk_startup_window_sec=musetalk_startup_window_sec,
                     musetalk_startup_window_chunks=musetalk_startup_window_chunks,
+                    musetalk_adaptive_window_sec=musetalk_adaptive_window_sec,
+                    musetalk_adaptive_window_secs=musetalk_adaptive_window_secs,
+                    musetalk_adaptive_window_chunks=musetalk_adaptive_window_chunks,
+                    musetalk_adaptive_min_lookahead_sec=musetalk_adaptive_min_lookahead_sec,
                     musetalk_lookahead_sec=musetalk_lookahead_sec,
                     musetalk_temporal_smooth=musetalk_temporal_smooth,
                     musetalk_coord_source=resolved_coord_source,
@@ -4056,6 +4553,10 @@ def warmup(req: WarmupRequest):
             musetalk_first_window_sec=req.musetalk_first_window_sec,
             musetalk_startup_window_sec=req.musetalk_startup_window_sec,
             musetalk_startup_window_chunks=req.musetalk_startup_window_chunks,
+            musetalk_adaptive_window_sec=req.musetalk_adaptive_window_sec,
+            musetalk_adaptive_window_secs=req.musetalk_adaptive_window_secs,
+            musetalk_adaptive_window_chunks=req.musetalk_adaptive_window_chunks,
+            musetalk_adaptive_min_lookahead_sec=req.musetalk_adaptive_min_lookahead_sec,
             musetalk_lookahead_sec=req.musetalk_lookahead_sec,
             musetalk_temporal_smooth=req.musetalk_temporal_smooth,
             musetalk_coord_source=req.musetalk_coord_source,
@@ -4158,6 +4659,23 @@ def profile_voice_controls(profile_name: str, profile_type: str | None = None):
         "profile": profile,
         "profile_type": ptype,
         "controls": controls,
+        "runtime_settings": _load_profile_runtime_settings(profile, ptype),
+    }
+
+
+@app.patch("/profiles/{profile_name}/runtime-settings")
+def save_profile_runtime_settings(profile_name: str, req: ProfileRuntimeSettingsRequest):
+    profile = _sanitize_profile_name(profile_name, "profile_name")
+    ptype = _normalize_profile_type(req.profile_type)
+    settings = _save_profile_runtime_settings(
+        profile,
+        ptype,
+        {"voice_controls": req.voice_controls},
+    )
+    return {
+        "profile": profile,
+        "profile_type": ptype,
+        "runtime_settings": settings,
     }
 
 
@@ -4425,34 +4943,38 @@ def train(req: TrainRequest):
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=(os.name != "nt"),
         )
-        assert process.stdout is not None
-        for line in process.stdout:
-            yield f"{line.rstrip()}\n"
-        exit_code = process.wait()
-        if exit_code != 0:
-            logger.error(
-                "component=backend op=train_subprocess status=error exit_code=%s profile=%s profile_type=%s cmd=%s",
-                exit_code,
-                profile,
-                profile_type,
-                command,
-            )
-            yield f"[process exited {exit_code}]\n"
-            yield "ERROR: Subprocess failed. See logs above for details.\n"
-            return
-        yield f"[process exited {exit_code}]\n"
-        yield "[warmup] starting...\n"
         try:
-            _warmup_profile(profile, profile_type, force=True)
-            yield "[warmup] done\n"
-        except Exception as exc:
-            logger.exception(
-                "component=backend op=warmup_profile status=error profile=%s profile_type=%s",
-                profile,
-                profile_type,
-            )
-            yield f"[warmup] failed: {exc}\n"
+            assert process.stdout is not None
+            for line in process.stdout:
+                yield f"{line.rstrip()}\n"
+            exit_code = process.wait()
+            if exit_code != 0:
+                logger.error(
+                    "component=backend op=train_subprocess status=error exit_code=%s profile=%s profile_type=%s cmd=%s",
+                    exit_code,
+                    profile,
+                    profile_type,
+                    command,
+                )
+                yield f"[process exited {exit_code}]\n"
+                yield "ERROR: Subprocess failed. See logs above for details.\n"
+                return
+            yield f"[process exited {exit_code}]\n"
+            yield "[warmup] starting...\n"
+            try:
+                _warmup_profile(profile, profile_type, force=True)
+                yield "[warmup] done\n"
+            except Exception as exc:
+                logger.exception(
+                    "component=backend op=warmup_profile status=error profile=%s profile_type=%s",
+                    profile,
+                    profile_type,
+                )
+                yield f"[warmup] failed: {exc}\n"
+        finally:
+            _terminate_process_tree(process, "train_subprocess")
 
     return StreamingResponse(_train_stream(), media_type="text/plain")
 

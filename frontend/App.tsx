@@ -38,6 +38,9 @@ type VoiceControlBackendDefaults = {
   paceScale: number;
   volumeGain: number;
 };
+type ProfileRuntimeSettings = {
+  voice_controls?: Partial<VoiceControlValues>;
+};
 type BinaryStreamPacketMetadata = {
   event?: string;
   detail?: string;
@@ -89,9 +92,9 @@ const DEFAULT_LLM_MODE: LLMMode = 'legacy_fast';
 const DEFAULT_MUSETALK_PRESET: MuseTalkPreset = 'realistic';
 const LLM_MODE_OPTIONS: { value: LLMMode; label: string }[] = [
   { value: 'legacy_fast', label: 'Llama 3.1 8B Instant (Cutoff)' },
-  { value: 'live_search', label: 'GPT-4o Mini Search Preview (Live Search)' },
+  { value: 'live_search', label: 'GPT-4o Mini (Live Search)' },
   { value: 'gemini_search', label: 'Gemini 2.5 Flash Lite (Live Search)' },
-  { value: 'auto', label: 'Auto (Mixed)' },
+  { value: 'auto', label: 'Auto (Llama/GPT/Gemini)' },
 ];
 const DEFAULT_AVATAR_START_SEC = 5;
 const BLUR_KERNEL_BY_LEVEL = { low: 60, medium: 75, high: 90 } as const;
@@ -111,6 +114,18 @@ const normalizeVoiceControls = (controls: VoiceControlValues): VoiceControlValue
   tone: Math.round(clamp(controls.tone, -100, 100)),
   volume: Math.round(clamp(controls.volume, -100, 100)),
 });
+const normalizeRuntimeSettings = (settings: any): ProfileRuntimeSettings => {
+  const normalized: ProfileRuntimeSettings = {};
+  if (settings?.voice_controls && typeof settings.voice_controls === 'object') {
+    normalized.voice_controls = normalizeVoiceControls({
+      pitch: Number(settings.voice_controls.pitch ?? 0),
+      pace: Number(settings.voice_controls.pace ?? 0),
+      tone: Number(settings.voice_controls.tone ?? 0),
+      volume: Number(settings.voice_controls.volume ?? 0),
+    });
+  }
+  return normalized;
+};
 const DEFAULT_VOICE_CONTROL_BACKEND_DEFAULTS: VoiceControlBackendDefaults = {
   pitchShift: 0,
   f0Scale: 1,
@@ -265,9 +280,11 @@ const App: React.FC = () => {
   const [modelOverride, setModelOverride] = useState('');
   const [refOverride, setRefOverride] = useState('');
   const [avatarBackend, setAvatarBackend] = useState<'wav2lip' | 'musetalk'>('musetalk');
-  const [museTalkPreset] = useState<MuseTalkPreset>(DEFAULT_MUSETALK_PRESET);
+  const [museTalkPreset, setMuseTalkPreset] = useState<MuseTalkPreset>(DEFAULT_MUSETALK_PRESET);
   const [outputMode, setOutputMode] = useState<'voice' | 'avatar'>(DEFAULT_OUTPUT_MODE);
   const [llmMode, setLlmMode] = useState<LLMMode>(DEFAULT_LLM_MODE);
+  const [runtimeSettingsStatus, setRuntimeSettingsStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [runtimeSettingsError, setRuntimeSettingsError] = useState<string | null>(null);
   const [voiceControlBackendDefaults, setVoiceControlBackendDefaults] = useState<VoiceControlBackendDefaults>(
     DEFAULT_VOICE_CONTROL_BACKEND_DEFAULTS,
   );
@@ -690,15 +707,55 @@ const App: React.FC = () => {
   );
   const handleVoiceControlsChange = useCallback((patch: Partial<VoiceControlValues>) => {
     setVoiceControlsDirty(true);
+    setRuntimeSettingsStatus('idle');
     setVoiceControlValues((prev) => {
       const base = prev ?? voiceControlDefaults ?? DEFAULT_VOICE_CONTROL_VALUES;
       return normalizeVoiceControls({ ...base, ...patch });
     });
   }, [voiceControlDefaults]);
   const resetVoiceControls = useCallback(() => {
+    setRuntimeSettingsStatus('idle');
     setVoiceControlValues(voiceControlDefaults ?? DEFAULT_VOICE_CONTROL_VALUES);
     setVoiceControlsDirty(false);
   }, [voiceControlDefaults]);
+  const saveRuntimeSettings = useCallback(async () => {
+    const profileName = profile.name.trim();
+    if (apiStatus !== 'online') {
+      setRuntimeSettingsStatus('error');
+      setRuntimeSettingsError('Backend is offline. Start the backend, then save again.');
+      return;
+    }
+    if (!profileName) {
+      setRuntimeSettingsStatus('error');
+      setRuntimeSettingsError('Select a profile before saving voice controls.');
+      return;
+    }
+    setRuntimeSettingsStatus('saving');
+    setRuntimeSettingsError(null);
+    try {
+      const res = await fetch(`${apiBase}/profiles/${encodeURIComponent(profileName)}/runtime-settings`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          profile_type: profileType,
+          voice_controls: voiceControlValues,
+        }),
+      });
+      if (!res.ok) throw new Error(await readErrorDetail(res));
+      setRuntimeSettingsStatus('saved');
+      setVoiceControlsDirty(false);
+    } catch (err) {
+      setRuntimeSettingsStatus('error');
+      setRuntimeSettingsError(err instanceof Error ? err.message : String(err));
+    }
+  }, [
+    apiBase,
+    apiStatus,
+    profile.name,
+    profileType,
+    readErrorDetail,
+    voiceControlValues,
+  ]);
 
   useEffect(() => {
     if (apiStatus !== 'online' || !profile.name || !hasTrainedProfile) {
@@ -708,6 +765,8 @@ const App: React.FC = () => {
       setVoiceControlsStatus('ready');
       setVoiceControlsError(null);
       setVoiceControlsDirty(false);
+      setRuntimeSettingsStatus('idle');
+      setRuntimeSettingsError(null);
       return;
     }
 
@@ -743,11 +802,22 @@ const App: React.FC = () => {
           tone: 0,
           volume: 0,
         });
+        const runtimeSettings = normalizeRuntimeSettings(data?.runtime_settings);
+        const selectedControls = runtimeSettings.voice_controls
+          ? normalizeVoiceControls({
+            pitch: runtimeSettings.voice_controls.pitch ?? controls.pitch,
+            pace: runtimeSettings.voice_controls.pace ?? controls.pace,
+            tone: runtimeSettings.voice_controls.tone ?? controls.tone,
+            volume: runtimeSettings.voice_controls.volume ?? controls.volume,
+          })
+          : controls;
         setVoiceControlBackendDefaults(backendDefaults);
         setVoiceControlDefaults(controls);
-        setVoiceControlValues(controls);
+        setVoiceControlValues(selectedControls);
         setVoiceControlsStatus('ready');
         setVoiceControlsDirty(false);
+        setRuntimeSettingsStatus('idle');
+        setRuntimeSettingsError(null);
       })
       .catch((err) => {
         if (cancelled || (err as Error)?.name === 'AbortError') return;
@@ -1356,7 +1426,9 @@ const App: React.FC = () => {
     setLatency(null);
     setInferenceStageIndex(inferenceSteps.length > 0 ? 0 : null);
     // Set lead first, then schedule against it.
-    audioStartDelayRef.current = outputMode === 'avatar' ? AVATAR_AUDIO_START_DELAY_SEC : 0.08;
+    audioStartDelayRef.current = outputMode === 'avatar'
+      ? AVATAR_AUDIO_START_DELAY_SEC
+      : DEFAULT_AUDIO_START_DELAY_SEC;
     nextStartTimeRef.current = (audioContextRef.current?.currentTime || 0) + audioStartDelayRef.current;
     audioEndTimeRef.current = nextStartTimeRef.current;
     let sawError = false;
@@ -2372,6 +2444,17 @@ const App: React.FC = () => {
                   <div className="xl:col-span-5 space-y-4">
                     <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
                       <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                        Lip Sync Model
+                      </p>
+                      <div className="grid grid-cols-1 gap-2">
+                        <div className="px-3 py-2 rounded-lg text-sm font-semibold bg-teal-600 text-white text-center">
+                          {avatarBackend === 'wav2lip' ? 'Wav2Lip' : 'MuseTalk'}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
                         LLM Mode
                       </p>
                       <select
@@ -2387,24 +2470,17 @@ const App: React.FC = () => {
                       </select>
                     </div>
 
-                    <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
-                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                        Lip Sync Model
-                      </p>
-                      <div className="grid grid-cols-1 gap-2">
-                        <div className="px-3 py-2 rounded-lg text-sm font-semibold bg-teal-600 text-white text-center">
-                          {avatarBackend === 'wav2lip' ? 'Wav2Lip' : 'MuseTalk'}
-                        </div>
-                      </div>
-                    </div>
-
                     <VoiceControlsPanel
                       values={voiceControlValues}
                       defaults={voiceControlDefaults}
                       status={voiceControlsStatus}
                       error={voiceControlsError}
+                      saveStatus={runtimeSettingsStatus}
+                      saveError={runtimeSettingsError}
+                      canSave={apiStatus === 'online' && Boolean(profile.name.trim())}
                       onChange={handleVoiceControlsChange}
                       onReset={resetVoiceControls}
+                      onSave={saveRuntimeSettings}
                     />
 
                     <div className="bg-slate-950 border border-slate-900 rounded-2xl p-4">

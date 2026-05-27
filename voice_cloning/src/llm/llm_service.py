@@ -36,6 +36,13 @@ def _env_int(name: str, default: int, *, minimum: int) -> int:
     return max(minimum, value)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _load_env_files() -> None:
     load_dotenv()
     for parent in Path(__file__).resolve().parents:
@@ -54,18 +61,40 @@ LLM_MODE_AUTO = "auto"
 DEFAULT_LLM_MODE = LLM_MODE_LEGACY_FAST
 
 LEGACY_FAST_MODEL = "llama-3.1-8b-instant"
-LIVE_SEARCH_MODEL = "gpt-4o-mini-search-preview"
+LIVE_SEARCH_MODEL = "gpt-4o-mini"
 GEMINI_FLASH_MODEL = "gemini-2.5-flash-lite"
-OPENAI_MODELS: frozenset[str] = frozenset({"gpt-4o-mini-search-preview", "gpt-4o-search-preview"})
+OPENAI_RESPONSES_SEARCH_MODELS: frozenset[str] = frozenset(
+    {
+        "gpt-4o-mini",
+        "gpt-4o",
+        "gpt-4.1-mini",
+        "gpt-5.4-nano",
+        "gpt-5.4-mini",
+        "gpt-5-nano",
+        "gpt-5-mini",
+    }
+)
+OPENAI_CHAT_SEARCH_MODELS: frozenset[str] = frozenset(
+    {
+        "gpt-5-search-api",
+        "gpt-4o-mini-search-preview",
+        "gpt-4o-search-preview",
+    }
+)
+OPENAI_MODELS: frozenset[str] = OPENAI_RESPONSES_SEARCH_MODELS | OPENAI_CHAT_SEARCH_MODELS
+OPENAI_REASONING_EFFORTS: frozenset[str] = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
 WARMUP_MAX_COMPLETION_TOKENS = 16
 REALTIME_MAX_COMPLETION_TOKENS = 320
+OPENAI_REALTIME_MAX_OUTPUT_TOKENS = 512
 GEMINI_MAX_OUTPUT_TOKENS = 320
 GEMINI_SEARCH_TIMEOUT_SECONDS = 15
 MAX_HISTORY_MESSAGES = 8
 DEFAULT_REALTIME_MAX_COMPLETION_TOKENS = REALTIME_MAX_COMPLETION_TOKENS
+DEFAULT_OPENAI_REALTIME_MAX_OUTPUT_TOKENS = OPENAI_REALTIME_MAX_OUTPUT_TOKENS
 DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = GEMINI_MAX_OUTPUT_TOKENS
 DEFAULT_GEMINI_SEARCH_TIMEOUT_SECONDS = GEMINI_SEARCH_TIMEOUT_SECONDS
 DEFAULT_GEMINI_THINKING_LEVEL = "minimal"
+DEFAULT_OPENAI_REASONING_EFFORT = "none"
 DEFAULT_REALTIME_HISTORY_MESSAGES = 2
 DEFAULT_MAX_MESSAGE_CHARS = 1200
 DEFAULT_MAX_HISTORY_CHARS = 6000
@@ -75,6 +104,7 @@ DEFAULT_AUTO_LIVE_FOLLOWUP_TURNS = 2
 DEFAULT_AUTO_LIVE_FOLLOWUP_TTL_SECONDS = 600
 DEFAULT_AUTO_LIVE_TOPIC_TURNS = 4
 DEFAULT_FIRST_CHUNK_SOFT_MAX_CHARS = 72
+DEFAULT_AUTO_GEMINI_SEARCH_ENABLED = True
 RETRY_AFTER_PATTERN = re.compile(r"try again in ([0-9.]+)s", re.IGNORECASE)
 REQUEST_TOO_LARGE_PATTERN = re.compile(r"request entity too large", re.IGNORECASE)
 # Matches OpenAI inline citation annotations like ([domain.com](https://...))
@@ -273,6 +303,21 @@ _LIVE_CONTEXT_STOPWORDS = {
     "your",
 }
 
+_AUTO_GPT_REQUIRED: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(president|prime\s+minister|mayor|governor|senator|congress|parliament)\b", re.I),
+    re.compile(r"\b(election|campaign|candidate|polls?|odds|forecast|projected|likely\s+to\s+win)\b", re.I),
+    re.compile(r"\b(news|headline|breaking|war|conflict|court|lawsuit|legal|medical|health)\b", re.I),
+    re.compile(r"\b(stock|share|market|crypto|bitcoin|ethereum|price|earnings|exchange\s+rate)\b", re.I),
+    re.compile(r"\b(ceo|leader|government|administration|policy|law|regulation)\b", re.I),
+)
+
+_AUTO_GEMINI_LIGHT_LIVE: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(weather|temperature|forecast|rain|snow|humidity|wind)\b", re.I),
+    re.compile(r"\b(what\s+day|what\s+date|today'?s?\s+date|current\s+time|time\s+in)\b", re.I),
+    re.compile(r"\b(open\s+(now|today)|hours?|schedule|near\s+me)\b", re.I),
+    re.compile(r"\b(local|nearby|traffic|directions?)\b", re.I),
+)
+
 LOCATION_PREPOSITION_PATTERN = re.compile(
     r"\b(?:in|near|for|at)\s+"
     r"(?!today\b|tomorrow\b|tonight\b|now\b|right\b|current\b|the\b|a\b|an\b)"
@@ -341,6 +386,14 @@ class LLMRoute:
         return self.model in OPENAI_MODELS
 
     @property
+    def uses_openai_responses_search(self) -> bool:
+        return self.model in OPENAI_RESPONSES_SEARCH_MODELS
+
+    @property
+    def uses_openai_chat_search(self) -> bool:
+        return self.model in OPENAI_CHAT_SEARCH_MODELS
+
+    @property
     def uses_gemini(self) -> bool:
         return self.resolved_mode in {LLM_MODE_GEMINI_FLASH, LLM_MODE_GEMINI_SEARCH} or self.model.startswith(
             ("gemini-", "models/gemini-")
@@ -378,6 +431,7 @@ class LLMService:
         self.gemini_search_model = (
             os.environ.get("GEMINI_SEARCH_MODEL", self.gemini_model).strip() or self.gemini_model
         )
+        self.live_search_model = os.environ.get("OPENAI_LIVE_SEARCH_MODEL", LIVE_SEARCH_MODEL).strip() or LIVE_SEARCH_MODEL
         self.system_prompt = system_prompt
         self.history: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
         self._warmed_routes: set[str] = set()
@@ -387,6 +441,11 @@ class LLMService:
             "GROQ_REALTIME_MAX_COMPLETION_TOKENS",
             DEFAULT_REALTIME_MAX_COMPLETION_TOKENS,
             minimum=32,
+        )
+        self.openai_realtime_max_output_tokens = _env_int(
+            "OPENAI_REALTIME_MAX_OUTPUT_TOKENS",
+            DEFAULT_OPENAI_REALTIME_MAX_OUTPUT_TOKENS,
+            minimum=256,
         )
         self.gemini_max_output_tokens = _env_int(
             "GEMINI_MAX_OUTPUT_TOKENS",
@@ -398,7 +457,14 @@ class LLMService:
             DEFAULT_GEMINI_SEARCH_TIMEOUT_SECONDS,
             minimum=5,
         )
+        self.auto_gemini_search_enabled = _env_bool(
+            "LLM_AUTO_GEMINI_SEARCH",
+            DEFAULT_AUTO_GEMINI_SEARCH_ENABLED,
+        )
         self.gemini_thinking_level = os.environ.get("GEMINI_THINKING_LEVEL", DEFAULT_GEMINI_THINKING_LEVEL).strip().lower()
+        self.openai_reasoning_effort = self._normalize_openai_reasoning_effort(
+            os.environ.get("OPENAI_REASONING_EFFORT", DEFAULT_OPENAI_REASONING_EFFORT)
+        )
         self.realtime_history_messages = _env_int(
             "GROQ_REALTIME_HISTORY_MESSAGES",
             DEFAULT_REALTIME_HISTORY_MESSAGES,
@@ -672,6 +738,8 @@ class LLMService:
             route_model = self.gemini_model
         elif resolved_mode == LLM_MODE_GEMINI_SEARCH:
             route_model = self.gemini_search_model
+        elif resolved_mode == LLM_MODE_LIVE_SEARCH:
+            route_model = self.live_search_model
         else:
             route_model = MODEL_BY_MODE[resolved_mode]
         return LLMRoute(
@@ -718,7 +786,8 @@ class LLMService:
         first_chunk_min = max(20, min_chunk_size // 2)
         first_soft_max = max(first_chunk_min, int(self.first_chunk_soft_max_chars))
         first_yielded = False
-        is_openai = route.model in OPENAI_MODELS
+        is_openai = route.uses_realtime_tools
+        is_openai_responses = route.uses_openai_responses_search
         is_gemini = route.uses_gemini
 
         print(f"{route.model} Thinking...", end="", flush=True)
@@ -732,7 +801,13 @@ class LLMService:
                     cancel_event=cancel_event,
                     enable_search=route.uses_gemini_search,
                 )
-            elif route.model in OPENAI_MODELS:
+            elif route.uses_openai_responses_search:
+                stream = self._stream_openai_responses_tokens(
+                    messages,
+                    route.model,
+                    cancel_event=cancel_event,
+                )
+            elif route.uses_openai_chat_search:
                 if self.openai_client is None:
                     raise RuntimeError("OPENAI_API_KEY not set — cannot use live search model")
                 stream = self.openai_client.chat.completions.create(
@@ -757,7 +832,7 @@ class LLMService:
             for chunk in stream:
                 if self._is_cancelled(cancel_event):
                     raise LLMStreamCancelled()
-                token = chunk if is_gemini else chunk.choices[0].delta.content
+                token = chunk if (is_gemini or is_openai_responses) else chunk.choices[0].delta.content
                 if not token:
                     continue
                 if is_openai:
@@ -772,7 +847,9 @@ class LLMService:
                 if has_boundary:
                     threshold = first_chunk_min if not first_yielded else min_chunk_size
                     if len(buffer) >= threshold and not _ends_with_protected_abbreviation(buffer):
-                        yield buffer.strip()
+                        chunk_text = _strip_openai_citations(buffer).strip() if is_openai else buffer.strip()
+                        if chunk_text:
+                            yield chunk_text
                         buffer = ""
                         first_yielded = True
                         continue
@@ -786,7 +863,9 @@ class LLMService:
                         head = buffer[:split_at].strip()
                         tail = buffer[split_at:].strip()
                         if head and not _ends_with_protected_abbreviation(head):
-                            yield head
+                            chunk_text = _strip_openai_citations(head).strip() if is_openai else head
+                            if chunk_text:
+                                yield chunk_text
                             buffer = tail
                             first_yielded = True
                             continue
@@ -803,12 +882,16 @@ class LLMService:
                         head = buffer[:split_at].strip()
                         tail = buffer[split_at:].strip()
                         if head:
-                            yield head
+                            chunk_text = _strip_openai_citations(head).strip() if is_openai else head
+                            if chunk_text:
+                                yield chunk_text
                             first_yielded = True
                         buffer = tail
 
             if buffer.strip() and not self._is_cancelled(cancel_event):
-                yield buffer.strip()
+                chunk_text = _strip_openai_citations(buffer).strip() if is_openai else buffer.strip()
+                if chunk_text:
+                    yield chunk_text
             if self._is_cancelled(cancel_event):
                 raise LLMStreamCancelled()
         finally:
@@ -819,7 +902,93 @@ class LLMService:
                         close_stream()
 
         print(" Done.")
-        return full_response_text
+        return _strip_openai_citations(full_response_text).strip() if is_openai else full_response_text
+
+    def _stream_openai_responses_tokens(
+        self,
+        messages: List[Dict[str, str]],
+        model_name: str,
+        cancel_event=None,
+    ) -> Generator[str, None, None]:
+        if self.openai_client is None:
+            raise RuntimeError("OPENAI_API_KEY not set — cannot use live search model")
+
+        instructions, input_items = self._openai_responses_input(messages)
+        create_params: dict[str, object] = {
+            "model": model_name,
+            "instructions": instructions or None,
+            "input": input_items,
+            "stream": True,
+            "max_output_tokens": self.openai_realtime_max_output_tokens,
+            "tools": [{"type": "web_search", "search_context_size": "low"}],
+            "tool_choice": "required",
+            "max_tool_calls": 1,
+            "truncation": "auto",
+            "store": False,
+        }
+        text_config = self._openai_text_config_for_model(model_name)
+        if text_config:
+            create_params["text"] = text_config
+        reasoning_effort = self._openai_reasoning_effort_for_model(model_name)
+        if reasoning_effort:
+            create_params["reasoning"] = {"effort": reasoning_effort}
+
+        stream = self.openai_client.responses.create(**create_params)
+        try:
+            for event in stream:
+                if self._is_cancelled(cancel_event):
+                    raise LLMStreamCancelled()
+                event_type = getattr(event, "type", "")
+                if event_type == "response.output_text.delta":
+                    delta = getattr(event, "delta", "")
+                    if delta:
+                        yield delta
+                    continue
+                if event_type == "error":
+                    message = getattr(event, "message", "unknown OpenAI Responses API error")
+                    raise RuntimeError(f"OpenAI Responses API error: {message}")
+                if event_type == "response.failed":
+                    raise RuntimeError(self._openai_response_failure_message(event))
+        finally:
+            if self._is_cancelled(cancel_event):
+                close_stream = getattr(stream, "close", None)
+                if callable(close_stream):
+                    with contextlib.suppress(Exception):
+                        close_stream()
+
+        if self._is_cancelled(cancel_event):
+            raise LLMStreamCancelled()
+
+    @staticmethod
+    def _openai_responses_input(messages: List[Dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
+        instructions: list[str] = []
+        input_items: list[dict[str, str]] = []
+        for message in messages:
+            content = str(message.get("content", "")).strip()
+            if not content:
+                continue
+            role = str(message.get("role", "user")).lower()
+            if role == "system":
+                instructions.append(content)
+                continue
+            if role not in {"user", "assistant", "developer"}:
+                role = "user"
+            input_items.append({"role": role, "content": content})
+        if not input_items:
+            input_items.append({"role": "user", "content": ""})
+        return "\n".join(instructions), input_items
+
+    @staticmethod
+    def _openai_response_failure_message(event: object) -> str:
+        response = getattr(event, "response", None)
+        error = getattr(response, "error", None)
+        message = getattr(error, "message", None)
+        code = getattr(error, "code", None)
+        if message and code:
+            return f"OpenAI Responses API error {code}: {message}"
+        if message:
+            return f"OpenAI Responses API error: {message}"
+        return "OpenAI Responses API response failed"
 
     def _stream_gemini_tokens(
         self,
@@ -1026,7 +1195,7 @@ class LLMService:
             "Keep the answer concise and spoken-friendly. For temperatures, always include "
             "a number and write full unit words like 'eleven degrees Celsius' or "
             "'fifty two degrees Fahrenheit'; never write degree symbols, C, F, or C/F. "
-            "Do not use markdown headings, bullets, tables, code blocks, hashtags, or raw URLs unless asked."
+            "Do not include citations, source links, markdown formatting, headings, bold text, bullets, tables, code blocks, hashtags, or raw URLs unless asked."
         )
         routed_messages = list(messages)
         if routed_messages and routed_messages[0].get("role") == "system":
@@ -1091,8 +1260,44 @@ class LLMService:
             return DEFAULT_LLM_MODE
         return normalized
 
+    @staticmethod
+    def _normalize_openai_reasoning_effort(value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized in {"", "off", "false", "0", "default"}:
+            return None
+        if normalized in OPENAI_REASONING_EFFORTS:
+            return normalized
+        logger.warning(
+            "component=llm op=env_config status=invalid name=OPENAI_REASONING_EFFORT value=%s default=%s",
+            value,
+            DEFAULT_OPENAI_REASONING_EFFORT,
+        )
+        return DEFAULT_OPENAI_REASONING_EFFORT
+
+    def _openai_reasoning_effort_for_model(self, model_name: str) -> str | None:
+        if not model_name.startswith("gpt-5"):
+            return None
+        effort = self.openai_reasoning_effort
+        if effort == "none" and not model_name.startswith("gpt-5.4"):
+            return "low"
+        return effort
+
+    @staticmethod
+    def _openai_text_config_for_model(model_name: str) -> dict[str, str] | None:
+        if model_name.startswith("gpt-5"):
+            return {"verbosity": "low"}
+        return None
+
     def _auto_mode_for_prompt(self, user_input: str) -> str:
         if self._needs_current_info(user_input):
+            if self._should_use_gemini_search_in_auto(user_input):
+                logger.info(
+                    "component=llm op=auto_route status=gemini_light_live input_chars=%s",
+                    len(user_input),
+                )
+                return LLM_MODE_GEMINI_SEARCH
             return LLM_MODE_LIVE_SEARCH
         if self._should_continue_live_context(user_input):
             logger.info(
@@ -1109,6 +1314,14 @@ class LLMService:
 
     def _candidate_routes(self, route: LLMRoute, user_input: str) -> list[LLMRoute]:
         candidates = [route]
+        if route.uses_gemini_search and self.live_search_model:
+            candidates.append(
+                LLMRoute(
+                    requested_mode=route.requested_mode,
+                    resolved_mode=LLM_MODE_LIVE_SEARCH,
+                    model=self.live_search_model,
+                )
+            )
         if route.model != LEGACY_FAST_MODEL and not route.uses_gemini and not self._requires_live_route(user_input):
             candidates.append(
                 LLMRoute(
@@ -1126,6 +1339,16 @@ class LLMService:
             seen.add(candidate.cache_key)
             deduped.append(candidate)
         return deduped
+
+    def _should_use_gemini_search_in_auto(self, user_input: str) -> bool:
+        if not self.auto_gemini_search_enabled or not self.gemini_api_key:
+            return False
+        text = user_input.strip()
+        if len(text) > 180:
+            return False
+        if any(pattern.search(text) for pattern in _AUTO_GPT_REQUIRED):
+            return False
+        return any(pattern.search(text) for pattern in _AUTO_GEMINI_LIGHT_LIVE)
 
     def _requires_live_route(self, user_input: str) -> bool:
         return self._needs_current_info(user_input) or self._should_continue_live_context(user_input)
