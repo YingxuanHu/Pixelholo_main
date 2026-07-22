@@ -82,6 +82,7 @@ CASES: dict[str, BenchmarkCase] = {
             "musetalk_lookahead_sec": 0.28,
             "musetalk_temporal_smooth": 0.20,
             "musetalk_jpeg_quality": 95,
+            "musetalk_adaptive_window_sec": 0.0,
         },
         client_timing=ClientTiming(
             audio_start_delay_sec=0.34,
@@ -193,7 +194,92 @@ CASES: dict[str, BenchmarkCase] = {
             waits_for_predecode_before_audio=False,
         ),
     ),
+    "stream_085": BenchmarkCase(
+        name="stream_085",
+        description=(
+            "Candidate path: keep the current 0.55s startup windows but use a "
+            "0.85s steady MuseTalk stream window to reduce post-startup stalls."
+        ),
+        request_overrides={
+            "musetalk_preset": "realistic",
+            "musetalk_stream_window_sec": 0.85,
+            "musetalk_first_window_sec": 0.55,
+            "musetalk_startup_window_sec": 0.55,
+            "musetalk_startup_window_chunks": 2,
+            "musetalk_lookahead_sec": 0.28,
+            "musetalk_temporal_smooth": 0.20,
+            "musetalk_jpeg_quality": 95,
+            "musetalk_adaptive_window_sec": 0.0,
+        },
+        client_timing=ClientTiming(
+            audio_start_delay_sec=0.34,
+            audio_chunk_lead_sec=0.08,
+            video_predecode_wait_ms=45.0,
+            waits_for_predecode_before_audio=False,
+        ),
+    ),
+    "adaptive_085": BenchmarkCase(
+        name="adaptive_085",
+        description=(
+            "Candidate path: keep the 1.65s steady window, but ramp through "
+            "0.85s, 1.15s, and 1.45s before full-size packets."
+        ),
+        request_overrides={
+            "musetalk_preset": "realistic",
+            "musetalk_stream_window_sec": 1.65,
+            "musetalk_first_window_sec": 0.55,
+            "musetalk_startup_window_sec": 0.55,
+            "musetalk_startup_window_chunks": 2,
+            "musetalk_adaptive_window_sec": 0.85,
+            "musetalk_adaptive_window_secs": [0.85, 1.15, 1.45],
+            "musetalk_adaptive_window_chunks": 3,
+            "musetalk_adaptive_min_lookahead_sec": 0.08,
+            "musetalk_lookahead_sec": 0.28,
+            "musetalk_temporal_smooth": 0.20,
+            "musetalk_jpeg_quality": 95,
+        },
+        client_timing=ClientTiming(
+            audio_start_delay_sec=0.34,
+            audio_chunk_lead_sec=0.08,
+            video_predecode_wait_ms=45.0,
+            waits_for_predecode_before_audio=False,
+        ),
+    ),
+    "first_045_ramp": BenchmarkCase(
+        name="first_045_ramp",
+        description=(
+            "Experimental startup path: shorter 0.45s first window, 0.50s startup "
+            "windows, then a gradual ramp to test first-frame latency versus quality."
+        ),
+        request_overrides={
+            "musetalk_preset": "realistic",
+            "musetalk_stream_window_sec": 1.65,
+            "musetalk_first_window_sec": 0.45,
+            "musetalk_startup_window_sec": 0.50,
+            "musetalk_startup_window_chunks": 2,
+            "musetalk_adaptive_window_sec": 0.75,
+            "musetalk_adaptive_window_secs": [0.75, 0.95, 1.15, 1.35, 1.55],
+            "musetalk_adaptive_window_chunks": 5,
+            "musetalk_adaptive_min_lookahead_sec": 0.08,
+            "musetalk_lookahead_sec": 0.28,
+            "musetalk_temporal_smooth": 0.20,
+            "musetalk_jpeg_quality": 95,
+        },
+        client_timing=ClientTiming(
+            audio_start_delay_sec=0.34,
+            audio_chunk_lead_sec=0.08,
+            video_predecode_wait_ms=45.0,
+            waits_for_predecode_before_audio=False,
+        ),
+    ),
 }
+
+VOICE_CLIENT_TIMING = ClientTiming(
+    audio_start_delay_sec=0.04,
+    audio_chunk_lead_sec=0.03,
+    video_predecode_wait_ms=0.0,
+    waits_for_predecode_before_audio=False,
+)
 
 
 def _parse_csv(value: str) -> list[str]:
@@ -530,6 +616,8 @@ def _read_binary_stream(
     first_media_ms = 0.0
     chunk_count = 0
     chunk_frame_counts: list[int] = []
+    chunk_arrival_ms: list[float] = []
+    chunk_durations_ms: list[float] = []
     audio_duration_sec = 0.0
     fps_values: list[float] = []
 
@@ -559,6 +647,7 @@ def _read_binary_stream(
 
             if first_media_ms <= 0.0:
                 first_media_ms = (time.perf_counter() - started) * 1000.0
+            chunk_arrival_ms.append(round((time.perf_counter() - started) * 1000.0, 1))
             chunk_count += 1
             current_audio_bytes = int(metadata.get("audio_bytes_len") or 0)
             audio_bytes += current_audio_bytes
@@ -566,7 +655,9 @@ def _read_binary_stream(
             chunk_frame_counts.append(len(frame_lengths))
             frame_count += len(frame_lengths)
             frame_bytes += sum(frame_lengths)
-            audio_duration_sec += float(metadata.get("duration_sec") or 0.0)
+            duration_sec = float(metadata.get("duration_sec") or 0.0)
+            audio_duration_sec += duration_sec
+            chunk_durations_ms.append(round(duration_sec * 1000.0, 1))
             if metadata.get("fps"):
                 fps_values.append(float(metadata["fps"]))
             if len(payload) != payload_len:
@@ -591,6 +682,16 @@ def _read_binary_stream(
         raise RuntimeError(f"Trailing undecoded binary bytes: {len(pending)}")
 
     done_events = [event for event in events if event.get("event") == "done"]
+    arrival_gap_ms = [
+        round(chunk_arrival_ms[idx] - chunk_arrival_ms[idx - 1], 1)
+        for idx in range(1, len(chunk_arrival_ms))
+    ]
+    gap_over_prev_audio_ms = [
+        round(arrival_gap_ms[idx - 1] - chunk_durations_ms[idx - 1], 1)
+        for idx in range(1, len(chunk_arrival_ms))
+        if idx - 1 < len(chunk_durations_ms)
+    ]
+    positive_gap_over_prev_audio_ms = [value for value in gap_over_prev_audio_ms if value > 0]
     metrics = {
         "events": events,
         "first_media_ms": round(first_media_ms, 1),
@@ -599,6 +700,13 @@ def _read_binary_stream(
         "frame_bytes": frame_bytes,
         "chunks": chunk_count,
         "chunk_frame_counts": chunk_frame_counts,
+        "chunk_arrival_ms": chunk_arrival_ms,
+        "chunk_durations_ms": chunk_durations_ms,
+        "chunk_arrival_gap_ms": arrival_gap_ms,
+        "max_gap_over_prev_audio_ms": round(max(positive_gap_over_prev_audio_ms), 1)
+        if positive_gap_over_prev_audio_ms
+        else 0.0,
+        "gap_over_prev_audio_events": len(positive_gap_over_prev_audio_ms),
         "frames": frame_count,
         "audio_duration_sec": round(audio_duration_sec, 3),
         "fps": _median(fps_values),
@@ -678,20 +786,26 @@ def _warmup(
     *,
     api_base: str,
     profile: str,
+    profile_type: str,
     timeout: float,
     avatar_max_frame_edge: int,
     case: BenchmarkCase,
 ) -> dict[str, Any]:
     payload = {
         "profile": profile,
-        "profile_type": "avatar",
-        "lipsync_backend": "musetalk",
+        "profile_type": profile_type,
         "include_llm": False,
-        "musetalk_preset": case.request_overrides.get("musetalk_preset", "realistic"),
-        "musetalk_stream_window_sec": case.request_overrides.get("musetalk_stream_window_sec"),
-        "musetalk_lookahead_sec": case.request_overrides.get("musetalk_lookahead_sec"),
-        "avatar_max_frame_edge": avatar_max_frame_edge,
     }
+    if profile_type == "avatar":
+        payload.update(
+            {
+                "lipsync_backend": "musetalk",
+                "musetalk_preset": case.request_overrides.get("musetalk_preset", "realistic"),
+                "musetalk_stream_window_sec": case.request_overrides.get("musetalk_stream_window_sec"),
+                "musetalk_lookahead_sec": case.request_overrides.get("musetalk_lookahead_sec"),
+                "avatar_max_frame_edge": avatar_max_frame_edge,
+            }
+        )
     started = time.perf_counter()
     response = requests.post(
         f"{api_base.rstrip('/')}/warmup",
@@ -708,6 +822,7 @@ def _build_payload(
     *,
     endpoint: str,
     profile: str,
+    profile_type: str,
     text: str,
     seed: int,
     avatar_max_frame_edge: int,
@@ -717,16 +832,17 @@ def _build_payload(
     payload: dict[str, Any] = {
         "text": text,
         "speaker": profile,
-        "avatar_profile": profile,
-        "profile_type": "avatar",
-        "lipsync_backend": "musetalk",
+        "profile_type": profile_type,
         "seed": seed,
     }
     if endpoint.lstrip("/") == "chat":
         payload["llm_mode"] = llm_mode
-    if avatar_max_frame_edge > 0:
-        payload["avatar_max_frame_edge"] = avatar_max_frame_edge
-    payload.update(case.request_overrides)
+    if profile_type == "avatar":
+        payload["avatar_profile"] = profile
+        payload["lipsync_backend"] = "musetalk"
+        if avatar_max_frame_edge > 0:
+            payload["avatar_max_frame_edge"] = avatar_max_frame_edge
+        payload.update(case.request_overrides)
     return payload
 
 
@@ -754,6 +870,12 @@ def _summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
             "median_chunks": _median([float(row["chunks"]) for row in rows]),
             "median_frames": _median([float(row["frames"]) for row in rows]),
             "median_wire_kb": _median([row["wire_bytes"] / 1024.0 for row in rows]),
+            "median_max_gap_over_prev_audio_ms": _median(
+                [float(row.get("max_gap_over_prev_audio_ms", 0.0)) for row in rows]
+            ),
+            "median_gap_over_prev_audio_events": _median(
+                [float(row.get("gap_over_prev_audio_events", 0)) for row in rows]
+            ),
         }
         quality_keys = (
             "landmark_valid_ratio",
@@ -833,6 +955,7 @@ def _print_result(row: dict[str, Any]) -> None:
         "run={run} case={case:<8} first_media={first_media_ms:>7.1f}ms "
         "est_web_audio={estimated_web_audio_start_ms:>7.1f}ms "
         "total={total_ms:>7.1f}ms chunks={chunks:<2} frames={frames:<3} "
+        "max_gap={max_gap_over_prev_audio_ms:>7.1f}ms "
         "wire={wire_kb:>7.1f}KB stability={stability}".format(
             **row,
             wire_kb=row["wire_bytes"] / 1024.0,
@@ -852,6 +975,7 @@ def main() -> None:
     parser.add_argument("--api-base", default="http://127.0.0.1:8000")
     parser.add_argument("--endpoint", choices=("speak", "chat"), default="speak")
     parser.add_argument("--profile", default="alvin1_video")
+    parser.add_argument("--profile-type", choices=("avatar", "voice"), default="avatar")
     parser.add_argument("--text", default=DEFAULT_TEXT)
     parser.add_argument("--llm-mode", default="legacy_fast")
     parser.add_argument("--cases", default="old_like,current")
@@ -886,6 +1010,7 @@ def main() -> None:
             _warmup(
                 api_base=args.api_base,
                 profile=args.profile,
+                profile_type=args.profile_type,
                 timeout=args.timeout,
                 avatar_max_frame_edge=args.avatar_max_frame_edge,
                 case=warmup_case,
@@ -900,6 +1025,7 @@ def main() -> None:
             payload = _build_payload(
                 endpoint=args.endpoint,
                 profile=args.profile,
+                profile_type=args.profile_type,
                 text=args.text,
                 seed=args.seed,
                 avatar_max_frame_edge=args.avatar_max_frame_edge,
@@ -917,9 +1043,10 @@ def main() -> None:
                 media_dir=output_dir / "media",
                 media_stem=f"{run_index:02d}_{case.name}_repeat{repeat}",
             )
+            client_timing = VOICE_CLIENT_TIMING if args.profile_type == "voice" else case.client_timing
             estimated_start_ms, client_added_ms = _estimated_client_audio_start_ms(
                 metrics["first_media_ms"],
-                case.client_timing,
+                client_timing,
             )
             row = {
                 "run": run_index,
@@ -928,6 +1055,7 @@ def main() -> None:
                 "description": case.description,
                 "endpoint": args.endpoint,
                 "profile": args.profile,
+                "profile_type": args.profile_type,
                 "text_chars": len(args.text),
                 "audio_format": args.audio_format,
                 "estimated_web_audio_start_ms": estimated_start_ms,
@@ -944,6 +1072,7 @@ def main() -> None:
         "api_base": args.api_base,
         "endpoint": args.endpoint,
         "profile": args.profile,
+        "profile_type": args.profile_type,
         "text": args.text,
         "audio_format": args.audio_format,
         "warmup": warmup_results,

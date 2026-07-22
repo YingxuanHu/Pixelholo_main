@@ -6,8 +6,12 @@ type VoiceControlsPanelProps = {
   defaults: VoiceControlValues | null;
   status: 'idle' | 'loading' | 'ready' | 'error';
   error?: string | null;
+  saveStatus?: 'idle' | 'saving' | 'saved' | 'error';
+  saveError?: string | null;
+  canSave?: boolean;
   onChange: (patch: Partial<VoiceControlValues>) => void;
   onReset: () => void;
+  onSave: () => void;
 };
 
 type SliderConfig = {
@@ -99,8 +103,12 @@ const VoiceControlsPanel: React.FC<VoiceControlsPanelProps> = ({
   defaults,
   status,
   error,
+  saveStatus = 'idle',
+  saveError = null,
+  canSave = true,
   onChange,
   onReset,
+  onSave,
 }) => {
   const effectiveValues = values ?? defaults ?? FALLBACK_VALUES;
   const effectiveDefaults = defaults ?? FALLBACK_VALUES;
@@ -108,21 +116,53 @@ const VoiceControlsPanel: React.FC<VoiceControlsPanelProps> = ({
   return (
     <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-4">
       <div className="flex items-center justify-between gap-3">
-        <div>
+        <div className="flex items-center gap-2">
           <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Voice Controls</p>
-          <p className="mt-1 text-xs text-slate-500">
-            Applies to the next response you generate. These controls do not change saved profile defaults.
-          </p>
+          <span
+            className="group relative inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-slate-200 bg-slate-50 text-[11px] font-bold text-slate-500"
+            aria-label="Voice control changes apply to the next generated response. Use Save to keep them as this profile's default voice controls."
+          >
+            ?
+            <span className="pointer-events-none absolute left-0 top-6 z-20 hidden w-64 rounded-lg border border-slate-200 bg-white px-3 py-2 text-left text-[11px] font-semibold normal-case tracking-normal text-slate-600 shadow-lg group-hover:block">
+              <span className="block">Changes apply to the next generated response.</span>
+              <span className="mt-1 block">
+                Click{' '}
+                <span className="inline-flex rounded-md border border-teal-200 bg-teal-50 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-widest text-teal-700">
+                  Save
+                </span>{' '}
+                to make these voice controls the default for this profile.
+              </span>
+            </span>
+          </span>
         </div>
-        <button
-          type="button"
-          onClick={onReset}
-          disabled={!defaults}
-          className="rounded-lg border border-slate-200 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-slate-600 disabled:cursor-not-allowed disabled:opacity-40"
-        >
-          Reset
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onReset}
+            disabled={!defaults}
+            className="rounded-lg border border-slate-200 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-slate-600 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            Reset
+          </button>
+          <button
+            type="button"
+            onClick={onSave}
+            disabled={!canSave || saveStatus === 'saving'}
+            className="rounded-lg border border-teal-200 bg-teal-50 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-teal-700 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {saveStatus === 'saving' ? 'Saving' : 'Save'}
+          </button>
+        </div>
       </div>
+
+      {saveStatus === 'saved' && (
+        <p className="text-[11px] font-semibold text-teal-700">Voice controls saved for this profile.</p>
+      )}
+      {saveStatus === 'error' && (
+        <p className="text-[11px] font-semibold text-rose-600">
+          {saveError || 'Failed to save voice controls.'}
+        </p>
+      )}
 
       {status === 'loading' && (
         <div className="rounded-xl border border-slate-100 bg-slate-50 px-4 py-5 text-xs font-semibold text-slate-500">
@@ -143,13 +183,13 @@ const VoiceControlsPanel: React.FC<VoiceControlsPanelProps> = ({
           return (
             <div key={slider.key} className="space-y-2">
               <div className="flex items-start justify-between gap-4">
-                <div>
+                <div className="min-w-0">
                   <p className="text-sm font-semibold text-slate-800">{slider.label}</p>
                   <p className="text-[11px] text-slate-500">{slider.hint}</p>
                 </div>
-                <div className="text-right">
-                  <p className="text-sm font-bold text-teal-700">{slider.describe(value)}</p>
-                  <p className="text-[10px] text-slate-400">{describeDefault(slider.describe(defaultValue))}</p>
+                <div className="min-w-[170px] shrink-0 text-right">
+                  <p className="whitespace-nowrap text-sm font-bold text-teal-700">{slider.describe(value)}</p>
+                  <p className="whitespace-nowrap text-[10px] text-slate-400">{describeDefault(slider.describe(defaultValue))}</p>
                 </div>
               </div>
               <input

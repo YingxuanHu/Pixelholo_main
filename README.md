@@ -69,6 +69,13 @@ Open http://localhost:5173
 Optional (LLM chat): create `.env` at the repo root with:
 ```
 GROQ_API_KEY=your_key_here
+OPENAI_API_KEY=your_key_here
+GEMINI_API_KEY=your_key_here
+
+# Optional live-search tuning
+OPENAI_LIVE_SEARCH_MODEL=gpt-4o-mini
+OPENAI_REALTIME_MAX_OUTPUT_TOKENS=512
+OPENAI_REASONING_EFFORT=none
 ```
 
 ## Key Features

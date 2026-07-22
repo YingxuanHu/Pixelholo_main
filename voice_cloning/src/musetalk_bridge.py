@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import gc
 import json
 import logging
 import math
@@ -785,6 +786,25 @@ class MuseTalkBridge:
         )
         return latents, mask_arrays, mask_crop_boxes
 
+    def _clear_loaded_profile_assets(self) -> None:
+        self.frames = None
+        self.coords_xyxy = None
+        self._latents = []
+        self._mask_arrays = []
+        self._mask_crop_boxes = []
+        self._blend_alphas = []
+        self.audio_history = np.array([], dtype=np.float32)
+        self._loaded_cache_dir = None
+        self._loaded_coord_source = None
+        self._loaded_runtime_max_frame_edge = 0
+        self._coord_sha1 = None
+        self._prev_generated_face = None
+        self.frame_idx = 0
+        self.frame_accumulator = 0.0
+        self.infer_frame_accumulator = 0.0
+        self._vignette_cache.clear()
+        gc.collect()
+
     def load_profile(self, profile: str, profile_type: str = PROFILE_TYPE_AVATAR) -> None:
         cache_dir = avatar_cache_dir(profile, profile_type)
         frames_path = cache_dir / "frames.npy"
@@ -820,6 +840,14 @@ class MuseTalkBridge:
             self.audio_history = np.array([], dtype=np.float32)
             self._prev_generated_face = None
             return
+
+        if self.frames is not None or self._latents or self._mask_arrays:
+            logger.info(
+                "component=musetalk op=profile_assets_clear status=before_load previous_cache=%s next_cache=%s",
+                self._loaded_cache_dir,
+                cache_dir,
+            )
+            self._clear_loaded_profile_assets()
 
         raw_coords = np.load(coords_path).astype(np.int32)
         frames, coords_xyxy, source_fmt, runtime_edge = self._load_or_build_runtime_frame_cache(
@@ -1249,19 +1277,7 @@ class MuseTalkBridge:
         return output_frames
 
     def close(self) -> None:
-        self.frames = None
-        self.coords_xyxy = None
-        self._latents = []
-        self._mask_arrays = []
-        self._mask_crop_boxes = []
-        self._blend_alphas = []
-        self.audio_history = np.array([], dtype=np.float32)
-        self._loaded_cache_dir = None
-        self._loaded_coord_source = None
-        self._loaded_runtime_max_frame_edge = 0
-        self._coord_sha1 = None
-        self._prev_generated_face = None
-        self._vignette_cache.clear()
+        self._clear_loaded_profile_assets()
         for attr in (
             "face_parser",
             "whisper",
