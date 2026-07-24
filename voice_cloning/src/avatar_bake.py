@@ -414,7 +414,10 @@ def bake_musetalk_assets(
     print("   Baking MuseTalk assets (landmark-stabilized)...")
     vae = VAE(model_path=str(vae_dir))
     face_parser = _FaceParsingWithPaths(face_parse_resnet, face_parse_model)
-    parsing_mode = os.getenv("MUSE_TALK_PARSING_MODE", "jaw")
+    # Use the native face/lip mask instead of the broader jaw-dilated mask.
+    # This leaves the original chin texture intact while MuseTalk updates the
+    # mouth region.
+    parsing_mode = os.getenv("MUSE_TALK_PARSING_MODE", "raw")
     upper_boundary_ratio = float(os.getenv("MUSE_TALK_UPPER_BOUNDARY_RATIO", "0.5"))
     bake_expand = float(os.getenv("MUSE_TALK_BAKE_EXPAND", "1.0"))
     frame_h, frame_w = frames.shape[1:3]
@@ -466,8 +469,8 @@ def bake_avatar(
     profile_type: str = PROFILE_TYPE_AVATAR,
     fps: float = 25.0,
     start_sec: float = 0.0,
-    loop_sec: float = 10.0,
-    loop_fade_sec: float = 0.0,
+    loop_sec: float = 20.0,
+    loop_fade_sec: float = 0.15,
     resize_factor: int = 1,
     pads: tuple[int, int, int, int] = (0, 10, 0, 0),
     batch_size: int = 16,
@@ -481,7 +484,12 @@ def bake_avatar(
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     cap = cv2.VideoCapture(str(video_path))
-    src_fps = cap.get(cv2.CAP_PROP_FPS) or fps
+    reported_src_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    # MediaRecorder WebM files commonly expose their millisecond time base as
+    # an apparent 1000 FPS.  Treat implausible metadata as unknown; sampling
+    # every 40th frame otherwise collapses a 20-second recording to a handful
+    # of frames and makes the avatar loop visibly jumpy.
+    src_fps = reported_src_fps if 5.0 <= reported_src_fps <= 120.0 else (fps or 25.0)
     fps = fps or src_fps or 25.0
     frame_interval = max(1, int(round(src_fps / fps))) if src_fps else 1
     
@@ -609,8 +617,8 @@ def main() -> None:
     parser.add_argument("--profile_type", default=PROFILE_TYPE_AVATAR)
     parser.add_argument("--fps", type=float, default=25.0)
     parser.add_argument("--start_sec", type=float, default=0.0)
-    parser.add_argument("--loop_sec", type=float, default=10.0)
-    parser.add_argument("--loop_fade_sec", type=float, default=0.0)
+    parser.add_argument("--loop_sec", type=float, default=20.0)
+    parser.add_argument("--loop_fade_sec", type=float, default=0.15)
     parser.add_argument("--resize_factor", type=int, default=1)
     parser.add_argument("--pads", type=str, default="0 10 0 0")
     parser.add_argument("--batch_size", type=int, default=16)

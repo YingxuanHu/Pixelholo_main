@@ -53,9 +53,9 @@ def main() -> None:
 
     parser.add_argument("--no_bake_avatar", action="store_true", help="Skip avatar cache baking for lip-sync")
     parser.add_argument("--avatar_fps", type=float, default=DEFAULT_AVATAR_FPS)
-    parser.add_argument("--avatar_start_sec", type=float, default=5.0)
-    parser.add_argument("--avatar_loop_sec", type=float, default=10.0)
-    parser.add_argument("--avatar_loop_fade_sec", type=float, default=0.0)
+    parser.add_argument("--avatar_start_sec", type=float, default=0.0)
+    parser.add_argument("--avatar_loop_sec", type=float, default=20.0)
+    parser.add_argument("--avatar_loop_fade_sec", type=float, default=0.15)
     parser.add_argument("--avatar_resize_factor", type=int, default=1)
     parser.add_argument("--avatar_pads", type=str, default=DEFAULT_AVATAR_PADS)
     parser.add_argument("--avatar_batch_size", type=int, default=16)

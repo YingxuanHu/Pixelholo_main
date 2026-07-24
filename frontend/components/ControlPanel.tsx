@@ -44,12 +44,14 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
     [handleSend],
   );
 
-  const { isListening, startListening, stopListening, hasSupport } = useSpeechToText(onSpeechResult);
-
+  const { isListening, startListening, stopListening, hasSupport, transcript } = useSpeechToText(onSpeechResult);
   useEffect(() => {
     if (stopListeningRef) stopListeningRef.current = stopListening;
   }, [stopListening, stopListeningRef]);
 
+  useEffect(() => {
+    if (isListening) setChatText(transcript);
+  }, [isListening, transcript]);
   const startListeningSafe = useCallback(() => {
     if (onInterrupt) {
       // Keep mic start inside the click gesture path.
@@ -109,6 +111,7 @@ const ControlPanel: React.FC<ControlPanelProps> = ({ onSendChat, onSendDirect, o
           {mode === 'chat' && hasSupport && (
             <button
               onClick={isListening ? stopListening : startListeningSafe}
+              disabled={isDisabled}
               className={`rounded-lg px-3 py-2 text-xs font-bold ${
                 isListening ? 'bg-rose-500 text-white' : 'bg-slate-800 text-slate-200'
               }`}

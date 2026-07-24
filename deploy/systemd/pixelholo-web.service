@@ -1,0 +1,20 @@
+[Unit]
+Description=PixelHolo web proxy and frontend
+After=network-online.target tailscaled.service pixelholo-backend.service
+Wants=network-online.target tailscaled.service
+Requires=pixelholo-backend.service
+
+[Service]
+Type=simple
+User=alvin
+WorkingDirectory=/home/alvin/PixelHolo_trial
+Environment=PYTHONUNBUFFERED=1
+Environment=PIXELHOLO_STATIC_ROOT=/home/alvin/PixelHolo_trial/frontend/dist
+Environment=PIXELHOLO_BACKEND_ORIGIN=http://127.0.0.1:8000
+ExecStart=/home/alvin/PixelHolo_trial/voice_cloning/.venv/bin/python -c "from aiohttp import web; from tools.web_proxy import app; web.run_app(app, host='100.120.224.119', port=8080)"
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -11,7 +11,7 @@ export const useSpeechToText = (onFinalText: SpeechResultHandler) => {
   const committedTextRef = useRef('');
   const lastEmittedTextRef = useRef('');
   const latestTranscriptRef = useRef('');
-  const stoppedByUserRef = useRef(false);
+  const suppressFinalRef = useRef(false);
 
   useEffect(() => {
     onFinalTextRef.current = onFinalText;
@@ -48,7 +48,7 @@ export const useSpeechToText = (onFinalText: SpeechResultHandler) => {
       latestTranscriptRef.current = full;
 
       // If browser flags final here, send immediately.
-      if (event.results[event.resultIndex]?.isFinal) {
+      if (!suppressFinalRef.current && event.results[event.resultIndex]?.isFinal) {
         const finalText = committedTextRef.current.trim();
         if (finalText && finalText !== lastEmittedTextRef.current) {
           lastEmittedTextRef.current = finalText;
@@ -59,18 +59,19 @@ export const useSpeechToText = (onFinalText: SpeechResultHandler) => {
     };
 
     recognition.onerror = () => {
+      suppressFinalRef.current = false;
       setIsListening(false);
     };
     recognition.onend = () => {
-      // If the user explicitly stopped, discard partial transcript instead of submitting.
-      if (!stoppedByUserRef.current) {
-        const finalText = committedTextRef.current.trim() || latestTranscriptRef.current.trim();
-        if (finalText && finalText !== lastEmittedTextRef.current) {
-          lastEmittedTextRef.current = finalText;
-          onFinalTextRef.current(finalText);
-        }
+      // Some browsers end on silence without firing a useful final result.
+      // Ensure we still auto-submit when speaking stops.
+      const finalText = committedTextRef.current.trim() || latestTranscriptRef.current.trim();
+      const shouldEmit = !suppressFinalRef.current;
+      suppressFinalRef.current = false;
+      if (shouldEmit && finalText && finalText !== lastEmittedTextRef.current) {
+        lastEmittedTextRef.current = finalText;
+        onFinalTextRef.current(finalText);
       }
-      stoppedByUserRef.current = false;
       setIsListening(false);
     };
 
@@ -90,10 +91,10 @@ export const useSpeechToText = (onFinalText: SpeechResultHandler) => {
   const startListening = () => {
     if (!recognitionRef.current || isListening) return;
     try {
-      stoppedByUserRef.current = false;
       committedTextRef.current = '';
       lastEmittedTextRef.current = '';
       latestTranscriptRef.current = '';
+      suppressFinalRef.current = false;
       setTranscript('');
       recognitionRef.current.start();
       setIsListening(true);
@@ -103,13 +104,13 @@ export const useSpeechToText = (onFinalText: SpeechResultHandler) => {
   };
 
   const stopListening = () => {
-    if (!recognitionRef.current || !isListening) return;
-    stoppedByUserRef.current = true;
+    suppressFinalRef.current = true;
     try {
-      recognitionRef.current.stop();
+      recognitionRef.current?.stop();
     } catch {
-      // ignore
+      // ignore stop races when the browser has already ended recognition
     }
+    setIsListening(false);
   };
 
   return {

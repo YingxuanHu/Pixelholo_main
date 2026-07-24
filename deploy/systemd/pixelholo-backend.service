@@ -1,0 +1,17 @@
+[Unit]
+Description=PixelHolo inference API (Chatterbox + MuseTalk)
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+User=alvin
+WorkingDirectory=/home/alvin/PixelHolo_trial/voice_cloning
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/alvin/PixelHolo_trial/voice_cloning/.venv/bin/python -m uvicorn src.inference:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -63,7 +63,10 @@ class MuseTalkBridge:
             torch.backends.cudnn.benchmark = True
 
         self.batch_size = int(batch_size or os.getenv("MUSE_TALK_BATCH_SIZE", "24"))
-        self.parsing_mode = parsing_mode or os.getenv("MUSE_TALK_PARSING_MODE", "jaw")
+        # Keep the replacement mask to MuseTalk's native face/lip segmentation.
+        # The custom `jaw` dilation can overwrite the chin with the model's
+        # lower-resolution reconstruction, which reads as a blurry jawline.
+        self.parsing_mode = parsing_mode or os.getenv("MUSE_TALK_PARSING_MODE", "raw")
         self.audio_padding_left = int(
             audio_padding_left or os.getenv("MUSE_TALK_AUDIO_PADDING_LEFT", "2")
         )
@@ -101,7 +104,19 @@ class MuseTalkBridge:
         self.alpha_blur_ratio = float(os.getenv("MUSE_TALK_ALPHA_BLUR_RATIO", "0.035"))
         self.vignette_margin_ratio = float(os.getenv("MUSE_TALK_VIGNETTE_MARGIN_RATIO", "0.02"))
         self.alpha_gamma = float(os.getenv("MUSE_TALK_ALPHA_GAMMA", "0.82"))
-        self.detail_sharpen = float(os.getenv("MUSE_TALK_DETAIL_SHARPEN", "0.28"))
+        # MuseTalk reconstructs the mouth at 256px and the result is then expanded
+        # into the portrait frame.  A moderate luminance-only sharpen restores some
+        # lip/teeth edge definition without introducing ringing around the mouth.
+        self.detail_sharpen = float(os.getenv("MUSE_TALK_DETAIL_SHARPEN", "0.58"))
+        # MuseTalk's generated face is 256px.  Keep its lower edge from
+        # replacing the source chin, where the reconstruction is most likely
+        # to look soft or lose the natural jaw contour.
+        self.mouth_mask_bottom_ratio = float(
+            os.getenv("MUSE_TALK_MOUTH_MASK_BOTTOM_RATIO", "0.84")
+        )
+        self.mouth_mask_bottom_feather = float(
+            os.getenv("MUSE_TALK_MOUTH_MASK_BOTTOM_FEATHER", "0.08")
+        )
         self.color_match_strength = float(os.getenv("MUSE_TALK_COLOR_MATCH_STRENGTH", "0.65"))
         self.cache_version = int(os.getenv("MUSE_TALK_CACHE_VERSION", "9"))
         self.mask_stabilize = os.getenv("MUSE_TALK_MASK_STABILIZE", "1") != "0"
@@ -125,6 +140,7 @@ class MuseTalkBridge:
         self._loaded_cache_dir: Path | None = None
         self._loaded_coord_source: str | None = None
         self._loaded_runtime_max_frame_edge = 0
+        self._loaded_cache_signature: tuple[tuple[str, int, int] | None, ...] | None = None
         self._coord_sha1: str | None = None
         self._vignette_cache: dict[tuple[int, int, int, int], np.ndarray] = {}
         self._prev_generated_face: np.ndarray | None = None
@@ -533,6 +549,31 @@ class MuseTalkBridge:
         out = cv2.merge((l_out, a, b))
         return cv2.cvtColor(out, cv2.COLOR_LAB2BGR)
 
+    def _restrict_chin_blend(
+        self,
+        alpha: np.ndarray,
+        face_box: tuple[int, int, int, int],
+        crop_box: tuple[int, int, int, int],
+    ) -> np.ndarray:
+        """Fade the generated face before it reaches the source chin."""
+        if alpha.size == 0:
+            return alpha
+        _x1, y1, _x2, y2 = face_box
+        _cx1, cy1, _cx2, _cy2 = crop_box
+        face_height = max(1, int(y2 - y1))
+        bottom_ratio = float(np.clip(self.mouth_mask_bottom_ratio, 0.65, 1.05))
+        feather_ratio = float(np.clip(self.mouth_mask_bottom_feather, 0.01, 0.25))
+        bottom = float(y1 - cy1) + face_height * bottom_ratio
+        feather = max(2.0, face_height * feather_ratio)
+        rows = np.arange(alpha.shape[0], dtype=np.float32)
+        gate = np.ones_like(rows)
+        fade_start = bottom - feather
+        fade_end = bottom + feather
+        gate[rows >= fade_end] = 0.0
+        fading = (rows > fade_start) & (rows < fade_end)
+        gate[fading] = (fade_end - rows[fading]) / max(1.0, fade_end - fade_start)
+        return np.clip(alpha * gate[:, None], 0.0, 1.0)
+
     def _cache_manifest(
         self,
         coords_sha1: str,
@@ -797,6 +838,7 @@ class MuseTalkBridge:
         self._loaded_cache_dir = None
         self._loaded_coord_source = None
         self._loaded_runtime_max_frame_edge = 0
+        self._loaded_cache_signature = None
         self._coord_sha1 = None
         self._prev_generated_face = None
         self.frame_idx = 0
@@ -827,8 +869,19 @@ class MuseTalkBridge:
                 f"Avatar cache missing for {profile}. Run preprocess with avatar baking."
             )
 
+        cache_signature = tuple(
+            (
+                str(path.name),
+                int(path.stat().st_mtime_ns),
+                int(path.stat().st_size),
+            )
+            if path.exists()
+            else None
+            for path in (frames_path, coords_path, meta_path, cache_dir / "musetalk_runtime_meta.json")
+        )
         if (
             self._loaded_cache_dir == cache_dir
+            and self._loaded_cache_signature == cache_signature
             and self._loaded_coord_source == coord_source
             and self._loaded_runtime_max_frame_edge == self._runtime_edge()
             and self.frames is not None
@@ -936,6 +989,7 @@ class MuseTalkBridge:
         self._loaded_cache_dir = cache_dir
         self._loaded_coord_source = coord_source
         self._loaded_runtime_max_frame_edge = self._runtime_edge()
+        self._loaded_cache_signature = cache_signature
         self.frame_idx = 0
         self.frame_accumulator = 0.0
         self.infer_frame_accumulator = 0.0
@@ -1151,6 +1205,7 @@ class MuseTalkBridge:
         if alpha.shape[:2] != (patch_h, patch_w):
             alpha = cv2.resize(alpha, (patch_w, patch_h), interpolation=cv2.INTER_LINEAR)
         alpha = np.clip(alpha.astype(np.float32), 0.0, 1.0)
+        alpha = self._restrict_chin_blend(alpha, (x1, y1, x2, y2), (cx1, cy1, cx2, cy2))
         alpha_3 = alpha[:, :, None]
         blended_patch = (composed_patch * alpha_3) + (original_patch * (1.0 - alpha_3))
 

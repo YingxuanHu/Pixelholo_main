@@ -84,7 +84,7 @@ def main() -> None:
 
     # Common chunked knobs
     parser.add_argument("--chunk_sec", type=float, default=1.0)
-    parser.add_argument("--loop_sec", type=float, default=10.0)
+    parser.add_argument("--loop_sec", type=float, default=20.0)
     parser.add_argument("--fps", type=float, default=0.0)
     parser.add_argument("--resize_factor", type=int, default=2)
     parser.add_argument("--fourcc", type=str, default="MJPG")

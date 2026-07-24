@@ -4,6 +4,7 @@ import Header from './components/Header';
 import StepCard from './components/StepCard';
 import LogPanel from './components/LogPanel';
 import VoiceControlsPanel from './components/VoiceControlsPanel';
+import { useSpeechToText } from './hooks/useSpeechToText';
 import {
   Profile,
   StepStatus,
@@ -13,7 +14,9 @@ import {
   InferenceChunk,
   ProfileInfo,
   ProfileType,
+  TTSBackend,
   VoiceControlValues,
+  VoiceEmotion,
 } from './types';
 
 type TrainFlags = {
@@ -37,6 +40,12 @@ type VoiceControlBackendDefaults = {
   embeddingScale: number;
   paceScale: number;
   volumeGain: number;
+  ttsExaggeration: number;
+  ttsTemperature: number;
+  ttsCfgWeight: number;
+  ttsRepetitionPenalty: number;
+  avatarEmotion: VoiceEmotion;
+  avatarEmotionIntensity: number;
 };
 type ProfileRuntimeSettings = {
   voice_controls?: Partial<VoiceControlValues>;
@@ -70,24 +79,69 @@ type QueuedVideoFrame = {
   frame: VideoFrameSource;
   t: number;
 };
-
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+// A raw upload is only a source asset.  Inference needs either a trained
+// checkpoint (the legacy path) or the processed clips produced by the
+// zero-shot preprocessing pipeline.  The avatar preprocessor writes its
+// extracted full-track WAV at the profile root, so raw_audio_files is not a
+// reliable readiness signal for video-only uploads.
+const profileIsInferenceReady = (item?: ProfileInfo | null) => Boolean(
+  item?.has_profile
+  || (item?.processed_wavs ?? 0) > 0,
+);
 const env = (import.meta as any).env ?? {};
+const IS_PRODUCTION_BUILD = env.PROD === true || env.MODE === 'production';
 const envNumber = (key: string, fallback: number, min?: number, max?: number) => {
   const raw = (env[key] as string | undefined)?.trim();
   const parsed = raw ? Number(raw) : fallback;
   const value = Number.isFinite(parsed) ? parsed : fallback;
   return clamp(value, min ?? Number.NEGATIVE_INFINITY, max ?? Number.POSITIVE_INFINITY);
 };
-const DEFAULT_API_BASE = (env.VITE_PIXELHOLO_API_BASE as string | undefined)?.trim() || 'http://127.0.0.1:8000';
+// Production is served through tools/web_proxy.py, which exposes FastAPI at the
+// same-origin /api route. Pointing a public browser at 127.0.0.1 would instead
+// target that visitor's own computer and make the engine appear offline.
+const DEFAULT_API_BASE = (env.VITE_PIXELHOLO_API_BASE as string | undefined)?.trim()
+  || (IS_PRODUCTION_BUILD ? '/api' : 'http://127.0.0.1:8000');
 const BINARY_STREAM_MEDIA_TYPE = 'application/vnd.pixelholo.stream-v1';
 const BINARY_STREAM_MAGIC = [80, 72, 83, 49]; // PHS1
 const BINARY_STREAM_HEADER_BYTES = 12;
 const BINARY_STREAM_ENABLED = (env.VITE_PIXELHOLO_BINARY_STREAM as string | undefined) !== '0';
 const BINARY_PCM_AUDIO_ENABLED = (env.VITE_PIXELHOLO_BINARY_PCM_AUDIO as string | undefined) !== '0';
 const LOCAL_STORAGE_API_BASE_KEY = 'voxclone_api_base';
-const DEFAULT_PROFILE_TYPE: 'voice' | 'avatar' = 'voice';
-const DEFAULT_OUTPUT_MODE: 'voice' | 'avatar' = 'voice';
+const LOCAL_STORAGE_WORKSPACE_KEY = 'pixelholo_workspace_id';
+const WORKSPACE_HEADER = 'X-PixelHolo-Workspace';
+
+const createAnonymousWorkspaceId = (): string => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+  throw new Error('This browser cannot create an anonymous workspace.');
+};
+
+const getOrCreateAnonymousWorkspaceId = (): string => {
+  const cached = localStorage.getItem(LOCAL_STORAGE_WORKSPACE_KEY);
+  if (cached && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(cached)) {
+    return cached;
+  }
+  const workspaceId = createAnonymousWorkspaceId();
+  localStorage.setItem(LOCAL_STORAGE_WORKSPACE_KEY, workspaceId);
+  return workspaceId;
+};
+// The web product is avatar-first: one short video becomes the user's voice
+// reference plus the baked face frames used by MuseTalk.  The legacy voice-only
+// and training paths remain in the backend, but are intentionally not exposed in
+// this experience.
+const DEFAULT_PROFILE_TYPE: 'voice' | 'avatar' = 'avatar';
+const DEFAULT_OUTPUT_MODE: 'voice' | 'avatar' = 'avatar';
+const DEFAULT_TTS_BACKEND: TTSBackend = 'chatterbox';
 const DEFAULT_LLM_MODE: LLMMode = 'legacy_fast';
 const DEFAULT_MUSETALK_PRESET: MuseTalkPreset = 'realistic';
 const LLM_MODE_OPTIONS: { value: LLMMode; label: string }[] = [
@@ -96,23 +150,41 @@ const LLM_MODE_OPTIONS: { value: LLMMode; label: string }[] = [
   { value: 'gemini_search', label: 'Gemini 2.5 Flash Lite (Live Search)' },
   { value: 'auto', label: 'Auto (Llama/GPT/Gemini)' },
 ];
-const DEFAULT_AVATAR_START_SEC = 5;
+const DEFAULT_AVATAR_START_SEC = 0;
+const DEFAULT_AVATAR_LOOP_SEC = 20;
+const DEFAULT_AVATAR_LOOP_FADE_SEC = 0.15;
+const CAMERA_RECORDING_SECONDS = 20;
+const CAMERA_PROMPT = 'Hi, this is my PixelHolo avatar. I am speaking clearly and naturally in my everyday voice. Today is a bright day, and this sample shows my pronunciation, rhythm, and tone. Please listen to how I normally sound while I speak naturally and comfortably.';
+const normalizeProfileName = (value: string) => value.trim().toLocaleLowerCase();
 const BLUR_KERNEL_BY_LEVEL = { low: 60, medium: 75, high: 90 } as const;
 const DEFAULT_AVATAR_BLUR_LEVEL: keyof typeof BLUR_KERNEL_BY_LEVEL = 'medium';
 const DEFAULT_VIDEO_FPS = 25;
 const DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE = Number(
-  (env.VITE_PIXELHOLO_AVATAR_MAX_FRAME_EDGE as string | undefined)?.trim() || '853',
+  (env.VITE_PIXELHOLO_AVATAR_MAX_FRAME_EDGE as string | undefined)?.trim() || '1080',
 );
 const DEFAULT_AUDIO_START_DELAY_SEC = envNumber('VITE_PIXELHOLO_AUDIO_START_DELAY_SEC', 0.04, 0.02, 0.25);
 const AVATAR_AUDIO_START_DELAY_SEC = envNumber('VITE_PIXELHOLO_AVATAR_AUDIO_START_DELAY_SEC', 0.34, 0.12, 1.0);
 const AVATAR_AUDIO_CHUNK_LEAD_SEC = envNumber('VITE_PIXELHOLO_AVATAR_AUDIO_CHUNK_LEAD_SEC', 0.08, 0.02, 0.5);
 const VIDEO_FRAME_DECODE_PREWAIT_MS = envNumber('VITE_PIXELHOLO_VIDEO_PREDECODE_PREWAIT_MS', 45, 0, 200);
 const WARMUP_CACHE_MAX_AGE_MS = 120_000;
-const normalizeVoiceControls = (controls: VoiceControlValues): VoiceControlValues => ({
-  pitch: Number(clamp(controls.pitch, -4, 4).toFixed(1)),
-  pace: Math.round(clamp(controls.pace, -100, 100)),
-  tone: Math.round(clamp(controls.tone, -100, 100)),
-  volume: Math.round(clamp(controls.volume, -100, 100)),
+const normalizeTtsBackend = (_value: unknown): TTSBackend => 'chatterbox';
+const normalizeVoiceEmotion = (value: unknown): VoiceEmotion => {
+  if (value === 'happy' || value === 'sad' || value === 'angry' || value === 'scared' || value === 'disgust') {
+    return value;
+  }
+  return 'neutral';
+};
+const normalizeVoiceControls = (controls: Partial<VoiceControlValues>): VoiceControlValues => ({
+  pitch: Number(clamp(Number(controls.pitch ?? 0), -4, 4).toFixed(1)),
+  pace: Math.round(clamp(Number(controls.pace ?? 0), -100, 100)),
+  tone: Math.round(clamp(Number(controls.tone ?? 0), -100, 100)),
+  volume: Math.round(clamp(Number(controls.volume ?? 0), -100, 100)),
+  expressiveness: Number(clamp(Number(controls.expressiveness ?? 0.5), 0.25, 1).toFixed(2)),
+  variation: Number(clamp(Number(controls.variation ?? 0.8), 0.1, 1.2).toFixed(2)),
+  guidance: Number(clamp(Number(controls.guidance ?? 0.5), 0, 1).toFixed(2)),
+  repetition: Number(clamp(Number(controls.repetition ?? 1.2), 0.9, 2).toFixed(2)),
+  emotion: normalizeVoiceEmotion(controls.emotion),
+  emotionIntensity: Number(clamp(Number(controls.emotionIntensity ?? 0.5), 0, 1).toFixed(2)),
 });
 const normalizeRuntimeSettings = (settings: any): ProfileRuntimeSettings => {
   const normalized: ProfileRuntimeSettings = {};
@@ -122,6 +194,12 @@ const normalizeRuntimeSettings = (settings: any): ProfileRuntimeSettings => {
       pace: Number(settings.voice_controls.pace ?? 0),
       tone: Number(settings.voice_controls.tone ?? 0),
       volume: Number(settings.voice_controls.volume ?? 0),
+      expressiveness: Number(settings.voice_controls.expressiveness ?? 0.5),
+      variation: Number(settings.voice_controls.variation ?? 0.8),
+      guidance: Number(settings.voice_controls.guidance ?? 0.5),
+      repetition: Number(settings.voice_controls.repetition ?? 1.2),
+      emotion: normalizeVoiceEmotion(settings.voice_controls.emotion),
+      emotionIntensity: Number(settings.voice_controls.emotion_intensity ?? settings.voice_controls.emotionIntensity ?? 0.5),
     });
   }
   return normalized;
@@ -132,12 +210,27 @@ const DEFAULT_VOICE_CONTROL_BACKEND_DEFAULTS: VoiceControlBackendDefaults = {
   embeddingScale: 1.2,
   paceScale: 1,
   volumeGain: 1,
+  // Chatterbox is most stable for identity when sampling is conservative.
+  // Keep these defaults below the expressive/creative preset so an uploaded
+  // voice is less likely to acquire a different accent between utterances.
+  ttsExaggeration: 0.35,
+  ttsTemperature: 0.5,
+  ttsCfgWeight: 0.8,
+  ttsRepetitionPenalty: 1.2,
+  avatarEmotion: 'neutral',
+  avatarEmotionIntensity: 0.5,
 };
 const DEFAULT_VOICE_CONTROL_VALUES = normalizeVoiceControls({
   pitch: 0,
   pace: 0,
   tone: 0,
   volume: 0,
+  expressiveness: 0.35,
+  variation: 0.5,
+  guidance: 0.8,
+  repetition: 1.2,
+  emotion: 'neutral',
+  emotionIntensity: 0.5,
 });
 const formatBytes = (value: number) => {
   if (!Number.isFinite(value) || value <= 0) return '0 MB';
@@ -239,11 +332,20 @@ const trainPreset: TrainParams = { batchSize: 2, epochs: 15, maxLen: 400 };
 const App: React.FC = () => {
   const [activeStep, setActiveStep] = useState(1);
   const [apiBase, setApiBase] = useState(DEFAULT_API_BASE);
+  const [workspaceId] = useState(getOrCreateAnonymousWorkspaceId);
   const [apiStatus, setApiStatus] = useState<'online' | 'offline' | 'checking'>('checking');
   const [profileType, setProfileType] = useState<'voice' | 'avatar'>(DEFAULT_PROFILE_TYPE);
   const [profile, setProfile] = useState<Profile>({ name: '', lastUploadedFile: null, fileSize: null });
+  const [isCreatingProfile, setIsCreatingProfile] = useState(true);
+  const [showWelcome, setShowWelcome] = useState(true);
+  const [autoPrepareAfterUpload, setAutoPrepareAfterUpload] = useState(false);
   const [lastUploadedFilename, setLastUploadedFilename] = useState<string | null>(null);
   const [lastUploadedAudioFilename, setLastUploadedAudioFilename] = useState<string | null>(null);
+  const [sourceMode, setSourceMode] = useState<'upload' | 'camera'>('upload');
+  const [cameraState, setCameraState] = useState<'idle' | 'requesting' | 'ready' | 'recording' | 'recorded' | 'error'>('idle');
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [cameraElapsed, setCameraElapsed] = useState(0);
+  const [cameraPreviewUrl, setCameraPreviewUrl] = useState<string | null>(null);
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [profilesStatus, setProfilesStatus] = useState<'idle' | 'loading' | 'error'>('idle');
   const [profileMenuKey, setProfileMenuKey] = useState<string | null>(null);
@@ -274,12 +376,22 @@ const App: React.FC = () => {
   const [uploadBytesAudio, setUploadBytesAudio] = useState<{ loaded: number; total: number }>({ loaded: 0, total: 0 });
   const uploadVideoLastPctRef = useRef(0);
   const uploadAudioLastPctRef = useRef(0);
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const minimalNameInputRef = useRef<HTMLInputElement | null>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
+  const cameraPreviewUrlRef = useRef<string | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const cameraChunksRef = useRef<Blob[]>([]);
+  const cameraTimerRef = useRef<number | null>(null);
   const [inferenceText, setInferenceText] = useState('');
+  const [composerMode, setComposerMode] = useState<'say' | 'chat'>('chat');
+  const [showVoiceSettings, setShowVoiceSettings] = useState(false);
   const [inferenceChunks, setInferenceChunks] = useState<InferenceChunk[]>([]);
   const [latency, setLatency] = useState<{ ttfa: number; total: number } | null>(null);
   const [modelOverride, setModelOverride] = useState('');
   const [refOverride, setRefOverride] = useState('');
   const [avatarBackend, setAvatarBackend] = useState<'wav2lip' | 'musetalk'>('musetalk');
+  const [ttsBackend, setTtsBackend] = useState<TTSBackend>(DEFAULT_TTS_BACKEND);
   const [museTalkPreset, setMuseTalkPreset] = useState<MuseTalkPreset>(DEFAULT_MUSETALK_PRESET);
   const [outputMode, setOutputMode] = useState<'voice' | 'avatar'>(DEFAULT_OUTPUT_MODE);
   const [llmMode, setLlmMode] = useState<LLMMode>(DEFAULT_LLM_MODE);
@@ -294,6 +406,7 @@ const App: React.FC = () => {
   const [voiceControlsError, setVoiceControlsError] = useState<string | null>(null);
   const [voiceControlsDirty, setVoiceControlsDirty] = useState(false);
   const [videoState, setVideoState] = useState<'idle' | 'buffering' | 'playing'>('idle');
+  const [isPlaybackActive, setIsPlaybackActive] = useState(false);
   const [videoFps, setVideoFps] = useState(DEFAULT_VIDEO_FPS);
   const [videoQueue, setVideoQueue] = useState(0);
 
@@ -306,8 +419,12 @@ const App: React.FC = () => {
   const streamRunningRef = useRef(false);
   const streamSessionRef = useRef<number>(0);
   const isBusy = Object.values(stepStatuses).some(status => status === 'running');
+  const isProfileSwitchBlocked = Object.entries(stepStatuses).some(
+    ([step, status]) => step !== 'inference' && status === 'running',
+  );
   const warmedProfilesRef = useRef<Map<string, number>>(new Map());
   const warmupInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
+  const profileSelectionRef = useRef(0);
   const backendRuntimeIdRef = useRef<string | null>(null);
   const activeWarmupKeyRef = useRef<string | null>(null);
   const videoCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -317,6 +434,7 @@ const App: React.FC = () => {
   const videoNextFrameTimeRef = useRef<number | null>(null);
   const videoStateRef = useRef<'idle' | 'buffering' | 'playing'>('idle');
   const videoDrawSerialRef = useRef(0);
+  const playbackSettleTimerRef = useRef<number | null>(null);
   const audioStartDelayRef = useRef<number>(DEFAULT_AUDIO_START_DELAY_SEC);
   const videoFpsRef = useRef<number>(DEFAULT_VIDEO_FPS);
   const frameQueueRef = useRef<QueuedVideoFrame[]>([]);
@@ -344,10 +462,17 @@ const App: React.FC = () => {
     setTrainParams(trainPreset);
   }, []);
 
+  const apiFetch = useCallback((input: RequestInfo | URL, init: RequestInit = {}) => {
+    const headers = new Headers(init.headers);
+    headers.set(WORKSPACE_HEADER, workspaceId);
+    return fetch(input, { ...init, headers });
+  }, [workspaceId]);
+
   const uploadWithProgress = useCallback((url: string, form: FormData, onProgress: (loaded: number, total: number) => void) => {
     return new Promise<string>((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('POST', url);
+      xhr.setRequestHeader(WORKSPACE_HEADER, workspaceId);
       xhr.upload.onprogress = (event) => {
         if (event.lengthComputable) {
           onProgress(event.loaded, event.total);
@@ -360,10 +485,10 @@ const App: React.FC = () => {
           reject(new Error(xhr.responseText || `Upload failed (${xhr.status})`));
         }
       };
-      xhr.onerror = () => reject(new Error('Upload failed'));
+      xhr.onerror = () => reject(new Error('Upload failed: the PixelHolo API is unreachable. Start the backend or check the API endpoint in connection settings.'));
       xhr.send(form);
     });
-  }, []);
+  }, [workspaceId]);
 
   useEffect(() => {
     if (profileType === 'avatar') {
@@ -373,8 +498,17 @@ const App: React.FC = () => {
   }, [profileType]);
 
   useEffect(() => {
+    if (IS_PRODUCTION_BUILD) {
+      // Public visitors must always stay on the same-origin proxy. Do not let
+      // a stale or manually saved development endpoint make the app offline.
+      localStorage.removeItem(LOCAL_STORAGE_API_BASE_KEY);
+      setApiBase('/api');
+      return;
+    }
+
     const cached = localStorage.getItem(LOCAL_STORAGE_API_BASE_KEY);
-    if (cached) setApiBase(cached);
+    if (!cached) return;
+    setApiBase(cached);
   }, []);
 
   useEffect(() => {
@@ -388,6 +522,7 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    if (IS_PRODUCTION_BUILD) return;
     localStorage.setItem(LOCAL_STORAGE_API_BASE_KEY, apiBase);
   }, [apiBase]);
 
@@ -408,7 +543,7 @@ const App: React.FC = () => {
   const loadProfiles = useCallback(async () => {
     setProfilesStatus('loading');
     try {
-      const res = await fetch(`${apiBase}/profiles?profile_type=${profileType}`, { cache: 'no-store' });
+      const res = await apiFetch(`${apiBase}/profiles?profile_type=${profileType}`, { cache: 'no-store' });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setProfiles(Array.isArray(data.profiles) ? data.profiles : []);
@@ -417,7 +552,7 @@ const App: React.FC = () => {
     } catch (err) {
       setProfilesStatus('error');
     }
-  }, [apiBase, profileType]);
+  }, [apiBase, apiFetch, profileType]);
 
   const readErrorDetail = useCallback(async (res: Response) => {
     const raw = await res.text();
@@ -468,7 +603,7 @@ const App: React.FC = () => {
       if (!nextName || nextName === item.name) return;
       setProfileMenuKey(null);
       try {
-        const res = await fetch(`${apiBase}/profiles/${encodeURIComponent(item.name)}`, {
+        const res = await apiFetch(`${apiBase}/profiles/${encodeURIComponent(item.name)}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ new_name: nextName, profile_type: currentType }),
@@ -486,7 +621,7 @@ const App: React.FC = () => {
         setUiNotice(`Rename failed: ${String(err)}`);
       }
     },
-    [apiBase, invalidateWarmupEntriesForProfile, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
+    [apiBase, apiFetch, invalidateWarmupEntriesForProfile, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
   );
 
   const handleDeleteProfile = useCallback(
@@ -503,7 +638,7 @@ const App: React.FC = () => {
       setProfileMenuKey(null);
       try {
         const params = new URLSearchParams({ profile_type: currentType });
-        const res = await fetch(`${apiBase}/profiles/${encodeURIComponent(item.name)}?${params.toString()}`, {
+        const res = await apiFetch(`${apiBase}/profiles/${encodeURIComponent(item.name)}?${params.toString()}`, {
           method: 'DELETE',
         });
         if (!res.ok) {
@@ -511,6 +646,7 @@ const App: React.FC = () => {
         }
         if (profile.name === item.name && profileType === currentType) {
           setProfile(prev => ({ ...prev, name: '', lastUploadedFile: null, fileSize: null }));
+          setIsCreatingProfile(true);
           setLastUploadedFilename(null);
           setLastUploadedAudioFilename(null);
           setActiveStep(1);
@@ -521,7 +657,7 @@ const App: React.FC = () => {
         setUiNotice(`Delete failed: ${String(err)}`);
       }
     },
-    [apiBase, invalidateWarmupEntriesForProfile, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
+    [apiBase, apiFetch, invalidateWarmupEntriesForProfile, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
   );
 
   const warmupKeyFor = useCallback(
@@ -529,11 +665,12 @@ const App: React.FC = () => {
       profileName: string,
       type: ProfileType,
       backend: 'wav2lip' | 'musetalk',
+      tts: TTSBackend,
       mode: LLMMode,
       preset: MuseTalkPreset,
       runtimeId: string | null,
     ) =>
-      `${runtimeId || 'unknown'}|${apiBase}|${type}|${profileName}|${type === 'avatar' ? `${backend}:${preset}` : '-'}|${mode}`,
+      `${runtimeId || 'unknown'}|${apiBase}|${type}|${profileName}|${tts}|${type === 'avatar' ? `${backend}:${preset}` : '-'}|${mode}`,
     [apiBase],
   );
 
@@ -558,8 +695,10 @@ const App: React.FC = () => {
 
   const warmupProfile = useCallback(async (profileName: string, type: ProfileType) => {
     if (!profileName) return;
+    const selectionId = profileSelectionRef.current;
+    const isCurrentSelection = () => selectionId === profileSelectionRef.current;
     const runtimeId = backendRuntimeIdRef.current;
-    const key = warmupKeyFor(profileName, type, avatarBackend, llmMode, museTalkPreset, runtimeId);
+    const key = warmupKeyFor(profileName, type, avatarBackend, ttsBackend, llmMode, museTalkPreset, runtimeId);
     if (hasFreshWarmup(key)) return;
 
     const inFlight = warmupInFlightRef.current.get(key);
@@ -569,16 +708,19 @@ const App: React.FC = () => {
     }
 
     const promise = (async () => {
-      activeWarmupKeyRef.current = key;
-      setIsWarmingUp(true);
-      setWarmupTargetName(profileName);
+      if (isCurrentSelection()) {
+        activeWarmupKeyRef.current = key;
+        setIsWarmingUp(true);
+        setWarmupTargetName(profileName);
+      }
       try {
-        const res = await fetch(`${apiBase}/warmup`, {
+        const res = await apiFetch(`${apiBase}/warmup`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             profile: profileName,
             profile_type: type,
+            tts_backend: ttsBackend,
             lipsync_backend: type === 'avatar' ? avatarBackend : null,
             avatar_max_frame_edge:
               type === 'avatar' && Number.isFinite(DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE) && DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE > 0
@@ -603,13 +745,13 @@ const App: React.FC = () => {
             : avatarBackend;
         if (isWarmupSatisfied(data, type)) {
           warmedProfilesRef.current.set(
-            warmupKeyFor(profileName, type, resolvedBackend, llmMode, museTalkPreset, resolvedRuntimeId ?? backendRuntimeIdRef.current),
+            warmupKeyFor(profileName, type, resolvedBackend, ttsBackend, llmMode, museTalkPreset, resolvedRuntimeId ?? backendRuntimeIdRef.current),
             Date.now(),
           );
         }
       } finally {
         warmupInFlightRef.current.delete(key);
-        if (activeWarmupKeyRef.current === key) {
+        if (isCurrentSelection() && activeWarmupKeyRef.current === key) {
           activeWarmupKeyRef.current = null;
           setIsWarmingUp(false);
           setWarmupTargetName(null);
@@ -619,7 +761,7 @@ const App: React.FC = () => {
 
     warmupInFlightRef.current.set(key, promise);
     await promise;
-  }, [apiBase, avatarBackend, hasFreshWarmup, isWarmupSatisfied, llmMode, museTalkPreset, warmupKeyFor]);
+  }, [apiBase, apiFetch, avatarBackend, hasFreshWarmup, isWarmupSatisfied, llmMode, museTalkPreset, ttsBackend, warmupKeyFor]);
 
   useEffect(() => {
     loadProfiles();
@@ -636,7 +778,7 @@ const App: React.FC = () => {
     let cancelled = false;
     const controller = new AbortController();
     setApiStatus('checking');
-    fetch(`${apiBase}/docs`, { signal: controller.signal })
+    apiFetch(`${apiBase}/docs`, { signal: controller.signal })
       .then((res) => {
         if (!cancelled) setApiStatus(res.ok ? 'online' : 'offline');
       })
@@ -647,12 +789,12 @@ const App: React.FC = () => {
       cancelled = true;
       controller.abort();
     };
-  }, [apiBase]);
+  }, [apiBase, apiFetch]);
 
   useEffect(() => {
     if (apiStatus !== 'online') return;
     let cancelled = false;
-    fetch(`${apiBase}/lipsync_backend`, { cache: 'no-store' })
+    apiFetch(`${apiBase}/lipsync_backend`, { cache: 'no-store' })
       .then(async (res) => {
         if (!res.ok) throw new Error(await res.text());
         return res.json();
@@ -660,6 +802,7 @@ const App: React.FC = () => {
       .then((data) => {
         if (cancelled) return;
         const backend = data?.backend === 'wav2lip' ? 'wav2lip' : 'musetalk';
+        const nextTtsBackend = normalizeTtsBackend(data?.tts_backend);
         const runtimeId = typeof data?.runtime_instance_id === 'string' ? data.runtime_instance_id : null;
         if (backendRuntimeIdRef.current && runtimeId && backendRuntimeIdRef.current !== runtimeId) {
           warmedProfilesRef.current.clear();
@@ -667,6 +810,7 @@ const App: React.FC = () => {
         }
         backendRuntimeIdRef.current = runtimeId;
         setAvatarBackend(backend);
+        setTtsBackend(nextTtsBackend);
       })
       .catch(() => {
         // Keep existing value on endpoint/read errors.
@@ -674,11 +818,20 @@ const App: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [apiBase, apiStatus]);
+  }, [apiBase, apiFetch, apiStatus]);
 
   const currentProfileInfo = profiles.find((item) => item.name === profile.name);
+  const profileNameTaken = Boolean(
+    isCreatingProfile
+      && profile.name.trim()
+      && profiles.some((item) => {
+        const itemType = item.profile_type === 'voice' ? 'voice' : 'avatar';
+        return itemType === profileType && normalizeProfileName(item.name) === normalizeProfileName(profile.name);
+      }),
+  );
   const hasTrainedProfile = Boolean(currentProfileInfo?.has_profile);
   const hasData = Boolean(currentProfileInfo?.has_data);
+  const hasInferenceProfile = profileIsInferenceReady(currentProfileInfo);
   const resolvePaceScale = useCallback(
     (pace: number) => {
       const base = voiceControlBackendDefaults?.paceScale ?? 1;
@@ -733,7 +886,7 @@ const App: React.FC = () => {
     setRuntimeSettingsStatus('saving');
     setRuntimeSettingsError(null);
     try {
-      const res = await fetch(`${apiBase}/profiles/${encodeURIComponent(profileName)}/runtime-settings`, {
+      const res = await apiFetch(`${apiBase}/profiles/${encodeURIComponent(profileName)}/runtime-settings`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -750,6 +903,7 @@ const App: React.FC = () => {
     }
   }, [
     apiBase,
+    apiFetch,
     apiStatus,
     profile.name,
     profileType,
@@ -758,7 +912,7 @@ const App: React.FC = () => {
   ]);
 
   useEffect(() => {
-    if (apiStatus !== 'online' || !profile.name || !hasTrainedProfile) {
+    if (apiStatus !== 'online' || !profile.name || !hasInferenceProfile) {
       setVoiceControlBackendDefaults(DEFAULT_VOICE_CONTROL_BACKEND_DEFAULTS);
       setVoiceControlDefaults(DEFAULT_VOICE_CONTROL_VALUES);
       setVoiceControlValues(DEFAULT_VOICE_CONTROL_VALUES);
@@ -779,7 +933,7 @@ const App: React.FC = () => {
     setVoiceControlsError(null);
     setVoiceControlsDirty(false);
 
-    fetch(
+    apiFetch(
       `${apiBase}/profiles/${encodeURIComponent(profile.name)}/voice-controls?profile_type=${profileType}`,
       { cache: 'no-store', signal: controller.signal },
     )
@@ -789,18 +943,31 @@ const App: React.FC = () => {
       })
       .then((data) => {
         if (cancelled) return;
+        const responseTtsBackend = normalizeTtsBackend(data?.tts_backend);
         const backendDefaults: VoiceControlBackendDefaults = {
           pitchShift: Number(data?.controls?.pitch_shift ?? 0),
           f0Scale: Number(data?.controls?.f0_scale ?? 1),
           embeddingScale: Number(data?.controls?.embedding_scale ?? 1.2),
           paceScale: Number(data?.controls?.pace_scale ?? 1),
           volumeGain: Number(data?.controls?.volume_gain ?? 1),
+          ttsExaggeration: Number(data?.controls?.tts_exaggeration ?? 0.35),
+          ttsTemperature: Number(data?.controls?.tts_temperature ?? 0.5),
+          ttsCfgWeight: Number(data?.controls?.tts_cfg_weight ?? 0.8),
+          ttsRepetitionPenalty: Number(data?.controls?.tts_repetition_penalty ?? 1.2),
+          avatarEmotion: normalizeVoiceEmotion(data?.controls?.avatar_emotion),
+          avatarEmotionIntensity: Number(data?.controls?.avatar_emotion_intensity ?? 0.5),
         };
         const controls = normalizeVoiceControls({
           pitch: backendDefaults.pitchShift,
           pace: 0,
           tone: 0,
           volume: 0,
+          expressiveness: backendDefaults.ttsExaggeration,
+          variation: backendDefaults.ttsTemperature,
+          guidance: backendDefaults.ttsCfgWeight,
+          repetition: backendDefaults.ttsRepetitionPenalty,
+          emotion: backendDefaults.avatarEmotion,
+          emotionIntensity: backendDefaults.avatarEmotionIntensity,
         });
         const runtimeSettings = normalizeRuntimeSettings(data?.runtime_settings);
         const selectedControls = runtimeSettings.voice_controls
@@ -809,8 +976,15 @@ const App: React.FC = () => {
             pace: runtimeSettings.voice_controls.pace ?? controls.pace,
             tone: runtimeSettings.voice_controls.tone ?? controls.tone,
             volume: runtimeSettings.voice_controls.volume ?? controls.volume,
+            expressiveness: runtimeSettings.voice_controls.expressiveness ?? controls.expressiveness,
+            variation: runtimeSettings.voice_controls.variation ?? controls.variation,
+            guidance: runtimeSettings.voice_controls.guidance ?? controls.guidance,
+            repetition: runtimeSettings.voice_controls.repetition ?? controls.repetition,
+            emotion: runtimeSettings.voice_controls.emotion ?? controls.emotion,
+            emotionIntensity: runtimeSettings.voice_controls.emotionIntensity ?? controls.emotionIntensity,
           })
           : controls;
+        setTtsBackend(responseTtsBackend);
         setVoiceControlBackendDefaults(backendDefaults);
         setVoiceControlDefaults(controls);
         setVoiceControlValues(selectedControls);
@@ -833,7 +1007,7 @@ const App: React.FC = () => {
       cancelled = true;
       controller.abort();
     };
-  }, [apiBase, apiStatus, hasTrainedProfile, profile.name, profileType, readErrorDetail]);
+  }, [apiBase, apiFetch, apiStatus, hasInferenceProfile, profile.name, profileType, readErrorDetail]);
 
   const preprocessSteps = [
     ...(profileType === 'avatar' ? ['Bake avatar frames (Wav2Lip cache)'] : []),
@@ -877,16 +1051,16 @@ const App: React.FC = () => {
     if (step === 1) return true;
     if (step === 2) return Boolean(profile.name);
     if (step === 3) return stepStatuses.preprocess === 'done' || hasData || hasTrainedProfile;
-    if (step === 4) return stepStatuses.train === 'done' || hasTrainedProfile;
+    if (step === 4) return stepStatuses.train === 'done' || hasInferenceProfile;
     return false;
   };
 
   useEffect(() => {
     if (apiStatus !== 'online') return;
-    if (!hasTrainedProfile) return;
+    if (!hasInferenceProfile) return;
     if (!profile.name) return;
     void warmupProfile(profile.name, profileType);
-  }, [apiStatus, hasTrainedProfile, profile.name, profileType, warmupProfile]);
+  }, [apiStatus, hasInferenceProfile, profile.name, profileType, warmupProfile]);
 
   const streamResponseLines = async (
     response: Response,
@@ -932,8 +1106,13 @@ const App: React.FC = () => {
     );
   };
 
-  const handleUpload = async (file: File) => {
+  const handleUpload = async (file: File, options: { autoPrepare?: boolean } = {}) => {
     if (!profile.name || !file) return;
+    if (profileNameTaken) {
+      setUiNotice('That profile name is already in use. Choose a different name, such as “Alvin 2”.');
+      minimalNameInputRef.current?.focus();
+      return;
+    }
     setUiNotice(null);
     setStepStatuses(prev => ({ ...prev, upload: 'running' }));
     setUploadPhaseVideo('uploading');
@@ -961,6 +1140,13 @@ const App: React.FC = () => {
       setLastUploadedFilename(data.filename);
       setStepStatuses(prev => ({ ...prev, upload: 'done' }));
       setUploadPhaseVideo('idle');
+      if (options.autoPrepare) {
+        // The camera capture is already a complete source clip. Treat it as
+        // the new profile immediately so the duplicate-name guard does not
+        // mistake the profile we just created for an unrelated existing one.
+        setIsCreatingProfile(false);
+        setAutoPrepareAfterUpload(true);
+      }
       loadProfiles();
     } catch (err) {
       setStepStatuses(prev => ({ ...prev, upload: 'error' }));
@@ -968,6 +1154,178 @@ const App: React.FC = () => {
       setPreprocessLogs([createLog(`Upload failed: ${String(err)}`, 'error')]);
     }
   };
+
+  const clearCameraPreview = useCallback(() => {
+    if (cameraPreviewUrlRef.current) {
+      URL.revokeObjectURL(cameraPreviewUrlRef.current);
+      cameraPreviewUrlRef.current = null;
+    }
+    setCameraPreviewUrl(null);
+  }, []);
+
+  const setCameraPreview = useCallback((blob: Blob) => {
+    clearCameraPreview();
+    const url = URL.createObjectURL(blob);
+    cameraPreviewUrlRef.current = url;
+    setCameraPreviewUrl(url);
+  }, [clearCameraPreview]);
+
+  const stopCameraStream = useCallback(() => {
+    if (cameraTimerRef.current !== null) {
+      window.clearInterval(cameraTimerRef.current);
+      cameraTimerRef.current = null;
+    }
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== 'inactive') {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      recorder.onerror = null;
+      try {
+        recorder.stop();
+      } catch {
+        // The recorder may already be stopping as a permission/tab change occurs.
+      }
+    }
+    mediaRecorderRef.current = null;
+    cameraStreamRef.current?.getTracks().forEach(track => track.stop());
+    cameraStreamRef.current = null;
+    if (cameraVideoRef.current) {
+      cameraVideoRef.current.pause();
+      cameraVideoRef.current.srcObject = null;
+      cameraVideoRef.current.removeAttribute('src');
+      cameraVideoRef.current.load();
+    }
+    clearCameraPreview();
+  }, [clearCameraPreview]);
+
+  const openCamera = useCallback(async () => {
+    if (!profile.name) {
+      setUiNotice('Enter a profile name before opening the camera.');
+      return;
+    }
+    if (profileNameTaken) {
+      setUiNotice('That profile name is already in use. Choose a different name, such as “Alvin 2”.');
+      minimalNameInputRef.current?.focus();
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraState('error');
+      setCameraError('Camera capture is not supported by this browser.');
+      return;
+    }
+    setCameraState('requesting');
+    setCameraError(null);
+    try {
+      stopCameraStream();
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: 'user',
+          width: { ideal: 720 },
+          height: { ideal: 960 },
+        },
+        audio: true,
+      });
+      cameraStreamRef.current = stream;
+      setCameraElapsed(0);
+      setCameraState('ready');
+    } catch (error) {
+      setCameraState('error');
+      setCameraError(error instanceof DOMException && error.name === 'NotAllowedError'
+        ? 'Camera permission was blocked. Allow camera and microphone access, then try again.'
+        : `Could not open the camera: ${String(error)}`);
+    }
+  }, [profile.name, profileNameTaken, stopCameraStream]);
+
+  useEffect(() => {
+    const video = cameraVideoRef.current;
+    if (!video) return;
+    if (cameraState === 'recorded' && cameraPreviewUrl) {
+      video.srcObject = null;
+      video.src = cameraPreviewUrl;
+      video.loop = true;
+      void video.play().catch(() => undefined);
+      return;
+    }
+    video.loop = false;
+    video.removeAttribute('src');
+    const stream = cameraStreamRef.current;
+    if (!stream) return;
+    video.srcObject = stream;
+    void video.play().catch(() => undefined);
+  }, [cameraPreviewUrl, cameraState, sourceMode]);
+
+  const stopCameraRecording = useCallback(() => {
+    if (cameraTimerRef.current !== null) {
+      window.clearInterval(cameraTimerRef.current);
+      cameraTimerRef.current = null;
+    }
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+  }, []);
+
+  const startCameraRecording = useCallback(() => {
+    const stream = cameraStreamRef.current;
+    if (!stream || typeof MediaRecorder === 'undefined') {
+      setCameraState('error');
+      setCameraError('This browser cannot record video. Try Chrome or Safari with camera access enabled.');
+      return;
+    }
+    const mimeType = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+      'video/mp4',
+    ].find(type => MediaRecorder.isTypeSupported(type)) || '';
+    try {
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      cameraChunksRef.current = [];
+      mediaRecorderRef.current = recorder;
+      recorder.ondataavailable = event => {
+        if (event.data.size > 0) cameraChunksRef.current.push(event.data);
+      };
+      recorder.onerror = () => {
+        setCameraState('error');
+        setCameraError('Camera recording failed. Please try again.');
+      };
+      recorder.onstop = () => {
+        const blobType = recorder.mimeType || mimeType || 'video/webm';
+        const blob = new Blob(cameraChunksRef.current, { type: blobType });
+        if (blob.size === 0) {
+          setCameraState('error');
+          setCameraError('No video was captured. Please try recording again.');
+          return;
+        }
+        const extension = blobType.includes('mp4') ? 'mp4' : 'webm';
+        const file = new File([blob], `pixelholo-camera-${Date.now()}.${extension}`, { type: blobType });
+        setCameraPreview(blob);
+        cameraStreamRef.current?.getTracks().forEach(track => track.stop());
+        cameraStreamRef.current = null;
+        mediaRecorderRef.current = null;
+        setCameraState('recorded');
+        setProfile(prev => ({
+          ...prev,
+          lastUploadedFile: file.name,
+          fileSize: `${(file.size / (1024 * 1024)).toFixed(2)} MB`,
+        }));
+        void handleUpload(file, { autoPrepare: true });
+      };
+      recorder.start(250);
+      setCameraElapsed(0);
+      setCameraState('recording');
+      cameraTimerRef.current = window.setInterval(() => {
+        setCameraElapsed(prev => {
+          const next = prev + 1;
+          if (next >= CAMERA_RECORDING_SECONDS) stopCameraRecording();
+          return next;
+        });
+      }, 1000);
+    } catch (error) {
+      setCameraState('error');
+      setCameraError(`Could not start recording: ${String(error)}`);
+    }
+  }, [handleUpload, setCameraPreview, stopCameraRecording]);
+
+  useEffect(() => () => stopCameraStream(), [stopCameraStream]);
 
   const handleUploadAudio = async (file: File) => {
     if (!profile.name) return;
@@ -1002,6 +1360,11 @@ const App: React.FC = () => {
 
   const startPreprocess = async () => {
     if (!profile.name) return;
+    if (profileNameTaken) {
+      setUiNotice('That profile name is already in use. Choose a different name, such as “Alvin 2”.');
+      minimalNameInputRef.current?.focus();
+      return;
+    }
     setUiNotice(null);
     setStepStatuses(prev => ({ ...prev, preprocess: 'running' }));
     setPreprocessLogs([createLog('Pipeline starting...', 'info')]);
@@ -1017,14 +1380,15 @@ const App: React.FC = () => {
       bake_avatar: profileType === 'avatar',
       avatar_fps: profileType === 'avatar' ? 25 : null,
       avatar_start_sec: profileType === 'avatar' ? avatarStartSec : null,
-      avatar_loop_sec: profileType === 'avatar' ? 10 : null,
+      avatar_loop_sec: profileType === 'avatar' ? DEFAULT_AVATAR_LOOP_SEC : null,
+      avatar_loop_fade_sec: profileType === 'avatar' ? DEFAULT_AVATAR_LOOP_FADE_SEC : null,
       avatar_resize_factor: profileType === 'avatar' ? 1 : null,
       avatar_pads: profileType === 'avatar' ? '0 10 0 0' : null,
       avatar_blur_background: profileType === 'avatar',
       avatar_blur_kernel: profileType === 'avatar' ? BLUR_KERNEL_BY_LEVEL[avatarBlurLevel] : null,
     };
     try {
-      const res = await fetch(`${apiBase}/preprocess`, {
+      const res = await apiFetch(`${apiBase}/preprocess`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -1085,6 +1449,7 @@ const App: React.FC = () => {
       setStepStatuses(prev => ({ ...prev, preprocess: 'done' }));
       setPreprocessProgress(1);
       setPreprocessStageIndex(preprocessSteps.length ? preprocessSteps.length - 1 : null);
+      setIsCreatingProfile(false);
       loadProfiles();
     } catch (err) {
       setStepStatuses(prev => ({ ...prev, preprocess: 'error' }));
@@ -1092,6 +1457,19 @@ const App: React.FC = () => {
       setPreprocessStageIndex(null);
     }
   };
+
+  useEffect(() => {
+    if (
+      !autoPrepareAfterUpload
+      || !lastUploadedFilename
+      || stepStatuses.upload !== 'done'
+      || stepStatuses.preprocess !== 'idle'
+    ) {
+      return;
+    }
+    setAutoPrepareAfterUpload(false);
+    void startPreprocess();
+  }, [autoPrepareAfterUpload, lastUploadedFilename, startPreprocess, stepStatuses.preprocess, stepStatuses.upload]);
 
   const startTraining = async () => {
     if (!profile.name) return;
@@ -1115,7 +1493,7 @@ const App: React.FC = () => {
     };
 
     try {
-      const res = await fetch(`${apiBase}/train`, {
+      const res = await apiFetch(`${apiBase}/train`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -1207,11 +1585,11 @@ const App: React.FC = () => {
 
   const interruptBackend = useCallback(async () => {
     try {
-      await fetch(`${apiBase}/interrupt`, { method: 'POST', keepalive: true });
+      await apiFetch(`${apiBase}/interrupt`, { method: 'POST', keepalive: true });
     } catch {
       // ignore best-effort interrupt failures
     }
-  }, [apiBase]);
+  }, [apiBase, apiFetch]);
 
   const stopAllAudio = () => {
     for (const src of activeSourcesRef.current) {
@@ -1233,6 +1611,33 @@ const App: React.FC = () => {
     }
   };
 
+  const clearPlaybackSettleTimer = useCallback(() => {
+    if (playbackSettleTimerRef.current !== null) {
+      window.clearTimeout(playbackSettleTimerRef.current);
+      playbackSettleTimerRef.current = null;
+    }
+  }, []);
+
+  const settlePlayback = useCallback(() => {
+    clearPlaybackSettleTimer();
+    const check = () => {
+      const audioContext = audioContextRef.current;
+      const audioSettled = !audioContext || audioContext.currentTime + 0.05 >= audioEndTimeRef.current;
+      const videoSettled = frameQueueRef.current.length === 0;
+      if (!audioSettled || !videoSettled) {
+        playbackSettleTimerRef.current = window.setTimeout(check, 100);
+        return;
+      }
+      playbackSettleTimerRef.current = null;
+      setIsPlaybackActive(false);
+      setStepStatuses(prev => ({ ...prev, inference: 'done' }));
+      videoStateRef.current = 'idle';
+      setVideoState('idle');
+      setVideoQueue(0);
+    };
+    check();
+  }, [clearPlaybackSettleTimer]);
+
   const resetVideo = useCallback(() => {
     if (videoTimerRef.current !== null) {
       window.clearInterval(videoTimerRef.current);
@@ -1252,10 +1657,14 @@ const App: React.FC = () => {
     setVideoState('idle');
     videoStartTimeRef.current = null;
     videoNextFrameTimeRef.current = null;
+    // A profile switch must never leave the last avatar frame visible while
+    // the next profile is warming up.  Clear the drawing surface completely;
+    // the preview shell will show its neutral background until new frames
+    // arrive.
     const canvas = videoCanvasRef.current;
-    if (canvas) {
-      const ctx = canvas.getContext('2d');
-      if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const context = canvas?.getContext('2d');
+    if (canvas && context) {
+      context.clearRect(0, 0, canvas.width, canvas.height);
     }
   }, [releaseFrameSource]);
 
@@ -1286,15 +1695,36 @@ const App: React.FC = () => {
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+    // Keep the final portrait upscale smooth on both high-DPI monitors and
+    // browsers that render the streamed frame below the canvas's CSS size.
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     const drawSerial = ++videoDrawSerialRef.current;
     const sourceUrl = typeof frameSource === 'string' ? frameSource : frameSource.url;
     const bitmap = typeof frameSource === 'string' ? undefined : frameSource.bitmap;
     const cleanup = () => {
       releaseFrameSource(frameSource);
     };
+    const drawCover = (source: CanvasImageSource, sourceWidth: number, sourceHeight: number) => {
+      if (!sourceWidth || !sourceHeight) return;
+      const targetRatio = canvas.width / canvas.height;
+      const sourceRatio = sourceWidth / sourceHeight;
+      let sx = 0;
+      let sy = 0;
+      let sw = sourceWidth;
+      let sh = sourceHeight;
+      if (sourceRatio > targetRatio) {
+        sw = sourceHeight * targetRatio;
+        sx = (sourceWidth - sw) / 2;
+      } else if (sourceRatio < targetRatio) {
+        sh = sourceWidth / targetRatio;
+        sy = (sourceHeight - sh) / 2;
+      }
+      ctx.drawImage(source, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+    };
     if (bitmap) {
       if (drawSerial === videoDrawSerialRef.current) {
-        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        drawCover(bitmap, bitmap.width, bitmap.height);
       }
       cleanup();
       return;
@@ -1310,7 +1740,7 @@ const App: React.FC = () => {
     const img = new Image();
     img.onload = () => {
       if (drawSerial === videoDrawSerialRef.current) {
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        drawCover(img, img.naturalWidth || img.width, img.naturalHeight || img.height);
       }
       cleanup();
     };
@@ -1409,9 +1839,23 @@ const App: React.FC = () => {
 
   const runInference = useCallback(async (text: string, endpoint: string) => {
     if (!profile.name || !text) return;
+    const selectionId = profileSelectionRef.current;
+    const requestProfileName = profile.name;
+    const requestProfileType = profileType;
+    if (isWarmingUp) {
+      setUiNotice(`Preparing ${requestProfileName} for its first response. Please wait a moment.`);
+      return;
+    }
     setUiNotice(null);
+    clearPlaybackSettleTimer();
+    setIsPlaybackActive(true);
     await unlockAudio();
+    // Profile selection can happen while the browser is unlocking audio. Do
+    // not let this stale invocation create a stream with the old voice.
+    if (selectionId !== profileSelectionRef.current) return;
     if (audioContextRef.current?.state !== 'running') {
+      clearPlaybackSettleTimer();
+      setIsPlaybackActive(false);
       setUiNotice('Safari blocked audio. Click again to enable sound.');
       return;
     }
@@ -1437,6 +1881,7 @@ const App: React.FC = () => {
       streamAbortRef.current.abort();
       await interruptBackend();
     }
+    if (selectionId !== profileSelectionRef.current) return;
     const controller = new AbortController();
     streamAbortRef.current = controller;
     streamRunningRef.current = true;
@@ -1446,8 +1891,9 @@ const App: React.FC = () => {
     let firstChunk = true;
 
     const payload: Record<string, any> = {
-      speaker: profile.name,
-      profile_type: profileType,
+      speaker: requestProfileName,
+      profile_type: requestProfileType,
+      tts_backend: ttsBackend,
       text,
       model_path: modelOverride || null,
       ref_wav_path: refOverride || null,
@@ -1456,15 +1902,24 @@ const App: React.FC = () => {
       payload.llm_mode = llmMode;
     }
     if ((voiceControlsStatus === 'ready' || voiceControlsDirty) && voiceControlValues) {
-      payload.pitch_shift = voiceControlValues.pitch;
       payload.pace_scale = resolvePaceScale(voiceControlValues.pace);
-      const toneOverrides = resolveToneOverrides(voiceControlValues.tone);
-      payload.f0_scale = toneOverrides.f0Scale;
-      payload.embedding_scale = toneOverrides.embeddingScale;
       payload.volume_gain = resolveVolumeGain(voiceControlValues.volume);
+      if (ttsBackend === 'chatterbox') {
+        payload.tts_exaggeration = voiceControlValues.expressiveness;
+        payload.tts_temperature = voiceControlValues.variation;
+        payload.tts_cfg_weight = voiceControlValues.guidance;
+        payload.tts_repetition_penalty = voiceControlValues.repetition;
+        payload.avatar_emotion = voiceControlValues.emotion;
+        payload.avatar_emotion_intensity = voiceControlValues.emotionIntensity;
+      } else {
+        payload.pitch_shift = voiceControlValues.pitch;
+        const toneOverrides = resolveToneOverrides(voiceControlValues.tone);
+        payload.f0_scale = toneOverrides.f0Scale;
+        payload.embedding_scale = toneOverrides.embeddingScale;
+      }
     }
     if (outputMode === 'avatar') {
-      payload.avatar_profile = profile.name;
+      payload.avatar_profile = requestProfileName;
       payload.lipsync_backend = avatarBackend;
       if (Number.isFinite(DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE) && DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE > 0) {
         payload.avatar_max_frame_edge = Math.round(DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE);
@@ -1479,6 +1934,7 @@ const App: React.FC = () => {
       setLatency(prev => prev ? { ...prev, total: inferenceMs ?? Math.round(performance.now() - startTime) } : null);
       setStepStatuses(prev => ({ ...prev, inference: 'done' }));
       setInferenceStageIndex(inferenceSteps.length ? inferenceSteps.length - 1 : null);
+      settlePlayback();
       if (streamAbortRef.current === controller) {
         streamAbortRef.current = null;
       }
@@ -1487,6 +1943,8 @@ const App: React.FC = () => {
 
     const failStream = () => {
       sawError = true;
+      clearPlaybackSettleTimer();
+      setIsPlaybackActive(false);
       setStepStatuses(prev => ({ ...prev, inference: 'error' }));
       setInferenceStageIndex(null);
     };
@@ -1508,6 +1966,7 @@ const App: React.FC = () => {
 
     const isSessionActive = () => (
       sessionId === streamSessionRef.current
+      && selectionId === profileSelectionRef.current
       && streamAbortRef.current === controller
       && !controller.signal.aborted
       && !sawError
@@ -1596,7 +2055,7 @@ const App: React.FC = () => {
     };
 
     try {
-      const res = await fetch(`${apiBase}${endpoint}`, {
+      const res = await apiFetch(`${apiBase}${endpoint}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1670,6 +2129,8 @@ const App: React.FC = () => {
       }
     } catch (err) {
       if ((err as Error).name !== 'AbortError') {
+        clearPlaybackSettleTimer();
+        setIsPlaybackActive(false);
         setStepStatuses(prev => ({ ...prev, inference: 'error' }));
         setInferenceStageIndex(null);
       }
@@ -1681,9 +2142,12 @@ const App: React.FC = () => {
     }
   }, [
     apiBase,
+    apiFetch,
     avatarBackend,
+    clearPlaybackSettleTimer,
     enqueueFrames,
     interruptBackend,
+    isWarmingUp,
     llmMode,
     museTalkPreset,
     modelOverride,
@@ -1693,6 +2157,8 @@ const App: React.FC = () => {
     refOverride,
     releaseFrameSource,
     resetVideo,
+    settlePlayback,
+    ttsBackend,
     unlockAudio,
     waitForFramePredecode,
     voiceControlValues,
@@ -1709,11 +2175,16 @@ const App: React.FC = () => {
 
   const stopInference = async () => {
     stopListeningRef.current?.();
+    stopListening();
     if (streamAbortRef.current) streamAbortRef.current.abort();
     streamAbortRef.current = null;
     streamRunningRef.current = false;
-    await interruptBackend();
+    // Invalidate stale stream callbacks before waiting for the backend's
+    // best-effort interrupt response.
     streamSessionRef.current += 1;
+    clearPlaybackSettleTimer();
+    setIsPlaybackActive(false);
+    await interruptBackend();
     await resetAudio();
     resetVideo();
     setStepStatuses(prev => ({ ...prev, inference: 'idle' }));
@@ -1818,6 +2289,638 @@ const App: React.FC = () => {
           </div>
         </div>
       </div>
+    </div>
+  );
+
+  // Once a zero-shot profile has been prepared, open the studio directly. The
+  // old training step is intentionally left in this file for the legacy worker,
+  // but it is not part of the public web flow.
+  useEffect(() => {
+    if (
+      hasInferenceProfile
+      && profile.name
+      && activeStep === 1
+      && (stepStatuses.preprocess === 'done' || stepStatuses.train === 'done')
+    ) {
+      setActiveStep(4);
+    }
+  }, [activeStep, hasInferenceProfile, profile.name, stepStatuses.preprocess, stepStatuses.train]);
+
+  const publicSetupReady = Boolean(
+    !profileNameTaken
+      && profile.name
+      && (lastUploadedFilename || (currentProfileInfo?.raw_files ?? 0) > 0),
+  );
+  const publicProfileReady = Boolean(!isCreatingProfile && hasInferenceProfile && profile.name);
+
+  const sendComposerText = async () => {
+    const text = inferenceText.trim();
+    if (!text) return;
+    await runInference(text, composerMode === 'chat' ? '/chat' : '/speak');
+  };
+
+  const applyVoiceInput = useCallback((spoken: string) => {
+    setInferenceText(spoken);
+    void runInference(spoken, '/chat');
+  }, [runInference]);
+  const {
+    isListening,
+    startListening,
+    stopListening,
+    hasSupport: hasSpeechSupport,
+    transcript: speechTranscript,
+  } = useSpeechToText(applyVoiceInput);
+  const composerDisplayText = isListening ? speechTranscript : inferenceText;
+
+  const selectProfile = async (item: ProfileInfo) => {
+    if (isProfileSwitchBlocked) {
+      setUiNotice('Finish the current profile preparation before switching avatars.');
+      return;
+    }
+    const selectionId = ++profileSelectionRef.current;
+    // Invalidate the old request synchronously, then update the visible
+    // profile immediately. The backend interrupt can finish in the background;
+    // no stale callback can pass the selection/session guards meanwhile.
+    const stopPromise = stopInference();
+    stopCameraStream();
+    const selectedProfileType: ProfileType = item.profile_type === 'voice' ? 'voice' : 'avatar';
+    const ready = profileIsInferenceReady(item);
+    setShowWelcome(false);
+    setProfileType(selectedProfileType);
+    setProfile({ name: item.name, lastUploadedFile: null, fileSize: null });
+    setIsCreatingProfile(false);
+    setAutoPrepareAfterUpload(false);
+    setLastUploadedFilename(null);
+    setLastUploadedAudioFilename(null);
+    setInferenceText('');
+    setInferenceChunks([]);
+    setLatency(null);
+    setUiNotice(null);
+    setActiveStep(ready ? 4 : 1);
+    await stopPromise;
+    if (selectionId !== profileSelectionRef.current) return;
+    if (ready) {
+      try {
+        await warmupProfile(item.name, selectedProfileType);
+        if (selectionId === profileSelectionRef.current) {
+          setUiNotice(null);
+        }
+      } catch (error) {
+        if (selectionId === profileSelectionRef.current) {
+          setUiNotice(`Could not warm up ${item.name}: ${String(error)}`);
+        }
+      }
+    }
+  };
+
+  const resetNewProfile = () => {
+    if (isBusy || isPlaybackActive) {
+      setUiNotice('Stop the current response before creating a new profile.');
+      return;
+    }
+    profileSelectionRef.current += 1;
+    streamSessionRef.current += 1;
+    stopListeningRef.current?.();
+    stopListening();
+    stopAllAudio();
+    resetVideo();
+    stopCameraStream();
+    setShowWelcome(false);
+    setIsCreatingProfile(true);
+    setAutoPrepareAfterUpload(false);
+    setSourceMode('upload');
+    setCameraState('idle');
+    setCameraError(null);
+    setCameraElapsed(0);
+    setProfile({ name: '', lastUploadedFile: null, fileSize: null });
+    setLastUploadedFilename(null);
+    setLastUploadedAudioFilename(null);
+    setPreprocessStats(null);
+    setPreprocessProgress(null);
+    setStepStatuses(prev => ({ ...prev, upload: 'idle', preprocess: 'idle', inference: 'idle' }));
+    setActiveStep(1);
+    setUiNotice(null);
+  };
+
+  return (
+    <div className="ph-minimal-app">
+      <header className="ph-minimal-header">
+        <button type="button" className="ph-minimal-brand" onClick={() => setShowWelcome(true)} aria-label="Go to PixelHolo home">
+          <span className="ph-minimal-mark">✦</span>
+        <span>PixelHolo</span>
+      </button>
+      <div className="ph-minimal-header-actions">
+          <span className="ph-minimal-status"><span className={`ph-status-dot ${apiStatus}`} />{apiStatus === 'online' ? 'Ready' : apiStatus === 'checking' ? 'Connecting' : 'Offline'}</span>
+          {!IS_PRODUCTION_BUILD && (
+            <details className="ph-minimal-connection">
+              <summary aria-label="Connection settings">•••</summary>
+              <label>API endpoint<input value={apiBase} onChange={event => setApiBase(event.target.value)} /></label>
+            </details>
+          )}
+        </div>
+      </header>
+
+      {showWelcome ? (
+        <main className="ph-welcome-page">
+          <section className="ph-welcome-hero">
+            <div className="ph-welcome-copy">
+              <span className="ph-minimal-eyebrow">One-shot avatar studio</span>
+              <h1>Turn one video<br /><em>into a voice avatar.</em></h1>
+              <p>Upload a 5–20 second talking-head video or record one with your camera. PixelHolo reuses the face and voice from that single clip, then streams Chatterbox speech with MuseTalk lip sync.</p>
+              <button type="button" className="ph-welcome-cta" onClick={resetNewProfile}>Create a profile <span>→</span></button>
+              <div className="ph-welcome-stack"><span className="ph-welcome-stack-mark">✦</span><span>One source clip</span><i>→</i><span>One speaking avatar</span></div>
+            </div>
+            <div className="ph-welcome-visual" aria-hidden="true">
+              <div className="ph-welcome-orbit ph-welcome-orbit-one" />
+              <div className="ph-welcome-orbit ph-welcome-orbit-two" />
+              <div className="ph-welcome-glow" />
+              <div className="ph-welcome-card">
+                <div className="ph-welcome-card-top"><span>PROFILE PREVIEW</span><span><i /> Ready</span></div>
+                <div className="ph-welcome-avatar-art"><span>✦</span><div className="ph-welcome-avatar-ring" /></div>
+                <strong>One clip in. A speaking avatar out.</strong>
+                <small>Chatterbox voice · MuseTalk lip sync</small>
+                <div className="ph-welcome-wave"><i /><i /><i /><i /><i /><i /><i /><i /><i /></div>
+              </div>
+            </div>
+          </section>
+          <section className="ph-welcome-features">
+            <div><span>01</span><strong>Bring a source clip</strong><p>Upload a talking video or record a guided 20-second sample. The same video supplies the face and voice.</p></div>
+            <div><span>02</span><strong>Prepare the profile</strong><p>PixelHolo cleans the audio and bakes a reusable portrait cache. New profiles skip a separate training step.</p></div>
+            <div><span>03</span><strong>Ask by text or voice</strong><p>Type a prompt or use your microphone. Chatterbox speech and MuseTalk frames stream back together.</p></div>
+          </section>
+          <section className="ph-welcome-bottom"><span>Anonymous device workspace · profiles stay with this browser</span><button type="button" onClick={resetNewProfile}>Start with a talking video <b>↗</b></button></section>
+        </main>
+      ) : (
+      <div className="ph-minimal-body">
+        <aside className="ph-minimal-sidebar" aria-label="Avatar profiles">
+          <div className="ph-minimal-sidebar-heading">
+            <div><span className="ph-minimal-eyebrow">Workspace</span><strong>Profiles</strong></div>
+            <span className="ph-minimal-profile-count">{profiles.length}</span>
+          </div>
+          <button type="button" className={`ph-minimal-new-profile ${!profile.name ? 'is-current' : ''}`} onClick={resetNewProfile}>
+            <span className="ph-minimal-new-profile-icon">＋</span>
+            <span><strong>New profile</strong><small>Upload or record a talking video</small></span>
+          </button>
+
+          <div className="ph-minimal-sidebar-section-label">Existing profiles</div>
+          <div className="ph-minimal-profile-list">
+            {profilesStatus === 'loading' && <div className="ph-minimal-sidebar-empty">Loading profiles…</div>}
+            {profilesStatus === 'error' && <div className="ph-minimal-sidebar-empty is-error">Could not load profiles.</div>}
+            {profilesStatus === 'idle' && profiles.length === 0 && (
+              <div className="ph-minimal-sidebar-empty">Your new profile will appear here after it is prepared.</div>
+            )}
+            {profiles.map(item => {
+              const selected = item.name === profile.name;
+              const ready = profileIsInferenceReady(item);
+              const menuKey = `${item.profile_type || 'avatar'}:${item.name}`;
+              return (
+                <div key={menuKey} className={`ph-minimal-profile-item ${selected ? 'is-selected' : ''}`}>
+                  <button type="button" className="ph-minimal-profile-select" onClick={() => void selectProfile(item)} disabled={isProfileSwitchBlocked}>
+                    <span className="ph-minimal-profile-avatar">{item.name.slice(0, 1).toUpperCase()}</span>
+                    <span className="ph-minimal-profile-copy"><strong>{item.name}</strong><small>{ready ? 'Ready to speak' : item.has_data ? 'Needs preparation' : 'Needs a source clip'}</small></span>
+                    <span className={`ph-minimal-profile-dot ${ready ? 'is-ready' : ''}`} />
+                  </button>
+                  <div className="ph-minimal-profile-menu-wrap" onClick={event => event.stopPropagation()}>
+                    <button type="button" className="ph-minimal-profile-options" disabled={isBusy} aria-label={`Profile options for ${item.name}`} onClick={() => setProfileMenuKey(prev => prev === menuKey ? null : menuKey)}>•••</button>
+                    {profileMenuKey === menuKey && (
+                      <div className="ph-minimal-profile-menu">
+                        <button type="button" onClick={() => void handleRenameProfile(item)}>Rename</button>
+                        <button type="button" className="is-danger" onClick={() => void handleDeleteProfile(item)}>Delete</button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="ph-minimal-sidebar-footer">
+            <span className={`ph-status-dot ${apiStatus}`} />
+            <div><strong>{apiStatus === 'online' ? 'Engine ready' : apiStatus === 'checking' ? 'Connecting…' : 'Engine offline'}</strong><small>Chatterbox · {avatarBackend === 'wav2lip' ? 'Wav2Lip' : 'MuseTalk'}</small></div>
+          </div>
+        </aside>
+
+        <main className="ph-minimal-main">
+        {!publicProfileReady && (
+          <section className="ph-minimal-create">
+            <div className="ph-minimal-intro">
+              <span className="ph-minimal-eyebrow">New avatar</span>
+              <h1>Make a voice avatar.</h1>
+              <p>Upload a short video of yourself talking. PixelHolo uses the face and voice from that one clip, then you can type what you want your avatar to say.</p>
+            </div>
+
+            <div className="ph-minimal-create-card">
+              {(() => {
+                const sourceUploaded = Boolean(
+                  profile.lastUploadedFile
+                  || (currentProfileInfo?.raw_files ?? 0) > 0,
+                );
+                return (
+                  <>
+              <label className="ph-minimal-label" htmlFor="minimal-avatar-name">Name your avatar</label>
+              <input
+                id="minimal-avatar-name"
+                className="ph-minimal-name-input"
+                ref={minimalNameInputRef}
+                value={profile.name}
+                onChange={event => {
+                  setProfile(prev => ({ ...prev, name: event.target.value }));
+                  setUiNotice(null);
+                }}
+                placeholder="Enter a profile name"
+                autoComplete="off"
+                spellCheck={false}
+                aria-invalid={profileNameTaken}
+                disabled={isBusy}
+              />
+              {profileNameTaken && (
+                <div className="ph-minimal-name-availability" role="alert">
+                  Profile name already exists. Choose another name, such as <strong>“{profile.name.trim()} 2”</strong>.
+                </div>
+              )}
+
+              <div className="ph-minimal-source-tabs" role="tablist" aria-label="Avatar source">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={sourceMode === 'camera'}
+                  className={sourceMode === 'camera' ? 'is-selected' : ''}
+                  disabled={isBusy}
+                  onClick={() => {
+                    if (!profile.name.trim()) {
+                      setUiNotice('Name your avatar first, then camera recording can begin.');
+                      minimalNameInputRef.current?.focus();
+                      return;
+                    }
+                    if (profileNameTaken) {
+                      setUiNotice('Choose a new profile name before recording.');
+                      minimalNameInputRef.current?.focus();
+                      return;
+                    }
+                    setSourceMode('camera');
+                    void openCamera();
+                  }}
+                >
+                  Record with camera
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={sourceMode === 'upload'}
+                  className={sourceMode === 'upload' ? 'is-selected' : ''}
+                  onClick={() => {
+                    setSourceMode('upload');
+                    stopCameraStream();
+                    setCameraState('idle');
+                  }}
+                >
+                  Upload video
+                </button>
+              </div>
+
+              {sourceMode === 'upload' ? (
+                <div className="ph-minimal-file-list">
+                  <label className={`ph-minimal-file-row ${sourceUploaded ? 'is-complete' : ''} ${!profile.name || profileNameTaken ? 'is-disabled' : ''}`}>
+                    <input type="file" accept="video/*" onChange={event => event.target.files?.[0] && void handleUpload(event.target.files[0])} disabled={!profile.name || profileNameTaken || isBusy} />
+                    <span className="ph-minimal-file-icon">▣</span>
+                    <span className="ph-minimal-file-copy"><strong>Talking video</strong><small>{profile.lastUploadedFile || (sourceUploaded ? 'Video uploaded · ready to prepare' : 'Face + voice source · 5–20 seconds · 720p+ · front-lit')}</small></span>
+                    <span className="ph-minimal-file-action">{uploadPhaseVideo === 'uploading' ? `${uploadProgressVideo}%` : sourceUploaded ? 'Replace' : 'Choose'}</span>
+                  </label>
+                </div>
+              ) : (
+                <div className="ph-camera-recorder">
+                  <div className="ph-camera-stage">
+                    <video ref={cameraVideoRef} src={cameraPreviewUrl ?? undefined} autoPlay muted playsInline loop={cameraState === 'recorded'} aria-label="Camera preview" />
+                    <div className="ph-camera-guide" aria-hidden="true">
+                      <span className="ph-camera-head-frame" />
+                      <small>Keep your face inside the frame</small>
+                    </div>
+                    {cameraState === 'requesting' && <div className="ph-camera-overlay">Opening camera…</div>}
+                    {cameraState === 'idle' && <div className="ph-camera-overlay">Allow camera access to begin</div>}
+                    {cameraState === 'recorded' && <div className="ph-camera-captured-badge">Recording captured · looping preview</div>}
+                  </div>
+                  <div className="ph-camera-meta"><span>{cameraState === 'recording' ? 'Recording…' : '20-second guided capture'}</span><strong>{cameraElapsed}s / {CAMERA_RECORDING_SECONDS}s</strong></div>
+                  <p className="ph-camera-instructions">Face straight toward the camera, use bright even light from in front of you, keep your eyes and mouth visible, and speak naturally in a quiet room. Avoid a bright window behind you.</p>
+                  <blockquote className="ph-camera-script">“{CAMERA_PROMPT}”</blockquote>
+                  {cameraError && <div className="ph-minimal-error">{cameraError}</div>}
+                  <div className="ph-camera-actions">
+                    {(cameraState === 'idle' || cameraState === 'error') && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={!profile.name || profileNameTaken || isBusy}>Allow camera</button>}
+                    {cameraState === 'ready' && <button type="button" className="ph-minimal-primary" onClick={startCameraRecording} disabled={isBusy}>Start recording<span>●</span></button>}
+                    {cameraState === 'recording' && <button type="button" className="ph-minimal-record-stop" onClick={stopCameraRecording}>Stop and use recording<span>■</span></button>}
+                    {cameraState === 'recorded' && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={isBusy}>Record again</button>}
+                    {uploadPhaseVideo === 'uploading' && <span className="ph-camera-upload-status">Uploading {uploadProgressVideo}%…</span>}
+                  </div>
+                </div>
+              )}
+
+              {stepStatuses.preprocess === 'running' && (
+                <div className="ph-minimal-progress"><div><span>Preparing avatar</span><b>{Math.round((preprocessDisplayProgress ?? 0) * 100)}%</b></div><span className="ph-minimal-progress-track"><i style={{ width: `${Math.round((preprocessDisplayProgress ?? 0) * 100)}%` }} /></span></div>
+              )}
+              {stepStatuses.preprocess === 'error' && <div className="ph-minimal-error">{preprocessLogs[preprocessLogs.length - 1]?.message || 'Could not prepare this avatar.'}</div>}
+              {uiNotice && <div className="ph-minimal-error">{uiNotice}</div>}
+
+              <button type="button" className="ph-minimal-primary" onClick={() => void startPreprocess()} disabled={profileNameTaken || autoPrepareAfterUpload || !publicSetupReady || stepStatuses.preprocess === 'running' || isBusy && stepStatuses.preprocess !== 'running'}>
+                {autoPrepareAfterUpload || stepStatuses.preprocess === 'running' ? 'Preparing…' : 'Create avatar'}<span>→</span>
+              </button>
+
+              <details className="ph-minimal-help">
+                <summary>What makes a good source?</summary>
+                <p>Use a steady 720p or higher clip with bright, even front lighting. Keep your mouth visible, avoid a bright window behind you, and speak clearly without music or echo.</p>
+              </details>
+                  </>
+                );
+              })()}
+            </div>
+          </section>
+        )}
+
+        {publicProfileReady && (
+          <section className="ph-minimal-studio">
+            <div className="ph-minimal-studio-heading">
+              <div><span className="ph-minimal-eyebrow">Avatar</span><h1>{profile.name}</h1></div>
+              {isWarmingUp && <span className="ph-minimal-warmup-pill"><i /> Preparing this profile…</span>}
+            </div>
+
+            <div className="ph-minimal-workspace">
+              <section className="ph-minimal-preview">
+                <div className="ph-minimal-preview-heading"><span>Live preview</span><span><i className={`ph-mini-dot ${isWarmingUp ? 'is-preparing' : videoState === 'playing' ? 'is-speaking' : ''}`} />{isWarmingUp ? 'Preparing' : videoState === 'playing' ? 'Speaking' : 'Ready'}</span></div>
+                <div className="ph-minimal-canvas-wrap">
+                  <canvas ref={videoCanvasRef} width={810} height={1080} aria-label="Live avatar preview" />
+                  {isWarmingUp && <div className="ph-minimal-buffering ph-minimal-preparing">Preparing avatar…</div>}
+                  {videoState === 'buffering' && stepStatuses.inference === 'running' && <div className="ph-minimal-buffering">Buffering…</div>}
+                </div>
+                <div className="ph-minimal-preview-footer"><span>Chatterbox + {avatarBackend === 'wav2lip' ? 'Wav2Lip' : 'MuseTalk'}</span><span>{videoQueue ? `${videoQueue} frames` : `${videoFps} FPS`}</span></div>
+              </section>
+
+              <section className="ph-minimal-composer">
+                <div className="ph-minimal-composer-heading">
+                  <div><span className="ph-minimal-eyebrow">Ask your avatar</span><small>Type a question or use your voice.</small></div>
+                </div>
+                <div className="ph-minimal-input-shell">
+                  <textarea
+                    className="ph-minimal-composer-input"
+                    value={composerDisplayText}
+                    onChange={event => setInferenceText(event.target.value)}
+                    onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendComposerText(); } }}
+                    placeholder={isListening ? 'Listening…' : 'Ask your avatar something…'}
+                    rows={5}
+                  />
+                  <button type="button" className={`ph-minimal-voice-button ${isListening ? 'is-listening' : ''}`} onClick={() => (isListening ? stopListening() : startListening())} disabled={!hasSpeechSupport || stepStatuses.inference === 'running' || isWarmingUp} title={hasSpeechSupport ? 'Speak; it will send automatically when you stop' : 'Voice input is not supported by this browser'} aria-label={hasSpeechSupport ? (isListening ? 'Stop listening' : 'Voice input') : 'Voice input unavailable'} aria-pressed={isListening}>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm6-3a1 1 0 0 0-2 0 4 4 0 0 1-8 0 1 1 0 0 0-2 0 6 6 0 0 0 5 5.91V19H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-2.09A6 6 0 0 0 18 11Z" /></svg>
+                    <span>{isListening ? 'Stop listening' : 'Voice'}</span>
+                  </button>
+                </div>
+                <div className="ph-minimal-composer-row"><span>{inferenceText.length} characters</span><span>{isListening ? (speechTranscript ? 'Listening…' : 'Start speaking…') : 'Enter to send · voice sends automatically'}</span></div>
+
+                <div className="ph-minimal-model-grid">
+                  <label><span>Lip sync</span><select value={avatarBackend} onChange={event => setAvatarBackend(event.target.value as 'musetalk' | 'wav2lip')}><option value="musetalk">MuseTalk</option><option value="wav2lip">Wav2Lip</option></select></label>
+                  <label><span>Assistant</span><select value={llmMode} onChange={event => setLlmMode(event.target.value as LLMMode)}>{LLM_MODE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                </div>
+
+                <div className="ph-minimal-control-row"><label>Emotion<select value={voiceControlValues?.emotion || 'neutral'} onChange={event => handleVoiceControlsChange({ emotion: event.target.value as VoiceEmotion })}>{(['neutral', 'happy', 'sad', 'angry', 'scared', 'disgust'] as VoiceEmotion[]).map(emotion => <option key={emotion} value={emotion}>{emotion[0].toUpperCase() + emotion.slice(1)}</option>)}</select></label><button type="button" className="ph-minimal-advanced-button" onClick={() => setShowVoiceSettings(prev => !prev)}>{showVoiceSettings ? 'Hide options' : 'More options'}</button></div>
+
+                {showVoiceSettings && (
+                  <div className="ph-minimal-advanced-panel">
+                    <label><span>Expressiveness <b>{Math.round((voiceControlValues?.expressiveness ?? 0.5) * 100)}%</b></span><input type="range" min="0.25" max="1" step="0.01" value={voiceControlValues?.expressiveness ?? 0.5} onChange={event => handleVoiceControlsChange({ expressiveness: Number(event.target.value) })} /></label>
+                    <label><span>Variation / temperature <b>{(voiceControlValues?.variation ?? 0.8).toFixed(2)}</b></span><input type="range" min="0.1" max="1.2" step="0.01" value={voiceControlValues?.variation ?? 0.8} onChange={event => handleVoiceControlsChange({ variation: Number(event.target.value) })} /></label>
+                    <label><span>Voice match / CFG <b>{Math.round((voiceControlValues?.guidance ?? 0.5) * 100)}%</b></span><input type="range" min="0" max="1" step="0.01" value={voiceControlValues?.guidance ?? 0.5} onChange={event => handleVoiceControlsChange({ guidance: Number(event.target.value) })} /></label>
+                    <label><span>Repetition penalty <b>{(voiceControlValues?.repetition ?? 1.2).toFixed(2)}</b></span><input type="range" min="0.9" max="2" step="0.01" value={voiceControlValues?.repetition ?? 1.2} onChange={event => handleVoiceControlsChange({ repetition: Number(event.target.value) })} /></label>
+                    <label><span>Emotion intensity <b>{Math.round((voiceControlValues?.emotionIntensity ?? 0.5) * 100)}%</b></span><input type="range" min="0" max="1" step="0.05" value={voiceControlValues?.emotionIntensity ?? 0.5} disabled={voiceControlValues?.emotion === 'neutral'} onChange={event => handleVoiceControlsChange({ emotionIntensity: Number(event.target.value) })} /></label>
+                    <div className="ph-minimal-advanced-actions"><button type="button" onClick={resetVoiceControls}>Reset</button><button type="button" className="is-accent" onClick={() => void saveRuntimeSettings()} disabled={runtimeSettingsStatus === 'saving'}>{runtimeSettingsStatus === 'saved' ? 'Saved' : runtimeSettingsStatus === 'saving' ? 'Saving…' : 'Save defaults'}</button></div>
+                  </div>
+                )}
+
+                {uiNotice && <div className="ph-minimal-error">{uiNotice}</div>}
+                <div className="ph-minimal-composer-footer"><span><i className={`ph-status-dot ${isListening ? 'checking' : 'online'}`} /> {isListening ? 'Listening…' : stepStatuses.inference === 'running' ? 'Generating…' : 'Ready to stream'}</span><div className="ph-minimal-composer-actions"><button type="button" className={`ph-minimal-mic-button ${isListening ? 'is-listening' : ''}`} onClick={() => (isListening ? stopListening() : startListening())} disabled={!hasSpeechSupport || stepStatuses.inference === 'running' || isWarmingUp} title={hasSpeechSupport ? 'Speak; it will send automatically when you stop' : 'Voice input is not supported by this browser'} aria-label={hasSpeechSupport ? 'Voice input' : 'Voice input unavailable'} aria-pressed={isListening}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm6-3a1 1 0 0 0-2 0 4 4 0 0 1-8 0 1 1 0 0 0-2 0 6 6 0 0 0 5 5.91V19H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-2.09A6 6 0 0 0 18 11Z" /></svg></button>{stepStatuses.inference === 'running' && <button type="button" className="ph-minimal-stop is-active" onClick={() => void stopInference()}>Stop</button>}</div></div>
+              </section>
+            </div>
+
+            <details className="ph-minimal-session-details"><summary>Session details</summary><div><span>Voice engine <b>Chatterbox</b></span><span>Lip sync <b>{avatarBackend === 'wav2lip' ? 'Wav2Lip' : 'MuseTalk'}</b></span><span>First audio <b>{latency ? `${latency.ttfa} ms` : '—'}</b></span><span>Chunks <b>{inferenceChunks.length || '—'}</b></span></div></details>
+          </section>
+        )}
+        </main>
+      </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="ph-app">
+      <header className="ph-topbar">
+        <div className="ph-brand-lockup">
+          <span className="ph-brand-mark">✦</span>
+          <div>
+            <div className="ph-brand-name">PixelHolo</div>
+            <div className="ph-brand-subtitle">Realtime avatar studio</div>
+          </div>
+          <span className="ph-dev-badge">DEV</span>
+        </div>
+        <div className="ph-topbar-actions">
+          <div className="ph-connection-pill">
+            <span className={`ph-status-dot ${apiStatus}`} />
+            <span>{apiStatus === 'online' ? 'Engine online' : apiStatus === 'checking' ? 'Connecting' : 'Engine offline'}</span>
+          </div>
+          <label className="ph-api-control">
+            <span>API</span>
+            <input value={apiBase} onChange={(event) => setApiBase(event.target.value)} aria-label="API base URL" />
+          </label>
+        </div>
+      </header>
+
+      <div className="ph-shell">
+        <aside className="ph-sidebar">
+          <button type="button" className="ph-new-avatar" onClick={resetNewProfile}>
+            <span>＋</span> New avatar
+          </button>
+
+          <div className="ph-sidebar-label">Your avatars</div>
+          <div className="ph-profile-list">
+            {profilesStatus === 'loading' && <div className="ph-sidebar-empty">Loading avatars…</div>}
+            {profilesStatus === 'error' && <div className="ph-sidebar-empty ph-error-text">Could not load avatars.</div>}
+            {profilesStatus === 'idle' && profiles.length === 0 && (
+              <div className="ph-sidebar-empty">Your first avatar will appear here.</div>
+            )}
+            {profiles.map((item) => {
+              const selected = item.name === profile.name;
+              return (
+                <div key={`${item.profile_type || 'avatar'}:${item.name}`} className={`ph-profile-row ${selected ? 'is-selected' : ''}`}>
+                  <button type="button" className="ph-profile-select" onClick={() => selectProfile(item)}>
+                    <span className="ph-profile-avatar">{item.name.slice(0, 1).toUpperCase()}</span>
+                    <span className="ph-profile-copy">
+                      <strong>{item.name}</strong>
+                      <small>{item.has_data ? 'Ready to speak' : 'Needs a source clip'}</small>
+                    </span>
+                    <span className={`ph-ready-dot ${item.has_data ? 'ready' : ''}`} />
+                  </button>
+                  <div className="ph-profile-actions">
+                    <button type="button" onClick={() => void handleRenameProfile(item)} aria-label={`Rename ${item.name}`}>Rename</button>
+                    <button type="button" onClick={() => void handleDeleteProfile(item)} aria-label={`Delete ${item.name}`}>Delete</button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="ph-sidebar-footer">
+            <div className="ph-engine-stack">
+              <span className="ph-stack-icon">◌</span>
+              <div><strong>Chatterbox</strong><small>voice cloning</small></div>
+              <span className="ph-stack-arrow">→</span>
+              <span className="ph-stack-icon">◉</span>
+              <div><strong>MuseTalk</strong><small>lip sync</small></div>
+            </div>
+            <p>Zero-shot setup. No training step required.</p>
+          </div>
+        </aside>
+
+        <main className="ph-main">
+          {!publicProfileReady && (
+            <section className="ph-setup-view">
+              <div className="ph-page-intro">
+                <div>
+                  <span className="ph-kicker">Create an avatar</span>
+                  <h1>Give your voice a face.</h1>
+                  <p>Upload a short talking-head video. PixelHolo extracts the voice and prepares the face reference once, then streams Chatterbox audio through MuseTalk in real time.</p>
+                </div>
+                <div className="ph-pipeline-card">
+                  <span className="ph-pipeline-label">The fast path</span>
+                  <div className="ph-pipeline-line"><span>Source clip</span><b>→</b><span>Chatterbox</span><b>→</b><span>MuseTalk</span></div>
+                  <small>One setup. Unlimited conversations.</small>
+                </div>
+              </div>
+
+              <div className="ph-setup-grid">
+                <section className="ph-card ph-setup-card">
+                  <div className="ph-card-heading">
+                    <div><span className="ph-step-index">01</span><h2>Make a new avatar</h2></div>
+                    <span className="ph-card-status">{stepStatuses.preprocess === 'running' ? 'Preparing…' : publicSetupReady ? 'Ready to prepare' : '2 files'}</span>
+                  </div>
+                  <label className="ph-field-label" htmlFor="avatar-name">Avatar name</label>
+                  <input
+                    id="avatar-name"
+                    className="ph-text-input"
+                    value={profile.name}
+                    onChange={(event) => setProfile(prev => ({ ...prev, name: event.target.value }))}
+                    placeholder="Enter a profile name"
+                    disabled={isBusy}
+                  />
+
+                  <div className="ph-upload-grid">
+                    <label className={`ph-upload-tile ${profile.lastUploadedFile ? 'is-complete' : ''} ${!profile.name ? 'is-disabled' : ''}`}>
+                      <input type="file" accept="video/*" onChange={(event) => event.target.files?.[0] && void handleUpload(event.target.files[0])} disabled={!profile.name || isBusy} />
+                      <span className="ph-upload-icon">↥</span>
+                      <strong>{profile.lastUploadedFile ? 'Video added' : 'Add portrait video'}</strong>
+                      <small>{profile.lastUploadedFile || '5–20 seconds · MP4 or MOV'}</small>
+                      {uploadPhaseVideo === 'uploading' && <span className="ph-upload-progress">Uploading {uploadProgressVideo}%</span>}
+                    </label>
+                    <label className={`ph-upload-tile ${lastUploadedAudioFilename ? 'is-complete' : ''} ${!profile.name ? 'is-disabled' : ''}`}>
+                      <input type="file" accept="audio/*" onChange={(event) => event.target.files?.[0] && void handleUploadAudio(event.target.files[0])} disabled={!profile.name || isBusy} />
+                      <span className="ph-upload-icon">∿</span>
+                      <strong>{lastUploadedAudioFilename ? 'Optional voice override added' : 'Optional voice override'}</strong>
+                      <small>{lastUploadedAudioFilename || 'Clean WAV or MP3 · same speaker'}</small>
+                      {uploadPhaseAudio === 'uploading' && <span className="ph-upload-progress">Uploading {uploadProgressAudio}%</span>}
+                    </label>
+                  </div>
+
+                  <div className="ph-setup-note"><span>✦</span><p>Use a steady 720p+ video with bright, even light on your face. Keep the camera at eye level, avoid a bright window behind you, and keep your mouth clearly visible.</p></div>
+
+                  {stepStatuses.preprocess === 'running' && (
+                    <div className="ph-progress-block">
+                      <div className="ph-progress-label"><span>Preparing your avatar</span><strong>{Math.round((preprocessDisplayProgress ?? 0) * 100)}%</strong></div>
+                      <div className="ph-progress-track"><span style={{ width: `${Math.round((preprocessDisplayProgress ?? 0) * 100)}%` }} /></div>
+                      <small>Extracting the voice, transcribing the track, and baking the face loop…</small>
+                    </div>
+                  )}
+                  {stepStatuses.preprocess === 'error' && <div className="ph-inline-error">{preprocessLogs[preprocessLogs.length - 1]?.message || 'Could not prepare this avatar.'}</div>}
+                  {uiNotice && <div className="ph-inline-error">{uiNotice}</div>}
+
+                  <button
+                    type="button"
+                    className="ph-primary-button ph-wide-button"
+                    onClick={() => void startPreprocess()}
+                    disabled={!publicSetupReady || stepStatuses.preprocess === 'running' || isBusy && stepStatuses.preprocess !== 'running'}
+                  >
+                    {stepStatuses.preprocess === 'running' ? 'Preparing avatar…' : 'Prepare avatar'}<span>→</span>
+                  </button>
+                </section>
+
+                <aside className="ph-card ph-guidance-card">
+                  <span className="ph-kicker">A good source clip</span>
+                  <h2>Make the first take count.</h2>
+                  <div className="ph-guidance-list">
+                    <div><span className="ph-guidance-number">01</span><p><strong>Use good light</strong><br />Choose bright, even front lighting and avoid backlight.</p></div>
+                    <div><span className="ph-guidance-number">02</span><p><strong>Frame your face</strong><br />Use a steady 720p+ clip with your eyes and mouth visible.</p></div>
+                    <div><span className="ph-guidance-number">03</span><p><strong>Use clean audio</strong><br />Avoid music, rooms with echo, and overlapping speakers.</p></div>
+                    <div><span className="ph-guidance-number">04</span><p><strong>Speak naturally</strong><br />A steady, relaxed delivery helps Chatterbox capture your voice.</p></div>
+                  </div>
+                  <div className="ph-guidance-footer"><span className="ph-checkmark">✓</span><span>No training step is required for this flow.</span></div>
+                </aside>
+              </div>
+
+              {preprocessStats && stepStatuses.preprocess === 'done' && (
+                <div className="ph-success-banner"><span>✓</span><div><strong>Avatar ready.</strong><small>{preprocessStats.segmentsKept || 0} clean voice segments prepared. Opening the studio…</small></div></div>
+              )}
+            </section>
+          )}
+
+          {publicProfileReady && (
+            <section className="ph-studio-view">
+              <div className="ph-studio-heading">
+                <div><span className="ph-kicker">Avatar studio</span><h1>{profile.name}</h1><p>Speak naturally. PixelHolo handles the voice and face in one stream.</p></div>
+                <div className="ph-studio-heading-actions"><span className="ph-live-pill"><span className="ph-status-dot online" /> {isWarmingUp ? `Warming ${warmupTargetName || 'avatar'}…` : 'Ready'}</span><button type="button" className="ph-secondary-button" onClick={() => setActiveStep(1)}>Change avatar</button></div>
+              </div>
+
+              <div className="ph-studio-grid">
+                <section className="ph-card ph-avatar-card">
+                  <div className="ph-avatar-card-head"><div><span className="ph-kicker">Live preview</span><h2>{isWarmingUp ? 'Preparing avatar' : videoState === 'playing' ? 'Speaking now' : 'Your avatar'}</h2></div><span className="ph-engine-chip"><span>◌</span> MuseTalk</span></div>
+                  <div className="ph-avatar-stage">
+                    <canvas ref={videoCanvasRef} width={810} height={1080} aria-label="Live avatar preview" />
+                    {isWarmingUp && <div className="ph-avatar-overlay">Preparing avatar…</div>}
+                    {videoState === 'buffering' && stepStatuses.inference === 'running' && <div className="ph-avatar-overlay">Buffering face frames…</div>}
+                  </div>
+                  <div className="ph-avatar-card-foot"><span><i className={`ph-mini-dot ${videoState === 'playing' ? 'is-speaking' : ''}`} /> {videoState === 'playing' ? 'Streaming' : 'Waiting for a prompt'}</span><span>{videoFps} FPS · {videoQueue} frames queued</span></div>
+                </section>
+
+                <section className="ph-card ph-composer-card">
+                  <div className="ph-composer-tabs"><button type="button" className={composerMode === 'say' ? 'is-active' : ''} onClick={() => setComposerMode('say')}>Say it</button><button type="button" className={composerMode === 'chat' ? 'is-active' : ''} onClick={() => setComposerMode('chat')}>Ask assistant</button></div>
+                  <textarea
+                    className="ph-composer-input"
+                    value={inferenceText}
+                    onChange={(event) => setInferenceText(event.target.value)}
+                    onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendComposerText(); } }}
+                    placeholder={composerMode === 'say' ? 'Type something for your avatar to say…' : 'Ask your avatar anything…'}
+                    rows={5}
+                  />
+                  <div className="ph-composer-meta"><span>{inferenceText.length} characters</span><span>Enter to generate · Shift + Enter for a new line</span></div>
+                  <button type="button" className="ph-primary-button ph-generate-button" onClick={() => void sendComposerText()} disabled={!inferenceText.trim() || stepStatuses.inference === 'running' || isWarmingUp}>{stepStatuses.inference === 'running' ? 'Generating…' : composerMode === 'say' ? 'Generate voice + lip sync' : 'Ask and animate'}<span>↗</span></button>
+
+                  <div className="ph-emotion-row"><div><span className="ph-control-label">Emotion</span><small>Chatterbox expression</small></div><select value={voiceControlValues?.emotion || 'neutral'} onChange={(event) => handleVoiceControlsChange({ emotion: event.target.value as VoiceEmotion })}>{(['neutral', 'happy', 'sad', 'angry', 'scared', 'disgust'] as VoiceEmotion[]).map((emotion) => <option key={emotion} value={emotion}>{emotion[0].toUpperCase() + emotion.slice(1)}</option>)}</select></div>
+
+                  <button type="button" className="ph-settings-toggle" onClick={() => setShowVoiceSettings(prev => !prev)}><span>Voice settings</span><span>{showVoiceSettings ? '−' : '+'}</span></button>
+                  {showVoiceSettings && (
+                    <div className="ph-voice-settings">
+                      <label><span>Expressiveness <b>{Math.round((voiceControlValues?.expressiveness ?? 0.5) * 100)}%</b></span><input type="range" min="0.25" max="1" step="0.01" value={voiceControlValues?.expressiveness ?? 0.5} onChange={(event) => handleVoiceControlsChange({ expressiveness: Number(event.target.value) })} /></label>
+                      <label><span>Voice match <b>{Math.round((voiceControlValues?.guidance ?? 0.5) * 100)}%</b></span><input type="range" min="0" max="1" step="0.01" value={voiceControlValues?.guidance ?? 0.5} onChange={(event) => handleVoiceControlsChange({ guidance: Number(event.target.value) })} /></label>
+                      <label><span>Pace <b>{voiceControlValues?.pace ?? 0}%</b></span><input type="range" min="-100" max="100" step="1" value={voiceControlValues?.pace ?? 0} onChange={(event) => handleVoiceControlsChange({ pace: Number(event.target.value) })} /></label>
+                      <div className="ph-voice-setting-actions"><button type="button" className="ph-text-button" onClick={resetVoiceControls}>Reset</button><button type="button" className="ph-text-button is-accent" onClick={() => void saveRuntimeSettings()} disabled={runtimeSettingsStatus === 'saving'}>{runtimeSettingsStatus === 'saved' ? 'Saved' : runtimeSettingsStatus === 'saving' ? 'Saving…' : 'Save defaults'}</button></div>
+                    </div>
+                  )}
+
+                  {uiNotice && <div className="ph-inline-error">{uiNotice}</div>}
+                  <div className="ph-composer-footer"><span><span className="ph-status-dot online" /> Chatterbox · {museTalkPreset.replace('_', ' ')}</span><button type="button" className="ph-stop-button" onClick={() => void stopInference()} disabled={stepStatuses.inference !== 'running'}>Stop</button></div>
+                </section>
+              </div>
+
+              <div className="ph-metrics-row">
+                <div className="ph-metric-card"><span className="ph-kicker">Time to first audio</span><strong>{latency ? `${latency.ttfa} ms` : '—'}</strong><small>Measured for the last prompt</small></div>
+                <div className="ph-metric-card"><span className="ph-kicker">Stream</span><strong>{inferenceChunks.length ? `${inferenceChunks.length} chunks` : 'Ready'}</strong><small>{latency?.total ? `${latency.total} ms total` : 'Chunked playback keeps the avatar responsive'}</small></div>
+                <div className="ph-metric-card ph-metric-card-wide"><span className="ph-kicker">Pipeline</span><div className="ph-pipeline-line"><span className="is-current">Chatterbox</span><b>→</b><span className="is-current">MuseTalk</span><b>→</b><span>Live browser playback</span></div><small>Voice identity is cached once per avatar session.</small></div>
+              </div>
+            </section>
+          )}
+        </main>
+      </div>
+      <footer className="ph-footer"><span>PixelHolo dev workspace</span><span>Local first · deploy target <strong>dev.pixelholo.com</strong></span></footer>
     </div>
   );
 
@@ -1928,7 +3031,7 @@ const App: React.FC = () => {
                         setProfile(prev => ({ ...prev, name: e.target.value }));
                       }}
                       disabled={isBusy}
-                      placeholder="e.g. Alvin Studio Master"
+                      placeholder="Enter a profile name"
                       className={`w-full bg-white border border-slate-200 rounded-lg px-4 py-3 text-sm focus:ring-2 focus:ring-teal-600 outline-none transition-all font-semibold ${isBusy ? 'opacity-60 cursor-not-allowed' : ''}`}
                     />
                     <p className="text-[10px] text-slate-400 mt-2 italic">Used to organize your models and generated assets.</p>
@@ -1986,6 +3089,8 @@ const App: React.FC = () => {
                                   setProfileType('voice');
                                 }
                                 setProfile(prev => ({ ...prev, name: item.name }));
+                                setIsCreatingProfile(false);
+                                setShowWelcome(false);
                                 const selectedType = item.profile_type === 'avatar' ? 'avatar' : 'voice';
                                 void warmupProfile(item.name, selectedType);
                                 setLastUploadedFilename(null);
@@ -2050,7 +3155,7 @@ const App: React.FC = () => {
 
                 <div className="space-y-4">
                   <p className="text-xs text-slate-500 bg-slate-50 border border-slate-100 rounded-lg px-3 py-2">
-                    Avatar setup uses two files: a video for the face loop and a separate audio file for voice training.
+                    Avatar setup uses one talking video by default. A separate audio override remains available for developer workflows.
                   </p>
                   <div className="relative group">
                     <input
@@ -2307,12 +3412,20 @@ const App: React.FC = () => {
           {activeStep === 3 && (
             <StepCard
               stepNumber={3}
-              title="Voice Model Training"
-              description="Fine-tune StyleTTS2 with your settings and flags."
+              title={ttsBackend !== 'styletts2' ? 'StyleTTS2 Backup Training' : 'Voice Model Training'}
+              description={
+                ttsBackend !== 'styletts2'
+                  ? 'Optional backup training. This TTS backend can use the processed profile audio directly.'
+                  : 'Fine-tune StyleTTS2 with your settings and flags.'
+              }
               status={stepStatuses.train}
               isActive={true}
               statusSteps={trainSteps}
-              statusNote="Training runs on GPU. Early-stop finishes once the sweet spot is detected."
+              statusNote={
+                ttsBackend !== 'styletts2'
+                  ? 'Skip this step unless you also want a StyleTTS2 backup checkpoint.'
+                  : 'Training runs on GPU. Early-stop finishes once the sweet spot is detected.'
+              }
               progress={trainDisplayProgress}
               activeStepIndex={stepStatuses.train === 'running' ? trainStageIndex : null}
               statusContent={trainingStatusCard}
@@ -2433,7 +3546,7 @@ const App: React.FC = () => {
                       <span className="text-[10px] font-bold text-teal-300">{outputMode === 'avatar' ? `${videoFps} FPS | ${videoQueue} queued` : 'disabled'}</span>
                     </div>
                     <div className="mt-3 bg-black rounded-xl overflow-hidden border border-slate-800 w-full max-w-[720px] mx-auto min-h-[720px]">
-                      <canvas ref={videoCanvasRef} width={640} height={853} className="w-full h-full" />
+                      <canvas ref={videoCanvasRef} width={810} height={1080} className="w-full h-full" />
                     </div>
                     <div className="mt-3 text-[11px] text-slate-400 flex items-center justify-between">
                       <span>Status: <span className="font-semibold text-slate-200">{videoState}</span></span>
@@ -2478,6 +3591,7 @@ const App: React.FC = () => {
                       saveStatus={runtimeSettingsStatus}
                       saveError={runtimeSettingsError}
                       canSave={apiStatus === 'online' && Boolean(profile.name.trim())}
+                      ttsBackend={ttsBackend}
                       onChange={handleVoiceControlsChange}
                       onReset={resetVoiceControls}
                       onSave={saveRuntimeSettings}

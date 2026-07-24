@@ -1,4 +1,7 @@
+from contextvars import ContextVar
 from pathlib import Path
+import os
+import uuid
 
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent
@@ -6,6 +9,26 @@ DATA_DIR = BASE_DIR / "data"
 MODELS_DIR = BASE_DIR / "models"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 LIP_SYNCING_DIR = REPO_ROOT / "lip_syncing"
+
+# Anonymous workspace isolation.  The legacy workspace deliberately keeps the
+# original paths so existing developer profiles remain intact while new web
+# sessions are stored below data/workspaces/<uuid> and outputs/workspaces/<uuid>.
+WORKSPACE_DIRNAME = "workspaces"
+LEGACY_WORKSPACE_ID = "legacy"
+WORKSPACE_HEADER = "X-PixelHolo-Workspace"
+_workspace_env_id = (os.getenv("PIXELHOLO_WORKSPACE_ID") or "").strip()
+try:
+    _workspace_default_id = (
+        LEGACY_WORKSPACE_ID
+        if not _workspace_env_id or _workspace_env_id == LEGACY_WORKSPACE_ID
+        else str(uuid.UUID(_workspace_env_id))
+    )
+except (ValueError, AttributeError, TypeError):
+    _workspace_default_id = LEGACY_WORKSPACE_ID
+_workspace_id_context: ContextVar[str] = ContextVar(
+    "pixelholo_workspace_id",
+    default=_workspace_default_id,
+)
 
 INFERENCE_AUDIO_DIRNAME = "audio"
 INFERENCE_VIDEO_DIRNAME = "video"
@@ -58,6 +81,56 @@ DEFAULT_EPOCHS = 15
 STYLE_TTS2_DIR = BASE_DIR / "lib" / "StyleTTS2"
 
 
+def normalize_workspace_id(value: str | None) -> str:
+    """Return a safe workspace identifier for anonymous browser sessions.
+
+    The frontend generates UUIDs and sends them in X-PixelHolo-Workspace.  The
+    legacy value is accepted for local/developer access when the header is not
+    present.  Never use an arbitrary client string as a filesystem path.
+    """
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return LEGACY_WORKSPACE_ID
+    if cleaned == LEGACY_WORKSPACE_ID:
+        return LEGACY_WORKSPACE_ID
+    try:
+        return str(uuid.UUID(cleaned))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError("workspace id must be a UUID") from exc
+
+
+def current_workspace_id() -> str:
+    return _workspace_id_context.get()
+
+
+def set_workspace_id(workspace_id: str):
+    """Set the request-local workspace and return its reset token."""
+    return _workspace_id_context.set(normalize_workspace_id(workspace_id))
+
+
+def reset_workspace_id(token) -> None:
+    _workspace_id_context.reset(token)
+
+
+def workspace_data_root(workspace_id: str | None = None) -> Path:
+    resolved = normalize_workspace_id(workspace_id or current_workspace_id())
+    if resolved == LEGACY_WORKSPACE_ID:
+        return DATA_DIR
+    return DATA_DIR / WORKSPACE_DIRNAME / resolved
+
+
+def workspace_outputs_root(workspace_id: str | None = None) -> Path:
+    resolved = normalize_workspace_id(workspace_id or current_workspace_id())
+    if resolved == LEGACY_WORKSPACE_ID:
+        return OUTPUTS_DIR
+    return OUTPUTS_DIR / WORKSPACE_DIRNAME / resolved
+
+
+def workspace_environment(workspace_id: str | None = None) -> dict[str, str]:
+    """Environment overlay for profile-processing subprocesses."""
+    return {"PIXELHOLO_WORKSPACE_ID": normalize_workspace_id(workspace_id or current_workspace_id())}
+
+
 def _normalize_profile_type(profile_type: str | None) -> str:
     if profile_type == PROFILE_TYPE_AVATAR:
         return PROFILE_TYPE_AVATAR
@@ -66,15 +139,17 @@ def _normalize_profile_type(profile_type: str | None) -> str:
 
 def dataset_root(speaker_name: str, profile_type: str | None = None) -> Path:
     normalized = _normalize_profile_type(profile_type)
+    data_root = workspace_data_root()
     if normalized == PROFILE_TYPE_AVATAR:
-        return DATA_DIR / AVATAR_PROFILE_DIRNAME / speaker_name
-    return DATA_DIR / VOICE_PROFILE_DIRNAME / speaker_name
+        return data_root / AVATAR_PROFILE_DIRNAME / speaker_name
+    return data_root / VOICE_PROFILE_DIRNAME / speaker_name
 
 
 def resolve_dataset_root(speaker_name: str, profile_type: str | None = None) -> Path:
     if profile_type:
         return dataset_root(speaker_name, profile_type)
-    for base in (DATA_DIR / VOICE_PROFILE_DIRNAME, DATA_DIR / AVATAR_PROFILE_DIRNAME, DATA_DIR):
+    data_root = workspace_data_root()
+    for base in (data_root / VOICE_PROFILE_DIRNAME, data_root / AVATAR_PROFILE_DIRNAME, data_root):
         candidate = base / speaker_name
         if candidate.exists():
             return candidate
@@ -83,9 +158,10 @@ def resolve_dataset_root(speaker_name: str, profile_type: str | None = None) -> 
 
 def profile_data_root(profile_type: str | None = None) -> Path:
     normalized = _normalize_profile_type(profile_type)
+    data_root = workspace_data_root()
     if normalized == PROFILE_TYPE_AVATAR:
-        return DATA_DIR / AVATAR_PROFILE_DIRNAME
-    return DATA_DIR / VOICE_PROFILE_DIRNAME
+        return data_root / AVATAR_PROFILE_DIRNAME
+    return data_root / VOICE_PROFILE_DIRNAME
 
 
 def raw_videos_dir(speaker_name: str, profile_type: str | None = None) -> Path:
@@ -110,7 +186,7 @@ def avatar_cache_dir(speaker_name: str, profile_type: str | None = None) -> Path
 
 def training_root(profile_type: str | None = None) -> Path:
     normalized = _normalize_profile_type(profile_type)
-    return OUTPUTS_DIR / TRAINING_DIRNAME / normalized
+    return workspace_outputs_root() / TRAINING_DIRNAME / normalized
 
 
 def training_dir(profile: str, profile_type: str | None = None) -> Path:
@@ -120,7 +196,11 @@ def training_dir(profile: str, profile_type: str | None = None) -> Path:
 def resolve_training_dir(profile: str, profile_type: str | None = None) -> Path:
     if profile_type:
         return training_dir(profile, profile_type)
-    for base in (training_root(PROFILE_TYPE_VOICE), training_root(PROFILE_TYPE_AVATAR), OUTPUTS_DIR / TRAINING_DIRNAME):
+    for base in (
+        training_root(PROFILE_TYPE_VOICE),
+        training_root(PROFILE_TYPE_AVATAR),
+        workspace_outputs_root() / TRAINING_DIRNAME,
+    ):
         candidate = base / profile
         if candidate.exists():
             return candidate
@@ -129,8 +209,8 @@ def resolve_training_dir(profile: str, profile_type: str | None = None) -> Path:
 
 def inference_audio_dir(profile: str, profile_type: str | None = None) -> Path:
     normalized = _normalize_profile_type(profile_type)
-    return OUTPUTS_DIR / INFERENCE_AUDIO_DIRNAME / normalized / profile
+    return workspace_outputs_root() / INFERENCE_AUDIO_DIRNAME / normalized / profile
 
 
 def inference_video_dir(profile: str, profile_type: str | None = None) -> Path:
-    return OUTPUTS_DIR / INFERENCE_VIDEO_DIRNAME / PROFILE_TYPE_AVATAR / profile
+    return workspace_outputs_root() / INFERENCE_VIDEO_DIRNAME / PROFILE_TYPE_AVATAR / profile

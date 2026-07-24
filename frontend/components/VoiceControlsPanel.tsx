@@ -1,5 +1,5 @@
 import React from 'react';
-import { VoiceControlValues } from '../types';
+import { TTSBackend, VoiceControlValues, VoiceEmotion } from '../types';
 
 type VoiceControlsPanelProps = {
   values: VoiceControlValues | null;
@@ -9,13 +9,14 @@ type VoiceControlsPanelProps = {
   saveStatus?: 'idle' | 'saving' | 'saved' | 'error';
   saveError?: string | null;
   canSave?: boolean;
+  ttsBackend?: TTSBackend;
   onChange: (patch: Partial<VoiceControlValues>) => void;
   onReset: () => void;
   onSave: () => void;
 };
 
 type SliderConfig = {
-  key: keyof VoiceControlValues;
+  key: Extract<keyof VoiceControlValues, 'pitch' | 'pace' | 'tone' | 'volume' | 'expressiveness' | 'variation' | 'guidance' | 'repetition'>;
   label: string;
   hint: string;
   min: number;
@@ -44,7 +45,7 @@ const describePitch = (value: number) => {
 
 const describeDefault = (value: string) => (value === 'Default' ? 'Profile default' : `Default ${value.toLowerCase()}`);
 
-const SLIDERS: SliderConfig[] = [
+const STYLE_TTS2_SLIDERS: SliderConfig[] = [
   {
     key: 'pitch',
     label: 'Pitch',
@@ -96,6 +97,89 @@ const FALLBACK_VALUES: VoiceControlValues = {
   pace: 0,
   tone: 0,
   volume: 0,
+  expressiveness: 0.5,
+  variation: 0.8,
+  guidance: 0.5,
+  repetition: 1.2,
+  emotion: 'neutral',
+  emotionIntensity: 0.5,
+};
+
+const describeCentered = (
+  value: number,
+  center: number,
+  low: string,
+  high: string,
+  tolerance = 0.03,
+) => {
+  const delta = value - center;
+  if (Math.abs(delta) <= tolerance) return 'Default';
+  return delta < 0 ? low : high;
+};
+
+const CHATTERBOX_SLIDERS: SliderConfig[] = [
+  {
+    key: 'expressiveness',
+    label: 'Expressiveness',
+    hint: 'Control Chatterbox delivery energy.',
+    min: 0.25,
+    max: 1,
+    step: 0.01,
+    minLabel: 'Subtle',
+    maxLabel: 'Expressive',
+    describe: (value) => describeCentered(value, 0.5, 'More subtle', 'More expressive'),
+  },
+  {
+    key: 'guidance',
+    label: 'Voice Match',
+    hint: 'How strongly generation follows the voice prompt.',
+    min: 0,
+    max: 1,
+    step: 0.01,
+    minLabel: 'Looser',
+    maxLabel: 'Closer',
+    describe: (value) => describeCentered(value, 0.5, 'Looser match', 'Closer match'),
+  },
+  {
+    key: 'pace',
+    label: 'Pace',
+    hint: 'Slow the delivery down or speed it up after TTS.',
+    min: -100,
+    max: 100,
+    step: 1,
+    minLabel: 'Slower',
+    maxLabel: 'Faster',
+    describe: (value) => describeRelative(value, 'slower', 'faster'),
+  },
+  {
+    key: 'volume',
+    label: 'Volume',
+    hint: 'Make the voice softer or stronger after TTS.',
+    min: -100,
+    max: 100,
+    step: 1,
+    minLabel: 'Softer',
+    maxLabel: 'Stronger',
+    describe: (value) => describeRelative(value, 'softer', 'stronger'),
+  },
+];
+
+const EMOTION_OPTIONS: { value: VoiceEmotion; label: string }[] = [
+  { value: 'neutral', label: 'Neutral' },
+  { value: 'happy', label: 'Happy' },
+  { value: 'sad', label: 'Sad' },
+  { value: 'angry', label: 'Angry' },
+  { value: 'scared', label: 'Scared' },
+  { value: 'disgust', label: 'Disgust' },
+];
+
+const EMOTION_VALUE_PRESETS: Record<VoiceEmotion, Pick<VoiceControlValues, 'expressiveness' | 'variation' | 'guidance'>> = {
+  neutral: { expressiveness: 0.5, variation: 0.8, guidance: 0.5 },
+  happy: { expressiveness: 0.62, variation: 0.9, guidance: 0.45 },
+  sad: { expressiveness: 0.42, variation: 0.7, guidance: 0.58 },
+  angry: { expressiveness: 0.7, variation: 0.82, guidance: 0.5 },
+  scared: { expressiveness: 0.66, variation: 0.95, guidance: 0.48 },
+  disgust: { expressiveness: 0.58, variation: 0.82, guidance: 0.52 },
 };
 
 const VoiceControlsPanel: React.FC<VoiceControlsPanelProps> = ({
@@ -106,18 +190,25 @@ const VoiceControlsPanel: React.FC<VoiceControlsPanelProps> = ({
   saveStatus = 'idle',
   saveError = null,
   canSave = true,
+  ttsBackend = 'chatterbox',
   onChange,
   onReset,
   onSave,
 }) => {
   const effectiveValues = values ?? defaults ?? FALLBACK_VALUES;
   const effectiveDefaults = defaults ?? FALLBACK_VALUES;
+  const sliders = ttsBackend === 'chatterbox'
+    ? CHATTERBOX_SLIDERS
+    : STYLE_TTS2_SLIDERS;
+  const title = ttsBackend === 'chatterbox'
+    ? 'Chatterbox Voice Controls'
+    : 'StyleTTS2 Voice Controls';
 
   return (
     <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-4">
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2">
-          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Voice Controls</p>
+          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{title}</p>
           <span
             className="group relative inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-slate-200 bg-slate-50 text-[11px] font-bold text-slate-500"
             aria-label="Voice control changes apply to the next generated response. Use Save to keep them as this profile's default voice controls."
@@ -177,7 +268,53 @@ const VoiceControlsPanel: React.FC<VoiceControlsPanelProps> = ({
       )}
 
       <div className="space-y-4">
-        {SLIDERS.map((slider) => {
+        {ttsBackend === 'chatterbox' && (
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">Emotion</span>
+              <span className="text-xs font-semibold capitalize text-teal-700">
+                {effectiveValues.emotion === 'neutral' ? 'Default' : effectiveValues.emotion}
+              </span>
+            </div>
+            <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
+              {EMOTION_OPTIONS.map((option) => {
+                const selected = effectiveValues.emotion === option.value;
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    onClick={() => onChange({ emotion: option.value, ...EMOTION_VALUE_PRESETS[option.value] })}
+                    className={`h-8 rounded-md border text-xs font-bold transition ${
+                      selected
+                        ? 'border-teal-600 bg-teal-600 text-white'
+                        : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'
+                    }`}
+                    aria-pressed={selected}
+                  >
+                    {option.label}
+                  </button>
+                );
+              })}
+            </div>
+            <div className={`mt-3 ${effectiveValues.emotion === 'neutral' ? 'opacity-45' : ''}`}>
+              <div className="mb-1 flex items-center justify-between text-[11px] font-semibold text-slate-500">
+                <span>Intensity</span>
+                <span>{Math.round(effectiveValues.emotionIntensity * 100)}%</span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={effectiveValues.emotionIntensity}
+                disabled={effectiveValues.emotion === 'neutral'}
+                onChange={(event) => onChange({ emotionIntensity: Number(event.target.value) })}
+                className="w-full accent-teal-600"
+              />
+            </div>
+          </div>
+        )}
+        {sliders.map((slider) => {
           const value = effectiveValues[slider.key];
           const defaultValue = effectiveDefaults[slider.key];
           return (

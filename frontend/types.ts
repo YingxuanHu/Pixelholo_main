@@ -1,6 +1,8 @@
 
 export type StepStatus = 'idle' | 'running' | 'done' | 'error';
 export type ProfileType = 'voice' | 'avatar';
+export type TTSBackend = 'chatterbox' | 'styletts2';
+export type VoiceEmotion = 'neutral' | 'happy' | 'sad' | 'angry' | 'scared' | 'disgust';
 
 export interface LogEntry {
   id: string;
@@ -43,6 +45,12 @@ export interface VoiceControlValues {
   pace: number;
   tone: number;
   volume: number;
+  expressiveness: number;
+  variation: number;
+  guidance: number;
+  repetition: number;
+  emotion: VoiceEmotion;
+  emotionIntensity: number;
 }
 
 export interface ProfileInfo {
