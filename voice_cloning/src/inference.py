@@ -1031,9 +1031,13 @@ def _rewrite_profile_refs_in_dir(
             file_path.write_text(updated, encoding="utf-8")
 
 
-def _drop_warmup_cache_for_profile(profile_name: str, profile_type: str) -> None:
+def _drop_warmup_cache_for_profile(
+    profile_name: str,
+    profile_type: str,
+    workspace_id: str | None = None,
+) -> None:
     ptype = _normalize_profile_type(profile_type)
-    workspace_id = current_workspace_id()
+    workspace_id = normalize_workspace_id(workspace_id or current_workspace_id())
     global _warmed_tts_profiles, _warmed_tts_engine_keys, _warmed_lipsync_profiles
     _warmed_tts_profiles = {
         key
@@ -3804,19 +3808,20 @@ def preprocess(req: PreprocessRequest):
         ]
     workspace_id = current_workspace_id()
     def _preprocess_stream() -> Iterator[str]:
-        token = set_workspace_id(workspace_id)
-        try:
-            yield from _stream_subprocess(
-                command,
-                cwd=PROJECT_ROOT,
-                workspace_id=workspace_id,
-            )
-            # A re-prepared profile may have the same directory name but different
-            # frame/latent files.  Drop warmup markers so the next selection reloads
-            # the new cache instead of reusing stale in-memory assets.
-            _drop_warmup_cache_for_profile(profile, profile_type)
-        finally:
-            reset_workspace_id(token)
+        # StreamingResponse advances this generator in worker contexts that can
+        # change between yielded lines. Do not carry a ContextVar token across
+        # yields: resetting such a token crashes the response after preprocessing
+        # succeeds, leaving the client appearing stuck. The subprocess receives
+        # its workspace explicitly and cache invalidation does too.
+        yield from _stream_subprocess(
+            command,
+            cwd=PROJECT_ROOT,
+            workspace_id=workspace_id,
+        )
+        # A re-prepared profile may have the same directory name but different
+        # frame/latent files. Drop warmup markers so the next selection reloads
+        # the new cache instead of reusing stale in-memory assets.
+        _drop_warmup_cache_for_profile(profile, profile_type, workspace_id)
 
     return StreamingResponse(_preprocess_stream(), media_type="text/plain")
 
@@ -3857,48 +3862,49 @@ def train(req: TrainRequest):
         command.append("--no_early_stop")
     workspace_id = current_workspace_id()
     def _train_stream() -> Iterator[str]:
-        token = set_workspace_id(workspace_id)
-        try:
-            child_env = os.environ.copy()
-            child_env.update(workspace_environment(workspace_id))
-            process = subprocess.Popen(
+        child_env = os.environ.copy()
+        child_env.update(workspace_environment(workspace_id))
+        process = subprocess.Popen(
+            command,
+            cwd=PROJECT_ROOT,
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            yield f"{line.rstrip()}\n"
+        exit_code = process.wait()
+        if exit_code != 0:
+            logger.error(
+                "component=backend op=train_subprocess status=error exit_code=%s profile=%s profile_type=%s cmd=%s",
+                exit_code,
+                profile,
+                profile_type,
                 command,
-                cwd=PROJECT_ROOT,
-                env=child_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
             )
-            assert process.stdout is not None
-            for line in process.stdout:
-                yield f"{line.rstrip()}\n"
-            exit_code = process.wait()
-            if exit_code != 0:
-                logger.error(
-                    "component=backend op=train_subprocess status=error exit_code=%s profile=%s profile_type=%s cmd=%s",
-                    exit_code,
-                    profile,
-                    profile_type,
-                    command,
-                )
-                yield f"[process exited {exit_code}]\n"
-                yield "ERROR: Subprocess failed. See logs above for details.\n"
-                return
             yield f"[process exited {exit_code}]\n"
-            yield "[warmup] starting...\n"
+            yield "ERROR: Subprocess failed. See logs above for details.\n"
+            return
+        yield f"[process exited {exit_code}]\n"
+        yield "[warmup] starting...\n"
+        warmup_token = set_workspace_id(workspace_id)
+        try:
             try:
                 _warmup_profile(profile, profile_type, force=True)
-                yield "[warmup] done\n"
+                warmup_message = "[warmup] done\n"
             except Exception as exc:
                 logger.exception(
                     "component=backend op=warmup_profile status=error profile=%s profile_type=%s",
                     profile,
                     profile_type,
                 )
-                yield f"[warmup] failed: {exc}\n"
+                warmup_message = f"[warmup] failed: {exc}\n"
         finally:
-            reset_workspace_id(token)
+            reset_workspace_id(warmup_token)
+        yield warmup_message
 
     return StreamingResponse(_train_stream(), media_type="text/plain")
 

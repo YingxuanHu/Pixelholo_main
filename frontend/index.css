@@ -330,6 +330,24 @@ button:disabled { cursor: not-allowed; }
 .ph-minimal-source-tabs button:hover:not(:disabled) { color: #087f72; }
 .ph-minimal-source-tabs button.is-selected { color: #087f72; background: #fff; box-shadow: 0 1px 4px rgba(36,37,32,.08); }
 .ph-minimal-source-tabs button:disabled { cursor: not-allowed; opacity: .45; }
+.ph-minimal-create-card.is-preparing > .ph-minimal-label,
+.ph-minimal-create-card.is-preparing > .ph-minimal-name-input,
+.ph-minimal-create-card.is-preparing > .ph-minimal-name-availability,
+.ph-minimal-create-card.is-preparing > .ph-minimal-source-tabs,
+.ph-minimal-create-card.is-preparing > .ph-minimal-file-list,
+.ph-minimal-create-card.is-preparing > .ph-camera-recorder,
+.ph-minimal-create-card.is-preparing > .ph-minimal-primary,
+.ph-minimal-create-card.is-preparing > .ph-minimal-help { display: none; }
+.ph-minimal-preparing { display: grid; gap: 14px; padding: 8px 2px; }
+.ph-minimal-preparing-heading { display: flex; align-items: center; gap: 10px; }
+.ph-minimal-preparing-heading strong { display: block; color: #29443e; font-size: 15px; }
+.ph-minimal-preparing-heading p { margin: 3px 0 0; color: #70807a; font-size: 11px; }
+.ph-minimal-preparing-pulse { width: 9px; height: 9px; flex: 0 0 auto; border-radius: 50%; background: #0b8b7d; box-shadow: 0 0 0 5px rgba(11, 139, 125, .12); animation: ph-preparing-pulse 1.4s ease-in-out infinite; }
+.ph-minimal-preparing-track { display: block; height: 4px; overflow: hidden; border-radius: 999px; background: #dfefea; }
+.ph-minimal-preparing-track i { display: block; width: 38%; height: 100%; border-radius: inherit; background: #0b8b7d; animation: ph-preparing-slide 1.5s ease-in-out infinite; }
+.ph-minimal-preparing small { color: #89938e; font: 500 9px 'DM Mono', monospace; }
+@keyframes ph-preparing-pulse { 50% { opacity: .45; transform: scale(.82); } }
+@keyframes ph-preparing-slide { 0% { transform: translateX(-120%); } 100% { transform: translateX(360%); } }
 .ph-camera-recorder { padding: 10px; border: 1px solid #dfe5e0; border-radius: 11px; background: #f8fbf9; }
 .ph-camera-stage { position: relative; width: min(100%, 360px); margin: 0 auto; aspect-ratio: 3 / 4; overflow: hidden; border-radius: 8px; background: #1e2926; }
 .ph-camera-stage video { width: 100%; height: 100%; display: block; object-fit: cover; transform: scaleX(-1); }

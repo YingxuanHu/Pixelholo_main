@@ -360,6 +360,7 @@ const App: React.FC = () => {
   const [preprocessStats, setPreprocessStats] = useState<PreprocessStats | null>(null);
   const [trainStats, setTrainStats] = useState<TrainStats | null>(null);
   const [preprocessProgress, setPreprocessProgress] = useState<number | null>(null);
+  const [preprocessActivity, setPreprocessActivity] = useState<string | null>(null);
   const [preprocessStageIndex, setPreprocessStageIndex] = useState<number | null>(null);
   const [trainStageIndex, setTrainStageIndex] = useState<number | null>(null);
   const [inferenceStageIndex, setInferenceStageIndex] = useState<number | null>(null);
@@ -1386,6 +1387,7 @@ const App: React.FC = () => {
     setPreprocessLogs([createLog('Pipeline starting...', 'info')]);
     setPreprocessStats(null);
     setPreprocessProgress(0);
+    setPreprocessActivity('Analyzing your source clip');
     setPreprocessStageIndex(preprocessSteps.length > 0 ? 0 : null);
     let sawError = false;
     const payload = {
@@ -1414,26 +1416,29 @@ const App: React.FC = () => {
         const errorLine = isErrorLine(line);
         if (errorLine) sawError = true;
         setPreprocessLogs(prev => [...prev, createLog(line, errorLine ? 'error' : 'info')]);
-        const stageUpdate = (label: string) => {
+        const stageUpdate = (label: string, activity: string) => {
           const idx = preprocessSteps.indexOf(label);
           if (idx >= 0) {
             setPreprocessStageIndex(prev => (prev === null || idx > prev ? idx : prev));
           }
+          setPreprocessActivity(activity);
         };
-        if (line.includes('Baking avatar cache')) {
-          stageUpdate('Bake avatar frames (Wav2Lip cache)');
+        if (line.includes('Reading video') || line.includes('Detecting faces')) {
+          stageUpdate('Bake avatar frames (Wav2Lip cache)', 'Analyzing your source clip');
+        } else if (line.includes('Baking avatar cache') || line.includes('Baking MuseTalk assets') || line.includes('Avatar successfully cached')) {
+          stageUpdate('Bake avatar frames (Wav2Lip cache)', 'Preparing face frames');
         } else if (line.includes('Extracting audio')) {
-          stageUpdate('Extract audio track');
+          stageUpdate('Extract audio track', 'Extracting your voice');
         } else if (line.includes('Loaded audio')) {
-          stageUpdate('Split on silence (2-10s)');
+          stageUpdate('Split on silence (2-10s)', 'Cleaning the voice sample');
         } else if (line.includes('Transcribing full audio')) {
-          stageUpdate('Transcribe with Whisper');
+          stageUpdate('Transcribe with Whisper', 'Checking speech');
         } else if (line.includes('Segments: raw=')) {
-          stageUpdate('Split on silence (2-10s)');
+          stageUpdate('Split on silence (2-10s)', 'Preparing the voice profile');
         } else if (line.includes('Exporting') || (line.includes('Wrote') && line.includes('.wav'))) {
-          stageUpdate('Write metadata.csv');
+          stageUpdate('Write metadata.csv', 'Finishing your avatar');
         } else if (line.includes('Metadata written')) {
-          stageUpdate('Write metadata.csv');
+          stageUpdate('Write metadata.csv', 'Finishing your avatar');
         }
         const match = line.match(/Segments: raw=(\d+) merged=(\d+) kept=(\d+)/);
         if (match) {
@@ -1464,11 +1469,13 @@ const App: React.FC = () => {
       }
       setStepStatuses(prev => ({ ...prev, preprocess: 'done' }));
       setPreprocessProgress(1);
+      setPreprocessActivity('Avatar ready');
       setPreprocessStageIndex(preprocessSteps.length ? preprocessSteps.length - 1 : null);
       setIsCreatingProfile(false);
       loadProfiles();
     } catch (err) {
       setStepStatuses(prev => ({ ...prev, preprocess: 'error' }));
+      setPreprocessActivity(null);
       setPreprocessLogs(prev => [...prev, createLog(`Preprocess failed: ${String(err)}`, 'error')]);
       setPreprocessStageIndex(null);
     }
@@ -2438,6 +2445,7 @@ const App: React.FC = () => {
     setLastUploadedAudioFilename(null);
     setPreprocessStats(null);
     setPreprocessProgress(null);
+    setPreprocessActivity(null);
     setStepStatuses(prev => ({ ...prev, upload: 'idle', preprocess: 'idle', inference: 'idle' }));
     setActiveStep(1);
     setUiNotice(null);
@@ -2550,7 +2558,7 @@ const App: React.FC = () => {
               <p>Upload a short video of yourself talking. PixelHolo uses the face and voice from that one clip, then you can type what you want your avatar to say.</p>
             </div>
 
-            <div className="ph-minimal-create-card">
+            <div className={`ph-minimal-create-card ${stepStatuses.preprocess === 'running' ? 'is-preparing' : ''}`}>
               {(() => {
                 const sourceUploaded = Boolean(
                   profile.lastUploadedFile
@@ -2641,7 +2649,7 @@ const App: React.FC = () => {
                     {cameraState === 'idle' && <div className="ph-camera-overlay">Allow camera access to begin</div>}
                     {cameraState === 'recorded' && <div className="ph-camera-captured-badge">Recording captured · looping preview</div>}
                   </div>
-                  <div className="ph-camera-meta"><span>{cameraState === 'recording' ? 'Recording…' : '20-second guided capture'}</span><strong>{cameraElapsed}s / {CAMERA_RECORDING_SECONDS}s</strong></div>
+                  <div className="ph-camera-meta"><span>{cameraState === 'recording' ? 'Recording…' : `${CAMERA_RECORDING_SECONDS}-second guided capture`}</span><strong>{cameraElapsed}s / {CAMERA_RECORDING_SECONDS}s</strong></div>
                   <p className="ph-camera-instructions">Face straight toward the camera, use bright even light from in front of you, keep your eyes and mouth visible, and speak naturally in a quiet room. Avoid a bright window behind you.</p>
                   {cameraError && <div className="ph-minimal-error">{cameraError}</div>}
                   <div className="ph-camera-actions">
@@ -2655,7 +2663,11 @@ const App: React.FC = () => {
               )}
 
               {stepStatuses.preprocess === 'running' && (
-                <div className="ph-minimal-progress"><div><span>Preparing avatar</span><b>{Math.round((preprocessDisplayProgress ?? 0) * 100)}%</b></div><span className="ph-minimal-progress-track"><i style={{ width: `${Math.round((preprocessDisplayProgress ?? 0) * 100)}%` }} /></span></div>
+                <div className="ph-minimal-preparing" role="status" aria-live="polite">
+                  <div className="ph-minimal-preparing-heading"><span className="ph-minimal-preparing-pulse" /><div><strong>Preparing your avatar</strong><p>{preprocessActivity || 'Analyzing your source clip'}</p></div></div>
+                  <span className="ph-minimal-preparing-track"><i /></span>
+                  <small>Keep this page open. This usually takes a minute or two.</small>
+                </div>
               )}
               {stepStatuses.preprocess === 'error' && <div className="ph-minimal-error">{preprocessLogs[preprocessLogs.length - 1]?.message || 'Could not prepare this avatar.'}</div>}
               {uiNotice && <div className="ph-minimal-error">{uiNotice}</div>}
