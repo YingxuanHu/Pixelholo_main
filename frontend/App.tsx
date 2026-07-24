@@ -776,18 +776,33 @@ const App: React.FC = () => {
 
   useEffect(() => {
     let cancelled = false;
-    const controller = new AbortController();
-    setApiStatus('checking');
-    apiFetch(`${apiBase}/docs`, { signal: controller.signal })
-      .then((res) => {
-        if (!cancelled) setApiStatus(res.ok ? 'online' : 'offline');
-      })
-      .catch(() => {
-        if (!cancelled) setApiStatus('offline');
-      });
+    let controller: AbortController | null = null;
+
+    const checkApi = async (initialCheck = false) => {
+      controller?.abort();
+      controller = new AbortController();
+      if (initialCheck) setApiStatus('checking');
+      try {
+        const response = await apiFetch(`${apiBase}/docs`, {
+          cache: 'no-store',
+          signal: controller.signal,
+        });
+        if (!cancelled) setApiStatus(response.ok ? 'online' : 'offline');
+      } catch (error) {
+        if (!cancelled && !(error instanceof DOMException && error.name === 'AbortError')) {
+          setApiStatus('offline');
+        }
+      }
+    };
+
+    void checkApi(true);
+    // A deployment restart or short tunnel interruption should recover in the
+    // UI by itself instead of leaving a visitor on a stale Offline state.
+    const retryTimer = window.setInterval(() => void checkApi(), 8_000);
     return () => {
       cancelled = true;
-      controller.abort();
+      window.clearInterval(retryTimer);
+      controller?.abort();
     };
   }, [apiBase, apiFetch]);
 

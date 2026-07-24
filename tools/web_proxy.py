@@ -66,7 +66,11 @@ async def static_or_spa(request: web.Request) -> web.StreamResponse:
     index = STATIC_ROOT / "index.html"
     if not index.is_file():
         raise web.HTTPServiceUnavailable(text=f"Frontend build missing: {index}")
-    return web.FileResponse(index)
+    # The HTML entry point must always be current so a fresh navigation picks
+    # up the latest fingerprinted JavaScript bundle after a deployment.
+    response = web.FileResponse(index)
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
 
 
 async def on_startup(app: web.Application) -> None:
