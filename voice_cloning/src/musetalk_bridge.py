@@ -1064,6 +1064,28 @@ class MuseTalkBridge:
                 masks_path,
                 runtime_meta_path,
             )
+            # The manifest did not exist when ``cache_signature`` was first
+            # collected above.  Refresh it now that the cache build has
+            # persisted the three runtime artifacts.  Without this refresh,
+            # the very first real request after warm-up reloads every latent
+            # and mask from disk once more before subsequent requests become
+            # genuinely hot.
+            cache_signature = tuple(
+                (
+                    str(path.name),
+                    int(path.stat().st_mtime_ns),
+                    int(path.stat().st_size),
+                )
+                if path.exists()
+                else None
+                for path in (
+                    frames_path,
+                    coords_path,
+                    meta_path,
+                    cache_dir / "musetalk_runtime_meta.json",
+                    cache_dir / "musetalk_runtime_meta_baked.json",
+                )
+            )
         else:
             logger.info(
                 "component=musetalk op=profile_cache status=hit profile=%s profile_type=%s source=%s",

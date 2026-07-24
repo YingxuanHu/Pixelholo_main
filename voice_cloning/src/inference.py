@@ -3425,7 +3425,37 @@ def _warmup_lipsync(
                     audio_16k = warmup_audio_16k
                     if audio_16k is None or audio_16k.size == 0:
                         audio_16k = np.zeros(int(0.45 * 16000), dtype=np.float32)
+                    warmup_started = time.perf_counter()
                     lipsync.sync_chunk(audio_16k.astype(np.float32, copy=False), fps=lipsync.fps)
+
+                    # A short warm-up waveform does not necessarily allocate
+                    # the same tensors as the first 1.2-second web stream.
+                    # Prime one window at the production shape so CUDA kernel
+                    # selection, batch buffers, and the compositor are all
+                    # ready before the UI enables the composer.  This costs
+                    # warm-up time, not user-visible first-response time.
+                    if backend == "musetalk":
+                        try:
+                            prime_seconds = float(
+                                os.getenv(
+                                    "MUSE_TALK_WARMUP_WINDOW_SEC",
+                                    os.getenv("MUSE_TALK_STREAM_WINDOW_SEC", "1.2"),
+                                )
+                            )
+                        except (TypeError, ValueError):
+                            prime_seconds = 1.2
+                        prime_samples = max(1, int(np.clip(prime_seconds, 0.5, 3.0) * 16000))
+                        prime_audio = np.zeros(prime_samples, dtype=np.float32)
+                        lipsync.sync_chunk(prime_audio, fps=lipsync.fps)
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                    logger.info(
+                        "component=backend op=warmup_lipsync status=ok profile=%s profile_type=%s backend=%s elapsed_ms=%.2f",
+                        profile,
+                        profile_type,
+                        backend,
+                        (time.perf_counter() - warmup_started) * 1000.0,
+                    )
         print(f"Lipsync warmup completed ({backend}).")
         return backend
     except Exception as exc:
