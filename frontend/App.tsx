@@ -1257,9 +1257,14 @@ const App: React.FC = () => {
       setCameraState('ready');
     } catch (error) {
       setCameraState('error');
-      setCameraError(error instanceof DOMException && error.name === 'NotAllowedError'
-        ? 'Camera permission was blocked. Allow camera and microphone access, then try again.'
-        : `Could not open the camera: ${String(error)}`);
+      const name = error instanceof DOMException ? error.name : '';
+      setCameraError(
+        name === 'NotAllowedError' || name === 'SecurityError'
+          ? 'Camera or microphone access was blocked. Use the permissions control in your browser address bar to allow both for pixelholo.com, then choose Enable camera again.'
+          : name === 'NotFoundError'
+            ? 'No camera or microphone was found. Connect one, then choose Enable camera again.'
+            : `Could not open the camera: ${String(error)}`,
+      );
     }
   }, [profileNameTaken, stopCameraStream]);
 
@@ -2682,14 +2687,24 @@ const App: React.FC = () => {
                       <small>Keep your face inside the frame</small>
                     </div>
                     {cameraState === 'requesting' && <div className="ph-camera-overlay">Opening camera…</div>}
-                    {cameraState === 'idle' && <div className="ph-camera-overlay">Allow camera access to begin</div>}
+                    {cameraState === 'idle' && (
+                      <button
+                        type="button"
+                        className="ph-camera-overlay ph-camera-enable-overlay"
+                        onClick={() => void openCamera()}
+                        disabled={profileNameTaken || isBusy}
+                      >
+                        <strong>Enable camera &amp; microphone</strong>
+                        <small>Your browser will ask for permission.</small>
+                      </button>
+                    )}
                     {cameraState === 'recorded' && <div className="ph-camera-captured-badge">Recording captured · looping preview</div>}
                   </div>
                   <div className="ph-camera-meta"><span>{cameraState === 'recording' ? 'Recording…' : `${CAMERA_RECORDING_SECONDS}-second guided capture`}</span><strong>{cameraElapsed}s / {CAMERA_RECORDING_SECONDS}s</strong></div>
                   <p className="ph-camera-instructions">Face straight toward the camera, use bright even light from in front of you, keep your eyes and mouth visible, and speak naturally in a quiet room. Avoid a bright window behind you.</p>
                   {cameraError && <div className="ph-minimal-error">{cameraError}</div>}
                   <div className="ph-camera-actions">
-                    {(cameraState === 'idle' || cameraState === 'error') && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Allow camera</button>}
+                    {(cameraState === 'idle' || cameraState === 'error') && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Enable camera &amp; microphone</button>}
                     {cameraState === 'ready' && <button type="button" className="ph-minimal-primary" onClick={startCameraRecording} disabled={isBusy}>Start recording<span>●</span></button>}
                     {cameraState === 'recording' && <button type="button" className="ph-minimal-record-stop" onClick={stopCameraRecording}>Stop and use recording<span>■</span></button>}
                     {cameraState === 'recorded' && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={isBusy}>Record again</button>}
