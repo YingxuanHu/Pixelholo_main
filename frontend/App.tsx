@@ -1386,7 +1386,10 @@ const App: React.FC = () => {
     setStepStatuses(prev => ({ ...prev, preprocess: 'running' }));
     setPreprocessLogs([createLog('Pipeline starting...', 'info')]);
     setPreprocessStats(null);
-    setPreprocessProgress(0);
+    // Leave this unset until the backend reports its first completed unit of
+    // work. A zero or stage-derived percentage here looks like real progress
+    // even if the worker has not begun yet.
+    setPreprocessProgress(null);
     setPreprocessActivity('Analyzing your source clip');
     setPreprocessStageIndex(preprocessSteps.length > 0 ? 0 : null);
     let sawError = false;
@@ -1413,6 +1416,23 @@ const App: React.FC = () => {
       });
       if (!res.ok) throw new Error(await res.text());
       await streamResponseLines(res, line => {
+        const progressMarker = line.match(/^PIXELHOLO_PROGRESS\s+(.+)$/);
+        if (progressMarker) {
+          try {
+            const event = JSON.parse(progressMarker[1]) as { progress?: unknown; activity?: unknown };
+            const progress = Number(event.progress);
+            if (Number.isFinite(progress)) {
+              setPreprocessProgress(clamp(progress / 100, 0, 1));
+            }
+            if (typeof event.activity === 'string' && event.activity.trim()) {
+              setPreprocessActivity(event.activity);
+            }
+            return;
+          } catch {
+            // A stale backend may send a malformed marker. Keep its line in
+            // the normal logs rather than failing an otherwise valid request.
+          }
+        }
         const errorLine = isErrorLine(line);
         if (errorLine) sawError = true;
         setPreprocessLogs(prev => [...prev, createLog(line, errorLine ? 'error' : 'info')]);
@@ -2251,10 +2271,10 @@ const App: React.FC = () => {
 
   const preprocessDisplayProgress =
     stepStatuses.preprocess === 'running'
-      ? Math.max(
-          preprocessProgress ?? 0,
-          stageProgress(preprocessStageIndex, preprocessSteps.length, 0.6),
-        )
+      // This comes from real backend units: decoded frames, face batches,
+      // audio extraction, transcription, and exported clips. Never invent a
+      // percentage from a fixed list of UI stages.
+      ? preprocessProgress
       : stepStatuses.preprocess === 'done'
         ? 1
         : null;
@@ -2664,9 +2684,18 @@ const App: React.FC = () => {
 
               {stepStatuses.preprocess === 'running' && (
                 <div className="ph-minimal-preparing" role="status" aria-live="polite">
-                  <div className="ph-minimal-preparing-heading"><span className="ph-minimal-preparing-pulse" /><div><strong>Preparing your avatar</strong><p>{preprocessActivity || 'Analyzing your source clip'}</p></div></div>
-                  <span className="ph-minimal-preparing-track"><i /></span>
-                  <small>Keep this page open. This usually takes a minute or two.</small>
+                  <div className="ph-minimal-preparing-heading">
+                    <span className="ph-minimal-preparing-pulse" />
+                    <div><strong>Preparing your avatar</strong><p>{preprocessActivity || 'Starting preparation'}</p></div>
+                    <b>{preprocessDisplayProgress === null ? 'Starting…' : `${Math.round(preprocessDisplayProgress * 100)}%`}</b>
+                  </div>
+                  <span className="ph-minimal-preparing-track">
+                    <i
+                      className={preprocessDisplayProgress === null ? 'is-indeterminate' : ''}
+                      style={preprocessDisplayProgress === null ? undefined : { width: `${Math.round(preprocessDisplayProgress * 100)}%` }}
+                    />
+                  </span>
+                  <small>Progress updates only as video, audio, and profile work completes.</small>
                 </div>
               )}
               {stepStatuses.preprocess === 'error' && <div className="ph-minimal-error">{preprocessLogs[preprocessLogs.length - 1]?.message || 'Could not prepare this avatar.'}</div>}
@@ -2879,9 +2908,9 @@ const App: React.FC = () => {
 
                   {stepStatuses.preprocess === 'running' && (
                     <div className="ph-progress-block">
-                      <div className="ph-progress-label"><span>Preparing your avatar</span><strong>{Math.round((preprocessDisplayProgress ?? 0) * 100)}%</strong></div>
+                      <div className="ph-progress-label"><span>Preparing your avatar</span><strong>{preprocessDisplayProgress === null ? 'Starting…' : `${Math.round(preprocessDisplayProgress * 100)}%`}</strong></div>
                       <div className="ph-progress-track"><span style={{ width: `${Math.round((preprocessDisplayProgress ?? 0) * 100)}%` }} /></div>
-                      <small>Extracting the voice, transcribing the track, and baking the face loop…</small>
+                      <small>{preprocessActivity || 'Waiting for the preparation worker…'}</small>
                     </div>
                   )}
                   {stepStatuses.preprocess === 'error' && <div className="ph-inline-error">{preprocessLogs[preprocessLogs.length - 1]?.message || 'Could not prepare this avatar.'}</div>}

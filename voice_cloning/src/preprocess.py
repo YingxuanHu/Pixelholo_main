@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import shutil
 import subprocess
 import sys
@@ -44,8 +45,30 @@ from config import (  # noqa: E402
 )
 
 
+ProgressReporter = Callable[[float, str], None]
 
-def _run_ffmpeg_extract(video_path: Path, wav_path: Path) -> None:
+
+def _media_duration_seconds(path: Path) -> float | None:
+    """Return a media duration when ffprobe can determine one."""
+    command = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            return None
+        duration = float(result.stdout.strip())
+        return duration if duration > 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def _run_ffmpeg_extract(
+    video_path: Path,
+    wav_path: Path,
+    progress: ProgressReporter | None = None,
+) -> None:
     filters = ["highpass=f=80", "lowpass=f=16000"]
     command = [
         "ffmpeg",
@@ -58,11 +81,40 @@ def _run_ffmpeg_extract(video_path: Path, wav_path: Path) -> None:
         str(DEFAULT_SAMPLE_RATE),
         "-af",
         ",".join(filters),
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        "-loglevel",
+        "error",
         str(wav_path),
     ]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {result.stderr.strip()}")
+    duration = _media_duration_seconds(video_path)
+    if progress:
+        progress(0.0, "Extracting your voice")
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        key, _, value = line.strip().partition("=")
+        if key != "out_time_us" or not duration:
+            continue
+        try:
+            elapsed = float(value) / 1_000_000
+        except ValueError:
+            continue
+        if progress:
+            progress(min(0.99, max(0.0, elapsed / duration)), "Extracting your voice")
+    stderr = process.stderr.read() if process.stderr is not None else ""
+    exit_code = process.wait()
+    if exit_code != 0:
+        raise RuntimeError(f"ffmpeg failed: {stderr.strip()}")
+    if progress:
+        progress(1.0, "Voice extracted")
 
 
 def _split_to_max_len(segment: AudioSegment, max_len_ms: int) -> list[AudioSegment]:
@@ -160,6 +212,7 @@ def _transcribe_full_audio(
     min_len_sec: float,
     max_len_sec: float,
     log: Callable[[str], None] | None = None,
+    progress: ProgressReporter | None = None,
 ) -> list[dict[str, float | str]]:
     segments, _info = model.transcribe(
         str(wav_path),
@@ -167,6 +220,7 @@ def _transcribe_full_audio(
         vad_filter=vad_filter,
     )
 
+    duration_seconds = _media_duration_seconds(wav_path) or 0.0
     collected: list[dict[str, float | str]] = []
     for segment in segments:
         text = _segment_text_is_valid(segment, min_avg_logprob, max_no_speech_prob, min_words)
@@ -175,6 +229,11 @@ def _transcribe_full_audio(
         if segment.end <= segment.start:
             continue
         collected.append({"start": segment.start, "end": segment.end, "text": text})
+        if progress and duration_seconds:
+            progress(
+                min(1.0, max(0.0, float(segment.end) / duration_seconds)),
+                "Analyzing speech",
+            )
 
     collected.sort(key=lambda item: float(item["start"]))
     merged = _merge_segments(collected, merge_gap_sec, max_len_sec)
@@ -191,6 +250,8 @@ def _transcribe_full_audio(
             f"Segments: raw={len(collected)} merged={len(merged)} kept={len(filtered)} "
             f"(min_len={min_len_sec}s, long segments split at {max_len_sec}s)"
         )
+    if progress:
+        progress(1.0, "Speech analysis complete")
 
     return filtered
 
@@ -258,6 +319,18 @@ def process_video(
         if not quiet:
             print(message, flush=True)
 
+    def _progress(fraction: float, activity: str) -> None:
+        if quiet:
+            return
+        payload = {
+            "progress": round(min(1.0, max(0.0, fraction)) * 100, 1),
+            "activity": activity,
+        }
+        # The API passes this small machine-readable line through its normal
+        # text stream. The client displays only work that has actually
+        # completed; it never derives progress from a timer or a static stage.
+        print(f"PIXELHOLO_PROGRESS {json.dumps(payload, separators=(',', ':'))}", flush=True)
+
     dataset_root = raw_videos_dir(speaker_name, profile_type).parent
     raw_dir = raw_videos_dir(speaker_name, profile_type)
     audio_dir = raw_audio_dir(speaker_name, profile_type)
@@ -271,6 +344,8 @@ def process_video(
     copied_video = raw_dir / video_path.name
     if video_path.resolve() != copied_video.resolve():
         shutil.copy2(video_path, copied_video)
+
+    _progress(0.0, "Checking your source clip")
 
     if bake_avatar and profile_type != PROFILE_TYPE_VOICE:
         _log("Baking avatar cache for lip-sync...")
@@ -290,7 +365,9 @@ def process_video(
             blur_background=avatar_blur_background,
             blur_kernel=avatar_blur_kernel,
             device=avatar_device or device,
+            progress=lambda fraction, activity: _progress(0.04 + 0.60 * fraction, activity),
         )
+        _progress(0.64, "Face frames prepared")
 
     extracted_wav = dataset_root / f"{speaker_name}_full.wav"
     if audio_path is not None:
@@ -298,10 +375,18 @@ def process_video(
         if audio_path.resolve() != copied_audio.resolve():
             shutil.copy2(audio_path, copied_audio)
         _log(f"Extracting audio from {copied_audio.name}...")
-        _run_ffmpeg_extract(copied_audio, extracted_wav)
+        _run_ffmpeg_extract(
+            copied_audio,
+            extracted_wav,
+            progress=lambda fraction, activity: _progress(0.64 + 0.08 * fraction, activity),
+        )
     else:
         _log(f"Extracting audio from {copied_video.name}...")
-        _run_ffmpeg_extract(copied_video, extracted_wav)
+        _run_ffmpeg_extract(
+            copied_video,
+            extracted_wav,
+            progress=lambda fraction, activity: _progress(0.64 + 0.08 * fraction, activity),
+        )
 
     audio = AudioSegment.from_wav(extracted_wav)
     if audio.frame_rate != DEFAULT_SAMPLE_RATE:
@@ -318,7 +403,9 @@ def process_video(
     min_len_sec = MIN_CHUNK_SEC
     max_len_sec = MAX_CHUNK_SEC
 
+    _progress(0.72, "Loading speech analysis")
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    _progress(0.75, "Analyzing speech")
 
     with meta_path.open("w", newline="") as csvfile:
         writer = csv.writer(csvfile, delimiter="|")
@@ -340,13 +427,15 @@ def process_video(
                 min_len_sec=min_len_sec,
                 max_len_sec=max_len_sec,
                 log=_log,
+                progress=lambda fraction, activity: _progress(0.75 + 0.14 * fraction, activity),
             )
         else:
             segments = []
 
         if segments:
             _log(f"Exporting {len(segments)} segments...")
-            for seg in segments:
+            total_segments = len(segments)
+            for segment_position, seg in enumerate(segments, start=1):
                 start_ms = int(float(seg["start"]) * 1000)
                 end_ms = int(float(seg["end"]) * 1000)
                 if end_ms <= start_ms:
@@ -401,6 +490,10 @@ def process_video(
                     if chunk_index == 1 or chunk_index % 10 == 0 or chunk_index == len(segments):
                         _log(f"Wrote {chunk_name} ({chunk_index}/{len(segments)})")
                     chunk_index += 1
+                _progress(
+                    0.89 + 0.10 * (segment_position / total_segments),
+                    "Saving your voice profile",
+                )
         else:
             _log("Whisper segmentation yielded no usable segments. Falling back to silence split...")
             silence_thresh = (
@@ -428,7 +521,8 @@ def process_video(
                 raise RuntimeError("No valid audio chunks found after silence splitting.")
 
             _log(f"Transcribing {len(filtered_chunks)} chunks...")
-            for chunk in filtered_chunks:
+            total_chunks = len(filtered_chunks)
+            for chunk_position, chunk in enumerate(filtered_chunks, start=1):
                 if not _chunk_is_usable(
                     chunk,
                     min_chunk_dbfs,
@@ -456,10 +550,16 @@ def process_video(
                 if chunk_index == 1 or chunk_index % 10 == 0 or chunk_index == len(filtered_chunks):
                     _log(f"Wrote {chunk_name} ({chunk_index}/{len(filtered_chunks)})")
                 chunk_index += 1
+                _progress(
+                    0.89 + 0.10 * (chunk_position / total_chunks),
+                    "Saving your voice profile",
+                )
 
         if chunk_index == 1:
             raise RuntimeError("No valid audio chunks found after filtering.")
 
+    _progress(0.99, "Writing your avatar profile")
+    _progress(1.0, "Avatar ready")
     return meta_path
 
 

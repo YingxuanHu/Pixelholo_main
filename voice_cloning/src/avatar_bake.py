@@ -3,7 +3,9 @@ import json
 import os
 import pickle
 import sys
+import math
 from pathlib import Path
+from typing import Callable
 import cv2
 import numpy as np
 import torch
@@ -33,6 +35,14 @@ except ImportError:
     PROFILE_TYPE_AVATAR = "avatar"
     PROFILE_TYPE_VOICE = "voice"
     def avatar_cache_dir(profile, type_): return PROJECT_ROOT / "cache" / profile / type_
+
+
+ProgressReporter = Callable[[float, str], None]
+
+
+def _report_progress(progress: ProgressReporter | None, fraction: float, activity: str) -> None:
+    if progress:
+        progress(min(1.0, max(0.0, fraction)), activity)
 
 
 def _smooth_boxes(boxes: np.ndarray, window: int = 5) -> np.ndarray:
@@ -146,10 +156,15 @@ def _resize_frames_and_coords(
 
     return resized_frames, np.array(resized_coords, dtype=np.int32)
 # --- 2. HIGH-QUALITY BLUR FUNCTION (REMBG) ---
-def _blur_background_with_rembg(frames: list[np.ndarray], blur_kernel: int) -> list[np.ndarray]:
+def _blur_background_with_rembg(
+    frames: list[np.ndarray],
+    blur_kernel: int,
+    progress: ProgressReporter | None = None,
+) -> list[np.ndarray]:
     if not REMBG_AVAILABLE:
         print("\n[WARNING] 'rembg' library not found.")
         print("   -> Skipping blur. To fix: pip install rembg\n")
+        _report_progress(progress, 1.0, "Background refinement skipped")
         return frames
 
     print(f"   ...blurring {len(frames)} frames using Rembg (High Quality)...")
@@ -165,6 +180,8 @@ def _blur_background_with_rembg(frames: list[np.ndarray], blur_kernel: int) -> l
     k = max(3, int(blur_kernel) // 2 * 2 + 1)
     output_frames: list[np.ndarray] = []
     
+    total_frames = max(1, len(frames))
+    report_every = max(1, total_frames // 24)
     for i, frame in enumerate(frames):
         # 1. Prepare Input (OpenCV is BGR, Rembg needs RGB)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -192,6 +209,12 @@ def _blur_background_with_rembg(frames: list[np.ndarray], blur_kernel: int) -> l
         # Progress indicator
         if i % 5 == 0:
             print(f"   Processed {i}/{len(frames)} frames", end="\r")
+        if (i + 1) % report_every == 0 or i + 1 == total_frames:
+            _report_progress(
+                progress,
+                (i + 1) / total_frames,
+                "Refining the background",
+            )
             
     print("") # Clear line
     return output_frames
@@ -365,6 +388,7 @@ def bake_musetalk_assets(
     cache_dir: Path,
     frames: np.ndarray,
     base_coords_y1y2x1x2: np.ndarray,
+    progress: ProgressReporter | None = None,
 ) -> None:
     if frames.ndim != 4 or base_coords_y1y2x1x2.ndim != 2:
         raise ValueError("Invalid frames/coords layout for MuseTalk baking.")
@@ -412,6 +436,7 @@ def bake_musetalk_assets(
             )
 
     print("   Baking MuseTalk assets (landmark-stabilized)...")
+    _report_progress(progress, 0.02, "Loading lip-sync models")
     vae = VAE(model_path=str(vae_dir))
     face_parser = _FaceParsingWithPaths(face_parse_resnet, face_parse_model)
     # Use the native face/lip mask instead of the broader jaw-dilated mask.
@@ -424,12 +449,15 @@ def bake_musetalk_assets(
 
     coords_xyxy = _build_musetalk_boxes(frames, base_coords_y1y2x1x2)
     np.save(cache_dir / "musetalk_coords.npy", coords_xyxy)
+    _report_progress(progress, 0.08, "Aligning face frames")
 
     latents: list[torch.Tensor] = []
     mask_arrays: list[np.ndarray] = []
     mask_crop_boxes: list[list[int]] = []
 
-    for frame, coord in zip(frames, coords_xyxy):
+    total_frames = max(1, len(frames))
+    report_every = max(1, total_frames // 24)
+    for index, (frame, coord) in enumerate(zip(frames, coords_xyxy), start=1):
         x1, y1, x2, y2 = _sanitize_xyxy(tuple(int(v) for v in coord), frame_w, frame_h)
 
         crop = frame[y1:y2, x1:x2]
@@ -450,7 +478,14 @@ def bake_musetalk_assets(
         aligned_mask, aligned_crop_box = _align_mask_to_crop(mask, crop_box, frame_w, frame_h)
         mask_arrays.append(aligned_mask)
         mask_crop_boxes.append([int(v) for v in aligned_crop_box])
+        if index % report_every == 0 or index == total_frames:
+            _report_progress(
+                progress,
+                0.08 + 0.87 * (index / total_frames),
+                "Preparing lip-sync frames",
+            )
 
+    _report_progress(progress, 0.96, "Saving lip-sync assets")
     torch.save(latents, cache_dir / "musetalk_latents.pt")
     with (cache_dir / "musetalk_masks.pkl").open("wb") as handle:
         pickle.dump(
@@ -461,6 +496,7 @@ def bake_musetalk_assets(
             },
             handle,
         )
+    _report_progress(progress, 1.0, "Lip-sync frames prepared")
 
 
 def bake_avatar(
@@ -479,6 +515,7 @@ def bake_avatar(
     blur_kernel: int = 75,
     face_crop_scale: float = 0.0,
     device: str = "cuda",
+    progress: ProgressReporter | None = None,
 ) -> Path:
     cache_dir = avatar_cache_dir(profile, profile_type)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -500,8 +537,15 @@ def bake_avatar(
     max_frames = int(loop_sec * fps) if loop_sec > 0 else None
 
     print(f"   Reading video: {video_path}")
+    _report_progress(progress, 0.0, "Reading your source video")
     frames: list[np.ndarray] = []
     frame_index = start_frame
+    source_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    available_source_frames = max(0, source_frame_count - start_frame)
+    expected_frames = math.ceil(available_source_frames / frame_interval) if available_source_frames else 0
+    if max_frames:
+        expected_frames = min(expected_frames, max_frames) if expected_frames else max_frames
+    report_every = max(1, expected_frames // 24) if expected_frames else 24
     
     while True:
         ret, frame = cap.read()
@@ -517,6 +561,9 @@ def bake_avatar(
         frame = _center_crop_3_4(frame)
         frames.append(frame)
         frame_index += 1
+        if len(frames) % report_every == 0:
+            read_fraction = min(1.0, len(frames) / expected_frames) if expected_frames else 0.0
+            _report_progress(progress, 0.08 * read_fraction, "Reading your source video")
         
         if max_frames and len(frames) >= max_frames:
             break
@@ -524,6 +571,7 @@ def bake_avatar(
     cap.release()
     if not frames:
         raise RuntimeError("No frames extracted from video.")
+    _report_progress(progress, 0.08, "Source video read")
 
     # 1. Detect Faces
     print("   Detecting faces...")
@@ -532,9 +580,15 @@ def bake_avatar(
     
     if detector:
         preds = []
-        for i in range(0, len(frames), batch_size):
+        total_batches = max(1, math.ceil(len(frames) / max(1, batch_size)))
+        for batch_number, i in enumerate(range(0, len(frames), batch_size), start=1):
             batch = np.array(frames[i : i + batch_size])
             preds.extend(detector.get_detections_for_batch(batch))
+            _report_progress(
+                progress,
+                0.08 + 0.24 * (batch_number / total_batches),
+                "Finding your face in each frame",
+            )
 
         coords: list[list[int]] = []
         last_good = None
@@ -563,6 +617,7 @@ def bake_avatar(
         print("   [WARN] No face detector. Using full frame.")
         h, w = frames[0].shape[:2]
         coords_arr = np.array([[0, h, 0, w]] * len(frames), dtype=np.int32)
+    _report_progress(progress, 0.34, "Face framing prepared")
 
     # 2. Optional tight crop around face.
     # Default is disabled to preserve the original center 3:4 framing from uploaded video.
@@ -574,15 +629,27 @@ def bake_avatar(
 
     # 3. Blur using Rembg
     if blur_background:
-        frames = _blur_background_with_rembg(frames, blur_kernel)
+        frames = _blur_background_with_rembg(
+            frames,
+            blur_kernel,
+            progress=lambda fraction, activity: _report_progress(
+                progress,
+                0.34 + 0.20 * fraction,
+                activity,
+            ),
+        )
+    else:
+        _report_progress(progress, 0.54, "Background refinement skipped")
 
     # 4. Loop Crossfade
     if loop_fade_sec and fps:
         fade_frames = int(round(loop_fade_sec * fps))
         frames = _apply_loop_crossfade(frames, fade_frames)
+    _report_progress(progress, 0.56, "Smoothing the video loop")
 
     np.save(cache_dir / "frames.npy", np.array(frames, dtype=np.uint8))
     np.save(cache_dir / "coords.npy", coords_arr)
+    _report_progress(progress, 0.59, "Saving face frames")
 
     meta = {
         "profile": profile,
@@ -603,10 +670,16 @@ def bake_avatar(
             cache_dir=cache_dir,
             frames=np.array(frames, dtype=np.uint8),
             base_coords_y1y2x1x2=coords_arr,
+            progress=lambda fraction, activity: _report_progress(
+                progress,
+                0.59 + 0.40 * fraction,
+                activity,
+            ),
         )
     except Exception as exc:
         print(f"[WARN] MuseTalk asset bake failed, runtime fallback will be used: {exc}")
 
+    _report_progress(progress, 1.0, "Face frames prepared")
     return cache_dir
 
 
