@@ -341,11 +341,13 @@ const App: React.FC = () => {
   const [autoPrepareAfterUpload, setAutoPrepareAfterUpload] = useState(false);
   const [lastUploadedFilename, setLastUploadedFilename] = useState<string | null>(null);
   const [lastUploadedAudioFilename, setLastUploadedAudioFilename] = useState<string | null>(null);
-  const [sourceMode, setSourceMode] = useState<'upload' | 'camera'>('upload');
+  const [sourceMode, setSourceMode] = useState<'upload' | 'camera'>('camera');
   const [cameraState, setCameraState] = useState<'idle' | 'requesting' | 'ready' | 'recording' | 'recorded' | 'error'>('idle');
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [cameraElapsed, setCameraElapsed] = useState(0);
   const [cameraPreviewUrl, setCameraPreviewUrl] = useState<string | null>(null);
+  const [capturedCameraFile, setCapturedCameraFile] = useState<File | null>(null);
+  const [profileNameRequired, setProfileNameRequired] = useState(false);
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [profilesStatus, setProfilesStatus] = useState<'idle' | 'loading' | 'error'>('idle');
   const [profileMenuKey, setProfileMenuKey] = useState<string | null>(null);
@@ -1153,6 +1155,7 @@ const App: React.FC = () => {
         fileSize: `${(file.size / (1024 * 1024)).toFixed(2)} MB`,
       }));
       setLastUploadedFilename(data.filename);
+      setCapturedCameraFile(null);
       setStepStatuses(prev => ({ ...prev, upload: 'done' }));
       setUploadPhaseVideo('idle');
       if (options.autoPrepare) {
@@ -1214,10 +1217,6 @@ const App: React.FC = () => {
   }, [clearCameraPreview]);
 
   const openCamera = useCallback(async () => {
-    if (!profile.name) {
-      setUiNotice('Enter a profile name before opening the camera.');
-      return;
-    }
     if (profileNameTaken) {
       setUiNotice('That profile name is already in use. Choose a different name, such as “Alvin 2”.');
       minimalNameInputRef.current?.focus();
@@ -1249,7 +1248,7 @@ const App: React.FC = () => {
         ? 'Camera permission was blocked. Allow camera and microphone access, then try again.'
         : `Could not open the camera: ${String(error)}`);
     }
-  }, [profile.name, profileNameTaken, stopCameraStream]);
+  }, [profileNameTaken, stopCameraStream]);
 
   useEffect(() => {
     const video = cameraVideoRef.current;
@@ -1322,7 +1321,9 @@ const App: React.FC = () => {
           lastUploadedFile: file.name,
           fileSize: `${(file.size / (1024 * 1024)).toFixed(2)} MB`,
         }));
-        void handleUpload(file, { autoPrepare: true });
+        // Keep the capture in the browser until the user chooses Create
+        // avatar. This lets someone record first and name the profile later.
+        setCapturedCameraFile(file);
       };
       recorder.start(250);
       setCameraElapsed(0);
@@ -1338,7 +1339,7 @@ const App: React.FC = () => {
       setCameraState('error');
       setCameraError(`Could not start recording: ${String(error)}`);
     }
-  }, [handleUpload, setCameraPreview, stopCameraRecording]);
+  }, [setCameraPreview, stopCameraRecording]);
 
   useEffect(() => () => stopCameraStream(), [stopCameraStream]);
 
@@ -1485,6 +1486,26 @@ const App: React.FC = () => {
     setAutoPrepareAfterUpload(false);
     void startPreprocess();
   }, [autoPrepareAfterUpload, lastUploadedFilename, startPreprocess, stepStatuses.preprocess, stepStatuses.upload]);
+
+  const handleCreateAvatar = async () => {
+    if (!profile.name.trim()) {
+      setProfileNameRequired(true);
+      setUiNotice('A profile name is required before you can create this avatar.');
+      minimalNameInputRef.current?.focus();
+      return;
+    }
+    if (profileNameTaken) {
+      setUiNotice('That profile name is already in use. Choose a different name, such as “Alvin 2”.');
+      minimalNameInputRef.current?.focus();
+      return;
+    }
+    setProfileNameRequired(false);
+    if (capturedCameraFile && !lastUploadedFilename) {
+      await handleUpload(capturedCameraFile, { autoPrepare: true });
+      return;
+    }
+    await startPreprocess();
+  };
 
   const startTraining = async () => {
     if (!profile.name) return;
@@ -2324,7 +2345,10 @@ const App: React.FC = () => {
   const publicSetupReady = Boolean(
     !profileNameTaken
       && profile.name
-      && (lastUploadedFilename || (currentProfileInfo?.raw_files ?? 0) > 0),
+      && (capturedCameraFile || lastUploadedFilename || (currentProfileInfo?.raw_files ?? 0) > 0),
+  );
+  const publicSourceReady = Boolean(
+    capturedCameraFile || lastUploadedFilename || (currentProfileInfo?.raw_files ?? 0) > 0,
   );
   const publicProfileReady = Boolean(!isCreatingProfile && hasInferenceProfile && profile.name);
 
@@ -2403,10 +2427,12 @@ const App: React.FC = () => {
     setShowWelcome(false);
     setIsCreatingProfile(true);
     setAutoPrepareAfterUpload(false);
-    setSourceMode('upload');
+    setSourceMode('camera');
     setCameraState('idle');
     setCameraError(null);
     setCameraElapsed(0);
+    setCapturedCameraFile(null);
+    setProfileNameRequired(false);
     setProfile({ name: '', lastUploadedFile: null, fileSize: null });
     setLastUploadedFilename(null);
     setLastUploadedAudioFilename(null);
@@ -2540,12 +2566,13 @@ const App: React.FC = () => {
                 value={profile.name}
                 onChange={event => {
                   setProfile(prev => ({ ...prev, name: event.target.value }));
+                  if (event.target.value.trim()) setProfileNameRequired(false);
                   setUiNotice(null);
                 }}
                 placeholder="Enter a profile name"
                 autoComplete="off"
                 spellCheck={false}
-                aria-invalid={profileNameTaken}
+                aria-invalid={profileNameTaken || (profileNameRequired && !profile.name.trim())}
                 disabled={isBusy}
               />
               {profileNameTaken && (
@@ -2562,11 +2589,6 @@ const App: React.FC = () => {
                   className={sourceMode === 'camera' ? 'is-selected' : ''}
                   disabled={isBusy}
                   onClick={() => {
-                    if (!profile.name.trim()) {
-                      setUiNotice('Name your avatar first, then camera recording can begin.');
-                      minimalNameInputRef.current?.focus();
-                      return;
-                    }
                     if (profileNameTaken) {
                       setUiNotice('Choose a new profile name before recording.');
                       minimalNameInputRef.current?.focus();
@@ -2587,6 +2609,10 @@ const App: React.FC = () => {
                     setSourceMode('upload');
                     stopCameraStream();
                     setCameraState('idle');
+                    setCapturedCameraFile(null);
+                    if (!lastUploadedFilename) {
+                      setProfile(prev => ({ ...prev, lastUploadedFile: null, fileSize: null }));
+                    }
                   }}
                 >
                   Upload video
@@ -2619,7 +2645,7 @@ const App: React.FC = () => {
                   <blockquote className="ph-camera-script">“{CAMERA_PROMPT}”</blockquote>
                   {cameraError && <div className="ph-minimal-error">{cameraError}</div>}
                   <div className="ph-camera-actions">
-                    {(cameraState === 'idle' || cameraState === 'error') && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={!profile.name || profileNameTaken || isBusy}>Allow camera</button>}
+                    {(cameraState === 'idle' || cameraState === 'error') && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Allow camera</button>}
                     {cameraState === 'ready' && <button type="button" className="ph-minimal-primary" onClick={startCameraRecording} disabled={isBusy}>Start recording<span>●</span></button>}
                     {cameraState === 'recording' && <button type="button" className="ph-minimal-record-stop" onClick={stopCameraRecording}>Stop and use recording<span>■</span></button>}
                     {cameraState === 'recorded' && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={isBusy}>Record again</button>}
@@ -2634,7 +2660,7 @@ const App: React.FC = () => {
               {stepStatuses.preprocess === 'error' && <div className="ph-minimal-error">{preprocessLogs[preprocessLogs.length - 1]?.message || 'Could not prepare this avatar.'}</div>}
               {uiNotice && <div className="ph-minimal-error">{uiNotice}</div>}
 
-              <button type="button" className="ph-minimal-primary" onClick={() => void startPreprocess()} disabled={profileNameTaken || autoPrepareAfterUpload || !publicSetupReady || stepStatuses.preprocess === 'running' || isBusy && stepStatuses.preprocess !== 'running'}>
+              <button type="button" className="ph-minimal-primary" onClick={() => void handleCreateAvatar()} disabled={profileNameTaken || autoPrepareAfterUpload || !publicSourceReady || stepStatuses.preprocess === 'running' || isBusy && stepStatuses.preprocess !== 'running'}>
                 {autoPrepareAfterUpload || stepStatuses.preprocess === 'running' ? 'Preparing…' : 'Create avatar'}<span>→</span>
               </button>
 
