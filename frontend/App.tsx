@@ -2696,9 +2696,9 @@ const App: React.FC = () => {
                             {cameraState === 'recorded' && <div className="ph-camera-captured-badge">Recording captured · looping preview</div>}
                           </div>
                           <div className="ph-camera-panel">
-                            <div className="ph-camera-meta"><span>{cameraState === 'recording' ? 'Recording in progress' : 'Guided capture'}</span><strong>{cameraElapsed}s / {CAMERA_RECORDING_SECONDS}s</strong></div>
-                            <p className="ph-camera-instructions">Face the camera in bright, even light. Keep your eyes and mouth visible, speak naturally in a quiet room, and avoid backlight.</p>
                             <div className="ph-camera-script-wrap"><span className="ph-minimal-label">Read this aloud</span><blockquote className="ph-camera-script">“{CAMERA_PROMPT}”</blockquote></div>
+                            <div className="ph-camera-meta"><span>{cameraState === 'recording' ? 'Recording in progress' : 'Guided capture'}</span><strong>{cameraElapsed}s / {CAMERA_RECORDING_SECONDS}s</strong></div>
+                            <p className="ph-camera-instructions">Keep the camera at eye level and look directly into the lens, not at your screen. Use bright, even light, keep your eyes and mouth visible, and speak naturally in a quiet room.</p>
                             {cameraError && <div className="ph-minimal-error">{cameraError}</div>}
                             <div className="ph-camera-actions">
                               {cameraState === 'idle' && <button type="button" className="ph-minimal-primary" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Enable camera<span>→</span></button>}

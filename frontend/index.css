@@ -20,7 +20,8 @@
 }
 
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 320px; min-height: 100vh; background: #f6f4ef; }
+html { scrollbar-gutter: stable; }
+body { margin: 0; min-width: 320px; min-height: 100vh; overflow-y: scroll; background: #f6f4ef; }
 button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; }
@@ -358,7 +359,7 @@ button:disabled { cursor: not-allowed; }
 .ph-camera-idle-state > span { width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid #6d8c84; border-radius: 50%; color: #9cd5c8; font-size: 14px; }
 .ph-camera-captured-badge { position: absolute; top: 10px; left: 50%; z-index: 3; transform: translateX(-50%); padding: 6px 9px; border: 1px solid rgba(220,249,242,.58); border-radius: 999px; color: #e3f5f1; background: rgba(8,127,114,.84); box-shadow: 0 4px 14px rgba(4,28,23,.18); font-size: 10px; font-weight: 700; white-space: nowrap; }
 .ph-camera-panel { min-width: 0; display: flex; flex-direction: column; padding: 3px 0; }
-.ph-camera-meta { display: flex; justify-content: space-between; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid #eceae5; color: #697872; font: 500 9px 'DM Mono', monospace; }
+.ph-camera-meta { display: flex; justify-content: space-between; gap: 10px; margin-top: 15px; padding-bottom: 12px; border-bottom: 1px solid #eceae5; color: #697872; font: 500 9px 'DM Mono', monospace; }
 .ph-camera-meta strong { color: #087f72; font-weight: 600; }
 .ph-camera-instructions { margin: 15px 0 17px; color: #70756e; font-size: 11px; line-height: 1.55; }
 .ph-camera-script-wrap { padding: 13px 14px; border: 1px solid #dce9e5; border-radius: 9px; background: #f5faf8; }
