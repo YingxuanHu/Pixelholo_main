@@ -2694,6 +2694,7 @@ const App: React.FC = () => {
                             </div>
                             {cameraState === 'requesting' && <div className="ph-camera-overlay">Opening camera…</div>}
                             {cameraState === 'idle' && <div className="ph-camera-idle-state"><span aria-hidden="true">◌</span><strong>Camera preview</strong></div>}
+                            {cameraState === 'idle' && <button type="button" className="ph-camera-enable-button" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Enable camera</button>}
                             {cameraState === 'recorded' && <div className="ph-camera-captured-badge">Recording captured · looping preview</div>}
                           </div>
                           <div className="ph-camera-panel">
@@ -2701,7 +2702,6 @@ const App: React.FC = () => {
                             <p className="ph-camera-instructions">Keep the camera at eye level and look directly into the lens, not at your screen. Use bright, even light, keep your eyes and mouth visible, and speak naturally in a quiet room.</p>
                             {cameraError && <div className="ph-minimal-error">{cameraError}</div>}
                             <div className="ph-camera-actions">
-                              {cameraState === 'idle' && <button type="button" className="ph-minimal-primary" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Enable camera<span>→</span></button>}
                               {cameraState === 'error' && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Try camera again</button>}
                               {cameraState === 'ready' && <button type="button" className="ph-minimal-primary" onClick={startCameraRecording} disabled={isBusy}>Start recording<span>●</span></button>}
                               {cameraState === 'recording' && <button type="button" className="ph-minimal-record-stop" onClick={stopCameraRecording}>Stop and use recording<span>■</span></button>}
@@ -2732,7 +2732,7 @@ const App: React.FC = () => {
               {stepStatuses.preprocess === 'error' && <div className="ph-minimal-error">{preprocessLogs[preprocessLogs.length - 1]?.message || 'Could not prepare this avatar.'}</div>}
               {uiNotice && <div className="ph-minimal-error">{uiNotice}</div>}
 
-              <button type="button" className="ph-minimal-primary" onClick={() => void handleCreateAvatar()} disabled={profileNameTaken || autoPrepareAfterUpload || !publicSourceReady || stepStatuses.preprocess === 'running' || isBusy && stepStatuses.preprocess !== 'running'}>
+              <button type="button" className="ph-minimal-primary ph-minimal-create-action" onClick={() => void handleCreateAvatar()} disabled={profileNameTaken || autoPrepareAfterUpload || !publicSourceReady || stepStatuses.preprocess === 'running' || isBusy && stepStatuses.preprocess !== 'running'}>
                 {autoPrepareAfterUpload || stepStatuses.preprocess === 'running' ? 'Preparing…' : 'Create avatar'}<span>→</span>
               </button>
 
