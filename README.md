@@ -304,7 +304,7 @@ different browser starts a new empty workspace.
 | `VITE_PIXELHOLO_API_BASE` | development: `http://127.0.0.1:8000`; production: `/api` | FastAPI origin override |
 | `VITE_PIXELHOLO_BINARY_STREAM` | enabled in the current client | Prefer binary avatar packets; disable to debug NDJSON |
 | `VITE_PIXELHOLO_BINARY_PCM_AUDIO` | enabled in the current client | Use raw PCM audio packets when supported |
-| `VITE_PIXELHOLO_AVATAR_MAX_FRAME_EDGE` | `1080` | Client-side maximum frame edge in pixels |
+| `VITE_PIXELHOLO_AVATAR_MAX_FRAME_EDGE` | `1280` | Client-side maximum frame edge in pixels for the high-detail web preview |
 | `VITE_PIXELHOLO_AUDIO_START_DELAY_SEC` | `0.04` | Audio-only playback start delay |
 | `VITE_PIXELHOLO_AVATAR_AUDIO_START_DELAY_SEC` | `0.34` | Avatar playback delay while the first frames arrive |
 | `VITE_PIXELHOLO_AVATAR_AUDIO_CHUNK_LEAD_SEC` | `0.08` | Lead time for subsequent avatar audio chunks |

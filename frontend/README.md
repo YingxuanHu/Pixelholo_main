@@ -80,7 +80,7 @@ Useful client-side tuning variables:
 | `VITE_PIXELHOLO_API_BASE` | development: `http://127.0.0.1:8000`; production: `/api` | FastAPI origin override |
 | `VITE_PIXELHOLO_BINARY_STREAM` | enabled in the current build | Prefer binary stream packets over NDJSON |
 | `VITE_PIXELHOLO_BINARY_PCM_AUDIO` | enabled in the current build | Prefer PCM audio packets when available |
-| `VITE_PIXELHOLO_AVATAR_MAX_FRAME_EDGE` | `1080` px | Downscale very large incoming avatar frames |
+| `VITE_PIXELHOLO_AVATAR_MAX_FRAME_EDGE` | `1280` px | Downscale very large incoming avatar frames while preserving more mouth detail |
 | `VITE_PIXELHOLO_AUDIO_START_DELAY_SEC` | `0.04` s | Audio-only startup offset |
 | `VITE_PIXELHOLO_AVATAR_AUDIO_START_DELAY_SEC` | `0.34` s | Avatar startup offset while frames buffer |
 | `VITE_PIXELHOLO_AVATAR_AUDIO_CHUNK_LEAD_SEC` | `0.08` s | Lead time for following audio chunks |
