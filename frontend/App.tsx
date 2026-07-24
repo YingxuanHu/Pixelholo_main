@@ -2607,114 +2607,111 @@ const App: React.FC = () => {
                 );
                 return (
                   <>
-              <label className="ph-minimal-label" htmlFor="minimal-avatar-name">Name your avatar</label>
-              <input
-                id="minimal-avatar-name"
-                className="ph-minimal-name-input"
-                ref={minimalNameInputRef}
-                value={profile.name}
-                onChange={event => {
-                  setProfile(prev => ({ ...prev, name: event.target.value }));
-                  if (event.target.value.trim()) setProfileNameRequired(false);
-                  setUiNotice(null);
-                }}
-                placeholder="Enter a profile name"
-                autoComplete="off"
-                spellCheck={false}
-                aria-invalid={profileNameTaken || (profileNameRequired && !profile.name.trim())}
-                disabled={isBusy}
-              />
-              {profileNameTaken && (
-                <div className="ph-minimal-name-availability" role="alert">
-                  Profile name already exists. Choose another name, such as <strong>“{profile.name.trim()} 2”</strong>.
-                </div>
-              )}
+                    <section className="ph-create-identity">
+                      <label className="ph-minimal-label" htmlFor="minimal-avatar-name">Profile name</label>
+                      <input
+                        id="minimal-avatar-name"
+                        className="ph-minimal-name-input"
+                        ref={minimalNameInputRef}
+                        value={profile.name}
+                        onChange={event => {
+                          setProfile(prev => ({ ...prev, name: event.target.value }));
+                          if (event.target.value.trim()) setProfileNameRequired(false);
+                          setUiNotice(null);
+                        }}
+                        placeholder="Name this avatar"
+                        autoComplete="off"
+                        spellCheck={false}
+                        aria-invalid={profileNameTaken || (profileNameRequired && !profile.name.trim())}
+                        disabled={isBusy}
+                      />
+                      {profileNameTaken && (
+                        <div className="ph-minimal-name-availability" role="alert">
+                          Profile name already exists. Choose another name, such as <strong>“{profile.name.trim()} 2”</strong>.
+                        </div>
+                      )}
+                    </section>
 
-              <div className="ph-minimal-source-tabs" role="tablist" aria-label="Avatar source">
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={sourceMode === 'camera'}
-                  className={sourceMode === 'camera' ? 'is-selected' : ''}
-                  disabled={isBusy}
-                  onClick={() => {
-                    if (profileNameTaken) {
-                      setUiNotice('Choose a new profile name before recording.');
-                      minimalNameInputRef.current?.focus();
-                      return;
-                    }
-                    setSourceMode('camera');
-                    void openCamera();
-                  }}
-                >
-                  Record with camera
-                </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={sourceMode === 'upload'}
-                  className={sourceMode === 'upload' ? 'is-selected' : ''}
-                  onClick={() => {
-                    setSourceMode('upload');
-                    stopCameraStream();
-                    setCameraState('idle');
-                    setCapturedCameraFile(null);
-                    if (!lastUploadedFilename) {
-                      setProfile(prev => ({ ...prev, lastUploadedFile: null, fileSize: null }));
-                    }
-                  }}
-                >
-                  Upload video
-                </button>
-              </div>
-
-              {sourceMode === 'upload' ? (
-                <div className="ph-minimal-file-list">
-                  <label className={`ph-minimal-file-row ${sourceUploaded ? 'is-complete' : ''} ${!profile.name || profileNameTaken ? 'is-disabled' : ''}`}>
-                    <input type="file" accept="video/*" onChange={event => event.target.files?.[0] && void handleUpload(event.target.files[0])} disabled={!profile.name || profileNameTaken || isBusy} />
-                    <span className="ph-minimal-file-icon">▣</span>
-                    <span className="ph-minimal-file-copy"><strong>Talking video</strong><small>{profile.lastUploadedFile || (sourceUploaded ? 'Video uploaded · ready to prepare' : 'Face + voice source · 5–20 seconds · 720p+ · front-lit')}</small></span>
-                    <span className="ph-minimal-file-action">{uploadPhaseVideo === 'uploading' ? `${uploadProgressVideo}%` : sourceUploaded ? 'Replace' : 'Choose'}</span>
-                  </label>
-                </div>
-              ) : (
-                <div className="ph-camera-recorder">
-                  <blockquote className="ph-camera-script">“{CAMERA_PROMPT}”</blockquote>
-                  <div className="ph-camera-stage">
-                    <video ref={cameraVideoRef} src={cameraPreviewUrl ?? undefined} autoPlay muted playsInline loop={cameraState === 'recorded'} aria-label="Camera preview" />
-                    <div className="ph-camera-guide" aria-hidden="true">
-                      <span className="ph-camera-head-frame" />
-                      <small>Keep your face inside the frame</small>
-                    </div>
-                    {cameraState === 'requesting' && <div className="ph-camera-overlay">Opening camera…</div>}
-                    {cameraState === 'idle' && (
-                      <div className="ph-camera-overlay ph-camera-permission">
+                    <section className="ph-create-source" aria-labelledby="source-heading">
+                      <div className="ph-create-section-heading">
+                        <div><span className="ph-minimal-label" id="source-heading">Source video</span><p>{sourceMode === 'camera' ? 'Record a guided sample' : 'Choose an existing talking video'}</p></div>
+                        <span>{sourceMode === 'camera' ? `${CAMERA_RECORDING_SECONDS} sec` : '5–20 sec'}</span>
+                      </div>
+                      <div className="ph-minimal-source-tabs" role="tablist" aria-label="Avatar source">
                         <button
                           type="button"
-                          className="ph-camera-enable-button"
-                          onClick={() => void openCamera()}
-                          disabled={profileNameTaken || isBusy}
+                          role="tab"
+                          aria-selected={sourceMode === 'camera'}
+                          className={sourceMode === 'camera' ? 'is-selected' : ''}
+                          disabled={isBusy}
+                          onClick={() => {
+                            if (profileNameTaken) {
+                              setUiNotice('Choose a new profile name before recording.');
+                              minimalNameInputRef.current?.focus();
+                              return;
+                            }
+                            setSourceMode('camera');
+                          }}
                         >
-                          <span aria-hidden="true">◉</span>
-                          Enable camera
+                          Record with camera
                         </button>
-                        <small>Camera + microphone permission required</small>
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={sourceMode === 'upload'}
+                          className={sourceMode === 'upload' ? 'is-selected' : ''}
+                          onClick={() => {
+                            setSourceMode('upload');
+                            stopCameraStream();
+                            setCameraState('idle');
+                            setCapturedCameraFile(null);
+                            if (!lastUploadedFilename) {
+                              setProfile(prev => ({ ...prev, lastUploadedFile: null, fileSize: null }));
+                            }
+                          }}
+                        >
+                          Upload video
+                        </button>
                       </div>
-                    )}
-                    {cameraState === 'recorded' && <div className="ph-camera-captured-badge">Recording captured · looping preview</div>}
-                  </div>
-                  <div className="ph-camera-meta"><span>{cameraState === 'recording' ? 'Recording…' : `${CAMERA_RECORDING_SECONDS}-second guided capture`}</span><strong>{cameraElapsed}s / {CAMERA_RECORDING_SECONDS}s</strong></div>
-                  <p className="ph-camera-instructions">Face straight toward the camera, use bright even light from in front of you, keep your eyes and mouth visible, and speak naturally in a quiet room. Avoid a bright window behind you.</p>
-                  {cameraError && <div className="ph-minimal-error">{cameraError}</div>}
-                  <div className="ph-camera-actions">
-                    {cameraState === 'error' && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Try camera again</button>}
-                    {cameraState === 'ready' && <button type="button" className="ph-minimal-primary" onClick={startCameraRecording} disabled={isBusy}>Start recording<span>●</span></button>}
-                    {cameraState === 'recording' && <button type="button" className="ph-minimal-record-stop" onClick={stopCameraRecording}>Stop and use recording<span>■</span></button>}
-                    {cameraState === 'recorded' && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={isBusy}>Record again</button>}
-                    {uploadPhaseVideo === 'uploading' && <span className="ph-camera-upload-status">Uploading {uploadProgressVideo}%…</span>}
-                  </div>
-                </div>
-              )}
+
+                      {sourceMode === 'upload' ? (
+                        <div className="ph-minimal-file-list">
+                          <label className={`ph-minimal-file-row ${sourceUploaded ? 'is-complete' : ''} ${!profile.name || profileNameTaken ? 'is-disabled' : ''}`}>
+                            <input type="file" accept="video/*" onChange={event => event.target.files?.[0] && void handleUpload(event.target.files[0])} disabled={!profile.name || profileNameTaken || isBusy} />
+                            <span className="ph-minimal-file-icon">▣</span>
+                            <span className="ph-minimal-file-copy"><strong>Talking video</strong><small>{profile.lastUploadedFile || (sourceUploaded ? 'Video uploaded · ready to prepare' : 'Face + voice source · 5–20 seconds · 720p+ · front-lit')}</small></span>
+                            <span className="ph-minimal-file-action">{uploadPhaseVideo === 'uploading' ? `${uploadProgressVideo}%` : sourceUploaded ? 'Replace' : 'Choose'}</span>
+                          </label>
+                        </div>
+                      ) : (
+                        <div className="ph-camera-recorder">
+                          <div className={`ph-camera-stage is-${cameraState}`}>
+                            <video ref={cameraVideoRef} src={cameraPreviewUrl ?? undefined} autoPlay muted playsInline loop={cameraState === 'recorded'} aria-label="Camera preview" />
+                            <div className="ph-camera-guide" aria-hidden="true">
+                              <span className="ph-camera-head-frame" />
+                              <small>Keep your face inside the frame</small>
+                            </div>
+                            {cameraState === 'requesting' && <div className="ph-camera-overlay">Opening camera…</div>}
+                            {cameraState === 'idle' && <div className="ph-camera-idle-state"><span aria-hidden="true">◌</span><strong>Camera preview</strong></div>}
+                            {cameraState === 'recorded' && <div className="ph-camera-captured-badge">Recording captured · looping preview</div>}
+                          </div>
+                          <div className="ph-camera-panel">
+                            <div className="ph-camera-meta"><span>{cameraState === 'recording' ? 'Recording in progress' : 'Guided capture'}</span><strong>{cameraElapsed}s / {CAMERA_RECORDING_SECONDS}s</strong></div>
+                            <p className="ph-camera-instructions">Face the camera in bright, even light. Keep your eyes and mouth visible, speak naturally in a quiet room, and avoid backlight.</p>
+                            <div className="ph-camera-script-wrap"><span className="ph-minimal-label">Read this aloud</span><blockquote className="ph-camera-script">“{CAMERA_PROMPT}”</blockquote></div>
+                            {cameraError && <div className="ph-minimal-error">{cameraError}</div>}
+                            <div className="ph-camera-actions">
+                              {cameraState === 'idle' && <button type="button" className="ph-minimal-primary" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Enable camera<span>→</span></button>}
+                              {cameraState === 'error' && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Try camera again</button>}
+                              {cameraState === 'ready' && <button type="button" className="ph-minimal-primary" onClick={startCameraRecording} disabled={isBusy}>Start recording<span>●</span></button>}
+                              {cameraState === 'recording' && <button type="button" className="ph-minimal-record-stop" onClick={stopCameraRecording}>Stop and use recording<span>■</span></button>}
+                              {cameraState === 'recorded' && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={isBusy}>Record again</button>}
+                              {uploadPhaseVideo === 'uploading' && <span className="ph-camera-upload-status">Uploading {uploadProgressVideo}%…</span>}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </section>
 
               {stepStatuses.preprocess === 'running' && (
                 <div className="ph-minimal-preparing" role="status" aria-live="polite">
