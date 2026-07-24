@@ -153,7 +153,7 @@ const LLM_MODE_OPTIONS: { value: LLMMode; label: string }[] = [
 const DEFAULT_AVATAR_START_SEC = 0;
 const DEFAULT_AVATAR_LOOP_SEC = 20;
 const DEFAULT_AVATAR_LOOP_FADE_SEC = 0.15;
-const CAMERA_RECORDING_SECONDS = 20;
+const CAMERA_RECORDING_SECONDS = 25;
 const CAMERA_PROMPT = 'Hi, this is my PixelHolo avatar. I am speaking clearly and naturally in my everyday voice. Today is a bright day, and this sample shows my pronunciation, rhythm, and tone. I am calm and confident, speaking at a steady pace just as I would in a normal conversation. Please listen to how I normally sound while I speak naturally and comfortably.';
 const normalizeProfileName = (value: string) => value.trim().toLocaleLowerCase();
 const BLUR_KERNEL_BY_LEVEL = { low: 60, medium: 75, high: 90 } as const;
