@@ -295,11 +295,6 @@ button:disabled { cursor: not-allowed; }
 .ph-minimal-profile-menu button:hover { background: #f4f8f6; color: #087f72; }
 .ph-minimal-profile-menu button.is-danger { color: #b65b51; }
 .ph-minimal-profile-menu button.is-danger:hover { background: #fff1ee; color: #a84c43; }
-.ph-minimal-sidebar-footer { display: flex; align-items: center; gap: 9px; margin-top: auto; padding: 15px 7px 0; border-top: 1px solid #e7e5df; }
-.ph-minimal-sidebar-footer .ph-status-dot { width: 7px; height: 7px; }
-.ph-minimal-sidebar-footer > div { display: flex; flex-direction: column; gap: 3px; }
-.ph-minimal-sidebar-footer strong { color: #555a53; font-size: 10px; }
-.ph-minimal-sidebar-footer small { color: #a0a199; font: 500 9px 'DM Mono', monospace; }
 .ph-minimal-main { width: 100%; min-width: 0; max-width: none; min-height: calc(100vh - 70px); margin: 0; padding: clamp(28px, 4vh, 52px) clamp(24px, 4vw, 52px) 32px; }
 .ph-minimal-create { max-width: 600px; margin: 0 auto; }
 .ph-minimal-intro { margin-bottom: 32px; text-align: center; }
@@ -516,7 +511,6 @@ button:disabled { cursor: not-allowed; }
   .ph-minimal-sidebar-section-label { padding: 0; }
   .ph-minimal-profile-list { flex: 0 0 auto; flex-direction: row; overflow-x: auto; padding-bottom: 2px; }
   .ph-minimal-profile-item { min-width: 210px; }
-  .ph-minimal-sidebar-footer { display: none; }
   .ph-minimal-main { min-height: auto; padding: 42px 17px 55px; }
   .ph-minimal-status { display: none; }
   .ph-minimal-intro { margin-bottom: 25px; }

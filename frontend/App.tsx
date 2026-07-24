@@ -2563,10 +2563,9 @@ const App: React.FC = () => {
             })}
           </div>
 
-          <div className="ph-minimal-sidebar-footer">
-            <span className={`ph-status-dot ${apiStatus}`} />
-            <div><strong>{apiStatus === 'online' ? 'Engine ready' : apiStatus === 'checking' ? 'Connecting…' : 'Engine offline'}</strong><small>Chatterbox · {avatarBackend === 'wav2lip' ? 'Wav2Lip' : 'MuseTalk'}</small></div>
-          </div>
+          {/* The connection state lives in the persistent header. Keeping it
+              out of this variable-height sidebar prevents a duplicate footer
+              from floating or being clipped on compact screens. */}
         </aside>
 
         <main className="ph-minimal-main">
