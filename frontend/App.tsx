@@ -160,8 +160,12 @@ const BLUR_KERNEL_BY_LEVEL = { low: 60, medium: 75, high: 90 } as const;
 const DEFAULT_AVATAR_BLUR_LEVEL: keyof typeof BLUR_KERNEL_BY_LEVEL = 'medium';
 const DEFAULT_VIDEO_FPS = 25;
 const DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE = Number(
-  (env.VITE_PIXELHOLO_AVATAR_MAX_FRAME_EDGE as string | undefined)?.trim() || '1080',
+  // The web canvas is portrait and can display 1280px-tall source frames without
+  // scaling them up.  Keep the server-side cap aligned with that display so the
+  // mouth and teeth are not softened by an avoidable downscale.
+  (env.VITE_PIXELHOLO_AVATAR_MAX_FRAME_EDGE as string | undefined)?.trim() || '1280',
 );
+const BEST_WEB_MUSETALK_JPEG_QUALITY = 95;
 const DEFAULT_AUDIO_START_DELAY_SEC = envNumber('VITE_PIXELHOLO_AUDIO_START_DELAY_SEC', 0.04, 0.02, 0.25);
 const AVATAR_AUDIO_START_DELAY_SEC = envNumber('VITE_PIXELHOLO_AVATAR_AUDIO_START_DELAY_SEC', 0.34, 0.12, 1.0);
 const AVATAR_AUDIO_CHUNK_LEAD_SEC = envNumber('VITE_PIXELHOLO_AVATAR_AUDIO_CHUNK_LEAD_SEC', 0.08, 0.02, 0.5);
@@ -422,6 +426,14 @@ const App: React.FC = () => {
   const streamRunningRef = useRef(false);
   const streamSessionRef = useRef<number>(0);
   const isBusy = Object.values(stepStatuses).some(status => status === 'running');
+  // A backend `done` event means all media has been delivered, not that the
+  // browser has finished playing it.  Treat either phase as active so a user
+  // can always stop the current response until audio and frames have drained.
+  const isInferenceActive = stepStatuses.inference === 'running' || isPlaybackActive;
+  const hasInferenceOutput = inferenceChunks.length > 0 || videoState === 'playing';
+  const inferenceStatusLabel = isInferenceActive
+    ? (hasInferenceOutput ? 'Streaming…' : 'Generating…')
+    : 'Ready to stream';
   const isProfileSwitchBlocked = Object.entries(stepStatuses).some(
     ([step, status]) => step !== 'inference' && status === 'running',
   );
@@ -1989,14 +2001,19 @@ const App: React.FC = () => {
       }
       if (avatarBackend === 'musetalk') {
         payload.musetalk_preset = museTalkPreset;
+        // Preserve as much source detail as the real-time MuseTalk renderer can
+        // deliver.  This does not change the model's native reconstruction size,
+        // but it avoids adding JPEG artifacts over lips, teeth, and the jawline.
+        payload.musetalk_jpeg_quality = BEST_WEB_MUSETALK_JPEG_QUALITY;
       }
     }
 
     const finishStream = (inferenceMs?: number) => {
       if (sawError) return;
       setLatency(prev => prev ? { ...prev, total: inferenceMs ?? Math.round(performance.now() - startTime) } : null);
-      setStepStatuses(prev => ({ ...prev, inference: 'done' }));
       setInferenceStageIndex(inferenceSteps.length ? inferenceSteps.length - 1 : null);
+      // Keep inference `running` until settlePlayback confirms that the browser
+      // has played every scheduled audio sample and displayed every queued frame.
       settlePlayback();
       if (streamAbortRef.current === controller) {
         streamAbortRef.current = null;
@@ -2724,9 +2741,9 @@ const App: React.FC = () => {
 
             <div className="ph-minimal-workspace">
               <section className="ph-minimal-preview">
-                <div className="ph-minimal-preview-heading"><span>Live preview</span><span><i className={`ph-mini-dot ${isWarmingUp ? 'is-preparing' : videoState === 'playing' ? 'is-speaking' : ''}`} />{isWarmingUp ? 'Preparing' : videoState === 'playing' ? 'Speaking' : 'Ready'}</span></div>
+                <div className="ph-minimal-preview-heading"><span>Live preview</span><span><i className={`ph-mini-dot ${isWarmingUp ? 'is-preparing' : isInferenceActive ? 'is-speaking' : ''}`} />{isWarmingUp ? 'Preparing' : isInferenceActive ? (videoState === 'playing' ? 'Speaking' : inferenceStatusLabel) : 'Ready'}</span></div>
                 <div className="ph-minimal-canvas-wrap">
-                  <canvas ref={videoCanvasRef} width={810} height={1080} aria-label="Live avatar preview" />
+                  <canvas ref={videoCanvasRef} width={960} height={1280} aria-label="Live avatar preview" />
                   {isWarmingUp && <div className="ph-minimal-buffering ph-minimal-preparing">Preparing avatar…</div>}
                   {videoState === 'buffering' && stepStatuses.inference === 'running' && <div className="ph-minimal-buffering">Buffering…</div>}
                 </div>
@@ -2746,7 +2763,7 @@ const App: React.FC = () => {
                     placeholder={isListening ? 'Listening…' : 'Ask your avatar something…'}
                     rows={5}
                   />
-                  <button type="button" className={`ph-minimal-voice-button ${isListening ? 'is-listening' : ''}`} onClick={() => (isListening ? stopListening() : startListening())} disabled={!hasSpeechSupport || stepStatuses.inference === 'running' || isWarmingUp} title={hasSpeechSupport ? 'Speak; it will send automatically when you stop' : 'Voice input is not supported by this browser'} aria-label={hasSpeechSupport ? (isListening ? 'Stop listening' : 'Voice input') : 'Voice input unavailable'} aria-pressed={isListening}>
+                  <button type="button" className={`ph-minimal-voice-button ${isListening ? 'is-listening' : ''}`} onClick={() => (isListening ? stopListening() : startListening())} disabled={!hasSpeechSupport || isInferenceActive || isWarmingUp} title={hasSpeechSupport ? 'Speak; it will send automatically when you stop' : 'Voice input is not supported by this browser'} aria-label={hasSpeechSupport ? (isListening ? 'Stop listening' : 'Voice input') : 'Voice input unavailable'} aria-pressed={isListening}>
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm6-3a1 1 0 0 0-2 0 4 4 0 0 1-8 0 1 1 0 0 0-2 0 6 6 0 0 0 5 5.91V19H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-2.09A6 6 0 0 0 18 11Z" /></svg>
                     <span>{isListening ? 'Stop listening' : 'Voice'}</span>
                   </button>
@@ -2772,7 +2789,7 @@ const App: React.FC = () => {
                 )}
 
                 {uiNotice && <div className="ph-minimal-error">{uiNotice}</div>}
-                <div className="ph-minimal-composer-footer"><span><i className={`ph-status-dot ${isListening ? 'checking' : 'online'}`} /> {isListening ? 'Listening…' : stepStatuses.inference === 'running' ? 'Generating…' : 'Ready to stream'}</span><div className="ph-minimal-composer-actions"><button type="button" className={`ph-minimal-mic-button ${isListening ? 'is-listening' : ''}`} onClick={() => (isListening ? stopListening() : startListening())} disabled={!hasSpeechSupport || stepStatuses.inference === 'running' || isWarmingUp} title={hasSpeechSupport ? 'Speak; it will send automatically when you stop' : 'Voice input is not supported by this browser'} aria-label={hasSpeechSupport ? 'Voice input' : 'Voice input unavailable'} aria-pressed={isListening}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm6-3a1 1 0 0 0-2 0 4 4 0 0 1-8 0 1 1 0 0 0-2 0 6 6 0 0 0 5 5.91V19H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-2.09A6 6 0 0 0 18 11Z" /></svg></button>{stepStatuses.inference === 'running' && <button type="button" className="ph-minimal-stop is-active" onClick={() => void stopInference()}>Stop</button>}</div></div>
+                <div className="ph-minimal-composer-footer"><span><i className={`ph-status-dot ${isListening ? 'checking' : isInferenceActive ? 'checking' : 'online'}`} /> {isListening ? 'Listening…' : inferenceStatusLabel}</span><div className="ph-minimal-composer-actions"><button type="button" className={`ph-minimal-mic-button ${isListening ? 'is-listening' : ''}`} onClick={() => (isListening ? stopListening() : startListening())} disabled={!hasSpeechSupport || isInferenceActive || isWarmingUp} title={hasSpeechSupport ? 'Speak; it will send automatically when you stop' : 'Voice input is not supported by this browser'} aria-label={hasSpeechSupport ? 'Voice input' : 'Voice input unavailable'} aria-pressed={isListening}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm6-3a1 1 0 0 0-2 0 1 1 0 0 0-2 0 6 6 0 0 0 5 5.91V19H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-2.09A6 6 0 0 0 18 11Z" /></svg></button>{isInferenceActive && <button type="button" className="ph-minimal-stop is-active" onClick={() => void stopInference()}>Stop</button>}</div></div>
               </section>
             </div>
 
