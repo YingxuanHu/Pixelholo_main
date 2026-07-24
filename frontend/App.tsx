@@ -154,7 +154,7 @@ const DEFAULT_AVATAR_START_SEC = 0;
 const DEFAULT_AVATAR_LOOP_SEC = 20;
 const DEFAULT_AVATAR_LOOP_FADE_SEC = 0.15;
 const CAMERA_RECORDING_SECONDS = 20;
-const CAMERA_PROMPT = 'Hi, this is my PixelHolo avatar. I am speaking clearly and naturally in my everyday voice. Today is a bright day, and this sample shows my pronunciation, rhythm, and tone. Please listen to how I normally sound while I speak naturally and comfortably.';
+const CAMERA_PROMPT = 'Hi, this is my PixelHolo avatar. I am speaking clearly and naturally in my everyday voice. Today is a bright day, and this sample shows my pronunciation, rhythm, and tone. I am calm and confident, speaking at a steady pace just as I would in a normal conversation. Please listen to how I normally sound while I speak naturally and comfortably.';
 const normalizeProfileName = (value: string) => value.trim().toLocaleLowerCase();
 const BLUR_KERNEL_BY_LEVEL = { low: 60, medium: 75, high: 90 } as const;
 const DEFAULT_AVATAR_BLUR_LEVEL: keyof typeof BLUR_KERNEL_BY_LEVEL = 'medium';
@@ -2630,6 +2630,7 @@ const App: React.FC = () => {
                 </div>
               ) : (
                 <div className="ph-camera-recorder">
+                  <blockquote className="ph-camera-script">“{CAMERA_PROMPT}”</blockquote>
                   <div className="ph-camera-stage">
                     <video ref={cameraVideoRef} src={cameraPreviewUrl ?? undefined} autoPlay muted playsInline loop={cameraState === 'recorded'} aria-label="Camera preview" />
                     <div className="ph-camera-guide" aria-hidden="true">
@@ -2642,7 +2643,6 @@ const App: React.FC = () => {
                   </div>
                   <div className="ph-camera-meta"><span>{cameraState === 'recording' ? 'Recording…' : '20-second guided capture'}</span><strong>{cameraElapsed}s / {CAMERA_RECORDING_SECONDS}s</strong></div>
                   <p className="ph-camera-instructions">Face straight toward the camera, use bright even light from in front of you, keep your eyes and mouth visible, and speak naturally in a quiet room. Avoid a bright window behind you.</p>
-                  <blockquote className="ph-camera-script">“{CAMERA_PROMPT}”</blockquote>
                   {cameraError && <div className="ph-minimal-error">{cameraError}</div>}
                   <div className="ph-camera-actions">
                     {(cameraState === 'idle' || cameraState === 'error') && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Allow camera</button>}

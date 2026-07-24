@@ -341,7 +341,7 @@ button:disabled { cursor: not-allowed; }
 .ph-camera-meta { display: flex; justify-content: space-between; gap: 10px; margin-top: 10px; color: #697872; font: 500 9px 'DM Mono', monospace; }
 .ph-camera-meta strong { color: #087f72; font-weight: 600; }
 .ph-camera-instructions { margin: 11px 2px 0; color: #777f79; font-size: 10px; line-height: 1.5; }
-.ph-camera-script { margin: 9px 0 0; padding: 12px 13px; border-left: 3px solid #9bd4ca; color: #566762; background: #edf7f4; font-size: 13px; line-height: 1.65; }
+.ph-camera-script { margin: 0 0 12px; padding: 12px 13px; border-left: 3px solid #9bd4ca; color: #566762; background: #edf7f4; font-size: 13px; line-height: 1.65; }
 .ph-camera-actions { display: flex; align-items: center; gap: 8px; margin-top: 11px; }
 .ph-camera-actions .ph-minimal-primary, .ph-camera-actions .ph-minimal-secondary, .ph-camera-actions .ph-minimal-record-stop { flex: 1; }
 .ph-minimal-secondary, .ph-minimal-record-stop { display: inline-flex; align-items: center; justify-content: space-between; gap: 8px; padding: 11px 12px; border: 1px solid #c9e0da; border-radius: 8px; color: #087f72; background: #eff9f6; font-size: 11px; font-weight: 700; cursor: pointer; }
