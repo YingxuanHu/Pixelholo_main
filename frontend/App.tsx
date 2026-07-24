@@ -1922,9 +1922,28 @@ const App: React.FC = () => {
     const selectionId = profileSelectionRef.current;
     const requestProfileName = profile.name;
     const requestProfileType = profileType;
-    if (isWarmingUp) {
-      setUiNotice(`Preparing ${requestProfileName} for its first response. Please wait a moment.`);
-      return;
+    const warmupKey = warmupKeyFor(
+      requestProfileName,
+      requestProfileType,
+      avatarBackend,
+      ttsBackend,
+      llmMode,
+      museTalkPreset,
+      backendRuntimeIdRef.current,
+    );
+    // The selection effect normally performs this before the user can send a
+    // prompt.  Await it here as well to close the small React scheduling race
+    // where a very fast first Enter could start inference while the cache is
+    // still being built.  The first *stream* therefore takes the same hot path
+    // as every later stream.
+    if (isWarmingUp || !hasFreshWarmup(warmupKey)) {
+      try {
+        await warmupProfile(requestProfileName, requestProfileType);
+      } catch (error) {
+        setUiNotice(`Could not prepare ${requestProfileName}: ${String(error)}`);
+        return;
+      }
+      if (selectionId !== profileSelectionRef.current) return;
     }
     setUiNotice(null);
     clearPlaybackSettleTimer();
@@ -2233,6 +2252,7 @@ const App: React.FC = () => {
     enqueueFrames,
     interruptBackend,
     isWarmingUp,
+    hasFreshWarmup,
     llmMode,
     museTalkPreset,
     modelOverride,
@@ -2249,6 +2269,8 @@ const App: React.FC = () => {
     voiceControlValues,
     voiceControlsStatus,
     voiceControlsDirty,
+    warmupKeyFor,
+    warmupProfile,
     resolvePaceScale,
     resolveToneOverrides,
     resolveVolumeGain,

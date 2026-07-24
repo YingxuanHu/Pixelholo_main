@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import pickle
@@ -384,6 +385,47 @@ def _build_musetalk_boxes(
     return np.array(coords_xyxy, dtype=np.int32)
 
 
+def _musetalk_runtime_cache_settings() -> dict[str, float | int | str]:
+    """Settings that must match MuseTalkBridge._cache_manifest exactly.
+
+    Avatar preparation runs in its own process.  Keeping this small manifest
+    contract here lets preparation persist assets that the inference worker can
+    load directly instead of rebuilding the 500-frame latent/mask cache on the
+    first response.
+    """
+    return {
+        "cache_version": int(os.getenv("MUSE_TALK_CACHE_VERSION", "10")),
+        "parsing_mode": os.getenv("MUSE_TALK_PARSING_MODE", "raw"),
+        "coord_expand_x": float(os.getenv("MUSE_TALK_COORD_EXPAND_X", "0.08")),
+        "coord_expand_up": float(os.getenv("MUSE_TALK_COORD_EXPAND_UP", "0.04")),
+        "coord_expand_down": float(os.getenv("MUSE_TALK_COORD_EXPAND_DOWN", "0.18")),
+        "upper_boundary_ratio": float(os.getenv("MUSE_TALK_UPPER_BOUNDARY_RATIO", "0.5")),
+        "blend_expand": float(os.getenv("MUSE_TALK_BLEND_EXPAND", "1.2")),
+        "alpha_blur_ratio": float(os.getenv("MUSE_TALK_ALPHA_BLUR_RATIO", "0.035")),
+        "vignette_margin_ratio": float(os.getenv("MUSE_TALK_VIGNETTE_MARGIN_RATIO", "0.02")),
+        "alpha_gamma": float(os.getenv("MUSE_TALK_ALPHA_GAMMA", "0.82")),
+    }
+
+
+def _expand_musetalk_coord(
+    coord: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    settings: dict[str, float | int | str],
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = coord
+    box_w = max(1, x2 - x1)
+    box_h = max(1, y2 - y1)
+    pad_x = int(round(box_w * float(settings["coord_expand_x"])))
+    pad_up = int(round(box_h * float(settings["coord_expand_up"])))
+    pad_down = int(round(box_h * float(settings["coord_expand_down"])))
+    return _sanitize_xyxy(
+        (x1 - pad_x, y1 - pad_up, x2 + pad_x, y2 + pad_down),
+        width,
+        height,
+    )
+
+
 def bake_musetalk_assets(
     cache_dir: Path,
     frames: np.ndarray,
@@ -439,12 +481,11 @@ def bake_musetalk_assets(
     _report_progress(progress, 0.02, "Loading lip-sync models")
     vae = VAE(model_path=str(vae_dir))
     face_parser = _FaceParsingWithPaths(face_parse_resnet, face_parse_model)
-    # Use the native face/lip mask instead of the broader jaw-dilated mask.
-    # This leaves the original chin texture intact while MuseTalk updates the
-    # mouth region.
-    parsing_mode = os.getenv("MUSE_TALK_PARSING_MODE", "raw")
-    upper_boundary_ratio = float(os.getenv("MUSE_TALK_UPPER_BOUNDARY_RATIO", "0.5"))
-    bake_expand = float(os.getenv("MUSE_TALK_BAKE_EXPAND", "1.0"))
+    # Use the same mask, expansion, and manifest settings as the long-lived
+    # inference worker.  Previously this function wrote similar-looking files
+    # without the runtime manifest and with a different face expansion, so
+    # MuseTalk discarded them and rebuilt every latent on the first request.
+    settings = _musetalk_runtime_cache_settings()
     frame_h, frame_w = frames.shape[1:3]
 
     coords_xyxy = _build_musetalk_boxes(frames, base_coords_y1y2x1x2)
@@ -458,7 +499,13 @@ def bake_musetalk_assets(
     total_frames = max(1, len(frames))
     report_every = max(1, total_frames // 24)
     for index, (frame, coord) in enumerate(zip(frames, coords_xyxy), start=1):
-        x1, y1, x2, y2 = _sanitize_xyxy(tuple(int(v) for v in coord), frame_w, frame_h)
+        raw_coord = _sanitize_xyxy(tuple(int(v) for v in coord), frame_w, frame_h)
+        x1, y1, x2, y2 = _expand_musetalk_coord(
+            raw_coord,
+            frame_w,
+            frame_h,
+            settings,
+        )
 
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
@@ -470,10 +517,10 @@ def bake_musetalk_assets(
         mask, crop_box = get_image_prepare_material(
             frame,
             [x1, y1, x2, y2],
-            upper_boundary_ratio=upper_boundary_ratio,
-            expand=bake_expand,
+            upper_boundary_ratio=float(settings["upper_boundary_ratio"]),
+            expand=float(settings["blend_expand"]),
             fp=face_parser,
-            mode=parsing_mode,
+            mode=str(settings["parsing_mode"]),
         )
         aligned_mask, aligned_crop_box = _align_mask_to_crop(mask, crop_box, frame_w, frame_h)
         mask_arrays.append(aligned_mask)
@@ -486,16 +533,50 @@ def bake_musetalk_assets(
             )
 
     _report_progress(progress, 0.96, "Saving lip-sync assets")
-    torch.save(latents, cache_dir / "musetalk_latents.pt")
-    with (cache_dir / "musetalk_masks.pkl").open("wb") as handle:
+    # The "_baked" suffix is the runtime cache suffix selected when
+    # MUSE_TALK_COORD_SOURCE=baked.  It intentionally does not overwrite a
+    # legacy detector-coordinate cache from older profiles.
+    cache_suffix = "_baked"
+    latents_path = cache_dir / f"musetalk_latents{cache_suffix}.pt"
+    masks_path = cache_dir / f"musetalk_masks{cache_suffix}.pkl"
+    runtime_meta_path = cache_dir / f"musetalk_runtime_meta{cache_suffix}.json"
+    torch.save(latents, latents_path)
+    with masks_path.open("wb") as handle:
         pickle.dump(
             {
+                "cache_version": int(settings["cache_version"]),
                 "coord_format": "xyxy",
+                "coords_sha1": hashlib.sha1(
+                    coords_xyxy.astype(np.int32, copy=False).tobytes()
+                ).hexdigest(),
+                "parsing_mode": str(settings["parsing_mode"]),
                 "mask_arrays": mask_arrays,
                 "mask_crop_boxes": mask_crop_boxes,
             },
             handle,
         )
+    runtime_meta_path.write_text(
+        json.dumps(
+            {
+                "cache_version": int(settings["cache_version"]),
+                "coord_format": "xyxy",
+                "coords_sha1": hashlib.sha1(
+                    coords_xyxy.astype(np.int32, copy=False).tobytes()
+                ).hexdigest(),
+                "parsing_mode": str(settings["parsing_mode"]),
+                "coord_expand_x": float(settings["coord_expand_x"]),
+                "coord_expand_up": float(settings["coord_expand_up"]),
+                "coord_expand_down": float(settings["coord_expand_down"]),
+                "upper_boundary_ratio": float(settings["upper_boundary_ratio"]),
+                "blend_expand": float(settings["blend_expand"]),
+                "alpha_blur_ratio": float(settings["alpha_blur_ratio"]),
+                "vignette_margin_ratio": float(settings["vignette_margin_ratio"]),
+                "alpha_gamma": float(settings["alpha_gamma"]),
+                "frame_shape": list(frames.shape),
+            },
+            indent=2,
+        )
+    )
     _report_progress(progress, 1.0, "Lip-sync frames prepared")
 
 

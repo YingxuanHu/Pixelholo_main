@@ -85,8 +85,12 @@ class MuseTalkBridge:
         # (low infer fps + frame upsampling reduces base-frame progression speed).
         self.default_infer_fps = float(os.getenv("MUSE_TALK_INFER_FPS", "25.0"))
         self.infer_fps = self.default_infer_fps
+        # Avatar preparation writes landmark-stabilized MuseTalk coordinates.
+        # Prefer them at runtime: they are centred on the lower face rather
+        # than a broad detector rectangle, which preserves more of the source
+        # chin while giving the model a stable mouth target.
         self.default_coord_source = self._normalize_coord_source(
-            os.getenv("MUSE_TALK_COORD_SOURCE", "legacy")
+            os.getenv("MUSE_TALK_COORD_SOURCE", "baked")
         )
         self.coord_source = self.default_coord_source
 
@@ -100,14 +104,16 @@ class MuseTalkBridge:
         self.upper_boundary_ratio = float(os.getenv("MUSE_TALK_UPPER_BOUNDARY_RATIO", "0.5"))
         self.blend_expand = float(os.getenv("MUSE_TALK_BLEND_EXPAND", "1.2"))
         # Slightly shrink generated face patch inside the target box to avoid oversized mouth appearance.
-        self.face_scale = float(os.getenv("MUSE_TALK_FACE_SCALE", "0.98"))
+        self.default_face_scale = float(os.getenv("MUSE_TALK_FACE_SCALE", "0.96"))
+        self.face_scale = self.default_face_scale
         self.alpha_blur_ratio = float(os.getenv("MUSE_TALK_ALPHA_BLUR_RATIO", "0.035"))
         self.vignette_margin_ratio = float(os.getenv("MUSE_TALK_VIGNETTE_MARGIN_RATIO", "0.02"))
         self.alpha_gamma = float(os.getenv("MUSE_TALK_ALPHA_GAMMA", "0.82"))
         # MuseTalk reconstructs the mouth at 256px and the result is then expanded
         # into the portrait frame.  A moderate luminance-only sharpen restores some
         # lip/teeth edge definition without introducing ringing around the mouth.
-        self.detail_sharpen = float(os.getenv("MUSE_TALK_DETAIL_SHARPEN", "0.58"))
+        self.default_detail_sharpen = float(os.getenv("MUSE_TALK_DETAIL_SHARPEN", "0.70"))
+        self.detail_sharpen = self.default_detail_sharpen
         # MuseTalk's generated face is 256px.  Keep its lower edge from
         # replacing the source chin, where the reconstruction is most likely
         # to look soft or lose the natural jaw contour.
@@ -118,10 +124,15 @@ class MuseTalkBridge:
             os.getenv("MUSE_TALK_MOUTH_MASK_BOTTOM_FEATHER", "0.08")
         )
         self.color_match_strength = float(os.getenv("MUSE_TALK_COLOR_MATCH_STRENGTH", "0.65"))
-        self.cache_version = int(os.getenv("MUSE_TALK_CACHE_VERSION", "9"))
+        # Version 10 is the cache contract shared with avatar_bake.py.  Earlier
+        # prepared assets did not have the runtime manifest, so the first
+        # response rebuilt them despite preprocessing having completed.
+        self.cache_version = int(os.getenv("MUSE_TALK_CACHE_VERSION", "10"))
         self.mask_stabilize = os.getenv("MUSE_TALK_MASK_STABILIZE", "1") != "0"
         self.mask_stabilize_window = int(os.getenv("MUSE_TALK_MASK_STABILIZE_WINDOW", "5"))
-        self.default_temporal_smooth = float(os.getenv("MUSE_TALK_TEMPORAL_SMOOTH", "0.08"))
+        # Excess temporal averaging softens lip edges and teeth.  A small
+        # amount removes flicker without turning moving mouths into a blur.
+        self.default_temporal_smooth = float(os.getenv("MUSE_TALK_TEMPORAL_SMOOTH", "0.025"))
         self.temporal_smooth = self.default_temporal_smooth
         self.default_runtime_max_frame_edge = _env_int(
             "MUSE_TALK_RUNTIME_MAX_FRAME_EDGE",
@@ -251,6 +262,77 @@ class MuseTalkBridge:
             )
             return "legacy"
         return source
+
+    def configure_for_request(
+        self,
+        *,
+        preset: str | None = None,
+        face_scale: float | None = None,
+        temporal_smooth: float | None = None,
+        detail_sharpen: float | None = None,
+        infer_fps: float | None = None,
+        audio_history_sec: float | None = None,
+    ) -> None:
+        """Reset request-local rendering settings before a profile is loaded.
+
+        The engine is shared by profiles, so stale values from the previous
+        request must never affect a new avatar.  The preset controls only
+        compositing behaviour; it does not change the underlying MuseTalk
+        checkpoint or add a second inference pass.
+        """
+        preset_name = (preset or "realistic").strip().lower().replace("-", "_")
+        preset_defaults = {
+            # Crisp detail is the web default.  Landmark coordinates and a
+            # conservative blend retain the original jawline around the model
+            # generated mouth.
+            "realistic": ("baked", 0.025, 0.96, 0.70),
+            "balanced": ("baked", 0.045, 0.97, 0.64),
+            "low_latency": ("baked", 0.0, 0.98, 0.60),
+            "stable": ("baked", 0.09, 0.96, 0.62),
+        }
+        coord_source, default_smooth, default_scale, default_sharpen = preset_defaults.get(
+            preset_name,
+            preset_defaults["realistic"],
+        )
+        # An explicit server setting remains an intentional override for
+        # controlled deployments and benchmark runs.
+        self.coord_source = self._normalize_coord_source(
+            os.getenv("MUSE_TALK_COORD_SOURCE", coord_source)
+        )
+        self.temporal_smooth = float(
+            np.clip(
+                self.default_temporal_smooth if preset_name == "realistic" else default_smooth,
+                0.0,
+                0.35,
+            )
+        )
+        self.face_scale = float(
+            np.clip(
+                self.default_face_scale if preset_name == "realistic" else default_scale,
+                0.75,
+                1.15,
+            )
+        )
+        self.detail_sharpen = float(
+            np.clip(
+                self.default_detail_sharpen if preset_name == "realistic" else default_sharpen,
+                0.0,
+                0.95,
+            )
+        )
+        self.infer_fps = self.default_infer_fps
+        self.audio_history_sec = self.default_audio_history_sec
+
+        if face_scale is not None:
+            self.face_scale = float(np.clip(float(face_scale), 0.75, 1.15))
+        if temporal_smooth is not None:
+            self.temporal_smooth = float(np.clip(float(temporal_smooth), 0.0, 0.35))
+        if detail_sharpen is not None:
+            self.detail_sharpen = float(np.clip(float(detail_sharpen), 0.0, 0.95))
+        if infer_fps is not None:
+            self.infer_fps = float(np.clip(float(infer_fps), 6.0, 30.0))
+        if audio_history_sec is not None:
+            self.audio_history_sec = float(np.clip(float(audio_history_sec), 0.5, 6.0))
 
     @staticmethod
     def _coords_sha1(coords: np.ndarray) -> str:
@@ -877,7 +959,13 @@ class MuseTalkBridge:
             )
             if path.exists()
             else None
-            for path in (frames_path, coords_path, meta_path, cache_dir / "musetalk_runtime_meta.json")
+            for path in (
+                frames_path,
+                coords_path,
+                meta_path,
+                cache_dir / "musetalk_runtime_meta.json",
+                cache_dir / "musetalk_runtime_meta_baked.json",
+            )
         )
         if (
             self._loaded_cache_dir == cache_dir
@@ -960,6 +1048,12 @@ class MuseTalkBridge:
             coords_xyxy,
         )
         if cached is None:
+            logger.info(
+                "component=musetalk op=profile_cache status=miss profile=%s profile_type=%s source=%s",
+                profile,
+                profile_type,
+                coord_source,
+            )
             latents, mask_arrays, mask_crop_boxes = self._build_profile_cache(
                 profile,
                 profile_type,
@@ -971,6 +1065,12 @@ class MuseTalkBridge:
                 runtime_meta_path,
             )
         else:
+            logger.info(
+                "component=musetalk op=profile_cache status=hit profile=%s profile_type=%s source=%s",
+                profile,
+                profile_type,
+                coord_source,
+            )
             latents, mask_arrays, mask_crop_boxes = cached
 
         mask_arrays, mask_crop_boxes = self._stabilize_mask_sequence(

@@ -234,6 +234,35 @@ class _LipSyncEngineProtocol(Protocol):
     def sync_chunk(self, audio_16k: np.ndarray, fps: float | None = None) -> list[np.ndarray]: ...
 
 
+def _configure_musetalk_for_request(
+    lipsync: _LipSyncEngineProtocol,
+    *,
+    preset: str | None = None,
+    face_scale: float | None = None,
+    temporal_smooth: float | None = None,
+    detail_sharpen: float | None = None,
+    infer_fps: float | None = None,
+    audio_history_sec: float | None = None,
+) -> None:
+    """Apply request-local MuseTalk settings before profile assets are loaded.
+
+    MuseTalk keeps the selected profile in mutable process memory.  Applying
+    these settings after ``load_profile`` can pair a cache built for one
+    coordinate source with another renderer configuration, which causes an
+    avoidable first-request rebuild and soft mouth boundaries.
+    """
+    configure = getattr(lipsync, "configure_for_request", None)
+    if callable(configure):
+        configure(
+            preset=preset,
+            face_scale=face_scale,
+            temporal_smooth=temporal_smooth,
+            detail_sharpen=detail_sharpen,
+            infer_fps=infer_fps,
+            audio_history_sec=audio_history_sec,
+        )
+
+
 def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
     if hasattr(audio, "detach"):
         audio = audio.detach().cpu().numpy()
@@ -1375,6 +1404,7 @@ def _stream_avatar_from_text_iter(
     stop_event = threading.Event()
     _register_stream_stop_event(stop_event, workspace_id)
     profile_lock_acquired = False
+    profile_load_started = time.perf_counter()
     try:
         while not stop_event.is_set():
             if _lipsync_profile_lock.acquire(timeout=0.2):
@@ -1384,6 +1414,15 @@ def _stream_avatar_from_text_iter(
             raise HTTPException(status_code=499, detail="Generation interrupted before profile load.")
         lipsync = lipsync_cm.__enter__()
         with _lipsync_lock:
+            _configure_musetalk_for_request(
+                lipsync,
+                preset=req.musetalk_preset,
+                face_scale=req.musetalk_face_scale,
+                temporal_smooth=req.musetalk_temporal_smooth,
+                detail_sharpen=req.musetalk_detail_sharpen,
+                infer_fps=req.musetalk_infer_fps,
+                audio_history_sec=req.musetalk_audio_history_sec,
+            )
             lipsync.load_profile(profile, profile_type)
     except FileNotFoundError as exc:
         with contextlib.suppress(Exception):
@@ -1400,6 +1439,13 @@ def _stream_avatar_from_text_iter(
         _unregister_stream_stop_event(stop_event)
         raise
     is_musetalk = lipsync.__class__.__name__ == "MuseTalkBridge"
+    logger.info(
+        "component=stream op=profile_ready profile=%s profile_type=%s backend=%s load_ms=%.2f",
+        profile,
+        profile_type,
+        req.lipsync_backend or "default",
+        (time.perf_counter() - profile_load_started) * 1000.0,
+    )
     fps = req.avatar_fps or lipsync.fps
     if mobile_profile and req.avatar_fps is None:
         try:
@@ -1409,13 +1455,14 @@ def _stream_avatar_from_text_iter(
 
     profile_defaults = _load_profile_defaults(model_path) if model_path is not None else {}
     # Request-time MuseTalk knobs (ignored for Wav2Lip).
-    # Reset to defaults when no override is provided so stale in-memory values do not linger.
+    # Profile-sensitive settings were reset before load_profile.  The values
+    # below only control per-stream cadence and must not invalidate that cache.
     if is_musetalk:
         if req.musetalk_batch_size is not None:
             lipsync.batch_size = max(1, min(int(req.musetalk_batch_size), 128))
-        if req.musetalk_infer_fps is not None:
-            lipsync.infer_fps = max(6.0, min(float(req.musetalk_infer_fps), 30.0))
-        elif mobile_profile:
+        elif hasattr(lipsync, "batch_size"):
+            lipsync.batch_size = max(1, min(int(os.getenv("MUSE_TALK_BATCH_SIZE", "24")), 128))
+        if mobile_profile:
             try:
                 lipsync.infer_fps = max(
                     6.0,
@@ -1424,20 +1471,6 @@ def _stream_avatar_from_text_iter(
             except (TypeError, ValueError):
                 lipsync.infer_fps = max(6.0, min(float(lipsync.infer_fps), 20.0))
 
-        default_face_scale = float(
-            profile_defaults.get(
-                "musetalk_face_scale",
-                os.getenv("MUSE_TALK_FACE_SCALE", "1.0"),
-            )
-        )
-        lipsync.face_scale = max(0.75, min(default_face_scale, 1.15))
-        if req.musetalk_face_scale is not None:
-            lipsync.face_scale = max(0.75, min(float(req.musetalk_face_scale), 1.15))
-
-        if req.musetalk_audio_history_sec is not None:
-            lipsync.audio_history_sec = max(
-                0.5, min(float(req.musetalk_audio_history_sec), 6.0)
-            )
     if is_musetalk and req.musetalk_max_chunk_chars is not None:
         max_chars = req.musetalk_max_chunk_chars
     elif req.max_chunk_chars is not None:
@@ -1721,6 +1754,7 @@ def _stream_avatar_from_text_iter(
                             is_first_tts_chunk,
                             chatterbox_settings,
                         )
+                        tts_started = time.perf_counter()
                         while True:
                             if stop_event.is_set():
                                 future.cancel()
@@ -1733,6 +1767,15 @@ def _stream_avatar_from_text_iter(
                         tts_chunk_index += 1
                         if audio is None or audio.size == 0:
                             continue
+                        if is_first_tts_chunk:
+                            logger.info(
+                                "component=stream op=first_tts_chunk profile=%s backend=%s tts_ms=%.2f elapsed_ms=%.2f chars=%d",
+                                profile,
+                                tts_backend,
+                                (time.perf_counter() - tts_started) * 1000.0,
+                                (time.perf_counter() - start_time) * 1000.0,
+                                len(chunk),
+                            )
                         audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
                         if smart_trim_db and smart_trim_db > 0:
                             audio = _smart_vad_trim(
@@ -1819,6 +1862,7 @@ def _stream_avatar_from_text_iter(
                 else 0
             )
 
+            lipsync_started = time.perf_counter()
             if SILENCE_CULLING_ENABLED and rms < SILENCE_RMS_THRESHOLD and last_frame is not None:
                 frames = [last_frame.copy() for _ in range(frames_needed)]
             else:
@@ -1856,6 +1900,7 @@ def _stream_avatar_from_text_iter(
                             f.copy() for f in frames[-musetalk_frame_crossfade:]
                         ]
                     last_frame = frames[-1].copy()
+            lipsync_elapsed_ms = (time.perf_counter() - lipsync_started) * 1000.0
             frame_payloads: list[str] = []
             frame_blobs: list[bytes] = []
             for frame in frames:
@@ -1879,6 +1924,16 @@ def _stream_avatar_from_text_iter(
 
             wav_bytes = _audio_to_wav_bytes(sub_audio, engine.sample_rate)
             duration_sec = float(len(sub_audio) / engine.sample_rate) if sub_audio.size else 0.0
+            if emit_index == 0:
+                logger.info(
+                    "component=stream op=first_media_chunk profile=%s backend=%s elapsed_ms=%.2f lipsync_ms=%.2f frames=%d duration_sec=%.3f",
+                    profile,
+                    req.lipsync_backend or "default",
+                    (time.perf_counter() - start_time) * 1000.0,
+                    lipsync_elapsed_ms,
+                    len(frames),
+                    duration_sec,
+                )
             if binary_transport:
                 metadata = {
                     "event": "chunk",
@@ -2287,8 +2342,11 @@ class GenerateRequest(BaseModel):
     avatar_profile: str | None = None
     avatar_fps: float | None = None
     avatar_max_frame_edge: int | None = None
+    musetalk_preset: str | None = None
     musetalk_batch_size: int | None = None
     musetalk_infer_fps: float | None = None
+    musetalk_temporal_smooth: float | None = None
+    musetalk_detail_sharpen: float | None = None
     musetalk_stream_window_sec: float | None = None
     musetalk_lookahead_sec: float | None = None
     musetalk_jpeg_quality: int | None = None
@@ -2336,6 +2394,7 @@ class WarmupRequest(BaseModel):
     profile_type: str | None = None
     tts_backend: str | None = None
     lipsync_backend: str | None = None
+    musetalk_preset: str | None = None
     llm_mode: str | None = None
     force: bool = False
     include_llm: bool = False
@@ -3351,12 +3410,17 @@ def _warmup_lipsync(
     profile_type: str,
     requested_backend: str | None = None,
     warmup_audio_16k: np.ndarray | None = None,
+    musetalk_preset: str | None = None,
 ) -> str:
     backend = _resolve_lipsync_backend(requested_backend)
     try:
         with _lipsync_profile_lock:
             with _acquire_lipsync_engine(backend) as lipsync:
                 with _lipsync_lock:
+                    _configure_musetalk_for_request(
+                        lipsync,
+                        preset=musetalk_preset,
+                    )
                     lipsync.load_profile(profile, profile_type)
                     audio_16k = warmup_audio_16k
                     if audio_16k is None or audio_16k.size == 0:
@@ -3375,6 +3439,7 @@ def _warmup_profile(
     requested_backend: str | None = None,
     force: bool = False,
     tts_backend: str | None = None,
+    musetalk_preset: str | None = None,
 ) -> dict[str, object]:
     with _warmup_profile_lock:
         resolved_tts_backend = _resolve_tts_backend(tts_backend)
@@ -3447,7 +3512,13 @@ def _warmup_profile(
         if profile_type == PROFILE_TYPE_AVATAR:
             backend = _resolve_lipsync_backend(requested_backend)
             resolved_backend = backend
-            lipsync_key = (profile, profile_type, backend, current_workspace_id())
+            lipsync_key = (
+                profile,
+                profile_type,
+                backend,
+                current_workspace_id(),
+                (musetalk_preset or "realistic").strip().lower(),
+            )
             lipsync_hot_before = _lipsync_profile_is_hot(
                 profile,
                 profile_type,
@@ -3459,6 +3530,7 @@ def _warmup_profile(
                     profile_type,
                     backend,
                     warmup_audio_16k=warmup_audio_16k,
+                    musetalk_preset=musetalk_preset,
                 )
                 warmed_lipsync = True
                 _warmed_lipsync_profiles.add(lipsync_key)
@@ -3517,6 +3589,7 @@ def warmup(req: WarmupRequest):
         requested_backend=req.lipsync_backend,
         force=bool(req.force),
         tts_backend=req.tts_backend,
+        musetalk_preset=req.musetalk_preset,
     )
     llm_hot_before = None
     llm_warmed = False
