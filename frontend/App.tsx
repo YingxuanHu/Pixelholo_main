@@ -2688,15 +2688,18 @@ const App: React.FC = () => {
                     </div>
                     {cameraState === 'requesting' && <div className="ph-camera-overlay">Opening camera…</div>}
                     {cameraState === 'idle' && (
-                      <button
-                        type="button"
-                        className="ph-camera-overlay ph-camera-enable-overlay"
-                        onClick={() => void openCamera()}
-                        disabled={profileNameTaken || isBusy}
-                      >
-                        <strong>Enable camera &amp; microphone</strong>
-                        <small>Your browser will ask for permission.</small>
-                      </button>
+                      <div className="ph-camera-overlay ph-camera-permission">
+                        <button
+                          type="button"
+                          className="ph-camera-enable-button"
+                          onClick={() => void openCamera()}
+                          disabled={profileNameTaken || isBusy}
+                        >
+                          <span aria-hidden="true">◉</span>
+                          Enable camera
+                        </button>
+                        <small>Camera + microphone permission required</small>
+                      </div>
                     )}
                     {cameraState === 'recorded' && <div className="ph-camera-captured-badge">Recording captured · looping preview</div>}
                   </div>
@@ -2704,7 +2707,7 @@ const App: React.FC = () => {
                   <p className="ph-camera-instructions">Face straight toward the camera, use bright even light from in front of you, keep your eyes and mouth visible, and speak naturally in a quiet room. Avoid a bright window behind you.</p>
                   {cameraError && <div className="ph-minimal-error">{cameraError}</div>}
                   <div className="ph-camera-actions">
-                    {(cameraState === 'idle' || cameraState === 'error') && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Enable camera &amp; microphone</button>}
+                    {cameraState === 'error' && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Try camera again</button>}
                     {cameraState === 'ready' && <button type="button" className="ph-minimal-primary" onClick={startCameraRecording} disabled={isBusy}>Start recording<span>●</span></button>}
                     {cameraState === 'recording' && <button type="button" className="ph-minimal-record-stop" onClick={stopCameraRecording}>Stop and use recording<span>■</span></button>}
                     {cameraState === 'recorded' && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={isBusy}>Record again</button>}

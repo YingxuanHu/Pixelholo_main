@@ -353,12 +353,13 @@ button:disabled { cursor: not-allowed; }
 .ph-camera-head-frame { width: 46%; height: 72%; border: 2px dashed rgba(219,250,242,.88); border-radius: 48% 48% 43% 43%; box-shadow: 0 0 0 999px rgba(9,22,19,.24); }
 .ph-camera-guide small { margin-top: 10px; padding: 4px 7px; border-radius: 4px; color: #e5f5f1; background: rgba(15,29,25,.62); font-size: 9px; }
 .ph-camera-overlay { position: absolute; inset: 0; z-index: 3; display: grid; place-items: center; color: #e3f5f1; background: rgba(17,31,27,.72); font-size: 12px; font-weight: 700; text-align: center; }
-.ph-camera-enable-overlay { gap: 5px; border: 0; cursor: pointer; font: inherit; transition: background .18s ease; }
-.ph-camera-enable-overlay strong { font-size: 13px; }
-.ph-camera-enable-overlay small { color: #b9d8d0; font-size: 10px; font-weight: 500; }
-.ph-camera-enable-overlay:hover:not(:disabled) { background: rgba(8,127,114,.78); }
-.ph-camera-enable-overlay:focus-visible { outline: 3px solid #d1f3eb; outline-offset: -6px; }
-.ph-camera-enable-overlay:disabled { cursor: not-allowed; }
+.ph-camera-permission { display: flex; flex-direction: column; gap: 10px; background: linear-gradient(rgba(17,31,27,.28), rgba(17,31,27,.48)); pointer-events: none; }
+.ph-camera-enable-button { display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px; border: 1px solid rgba(170,226,214,.54); border-radius: 999px; color: #effbf8; background: #087f72; box-shadow: 0 8px 18px rgba(2,38,33,.28); font: 700 12px 'DM Sans', system-ui, sans-serif; cursor: pointer; pointer-events: auto; transition: .18s ease; }
+.ph-camera-enable-button span { color: #a8ecdf; font-size: 14px; line-height: 1; }
+.ph-camera-enable-button:hover:not(:disabled) { background: #07584f; transform: translateY(-1px); }
+.ph-camera-enable-button:focus-visible { outline: 3px solid #d1f3eb; outline-offset: 3px; }
+.ph-camera-enable-button:disabled { cursor: not-allowed; opacity: .45; }
+.ph-camera-permission small { color: #b9d8d0; font-size: 10px; font-weight: 500; }
 .ph-camera-captured-badge { position: absolute; top: 10px; left: 50%; z-index: 3; transform: translateX(-50%); padding: 6px 9px; border: 1px solid rgba(220,249,242,.58); border-radius: 999px; color: #e3f5f1; background: rgba(8,127,114,.84); box-shadow: 0 4px 14px rgba(4,28,23,.18); font-size: 10px; font-weight: 700; white-space: nowrap; }
 .ph-camera-meta { display: flex; justify-content: space-between; gap: 10px; margin-top: 10px; color: #697872; font: 500 9px 'DM Mono', monospace; }
 .ph-camera-meta strong { color: #087f72; font-weight: 600; }
