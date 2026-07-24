@@ -145,10 +145,10 @@ const DEFAULT_TTS_BACKEND: TTSBackend = 'chatterbox';
 const DEFAULT_LLM_MODE: LLMMode = 'legacy_fast';
 const DEFAULT_MUSETALK_PRESET: MuseTalkPreset = 'realistic';
 const LLM_MODE_OPTIONS: { value: LLMMode; label: string }[] = [
-  { value: 'legacy_fast', label: 'Llama 3.1 8B Instant (Cutoff)' },
-  { value: 'live_search', label: 'GPT-4o Mini (Live Search)' },
-  { value: 'gemini_search', label: 'Gemini 2.5 Flash Lite (Live Search)' },
-  { value: 'auto', label: 'Auto (Llama/GPT/Gemini)' },
+  { value: 'legacy_fast', label: 'Llama 3.1 8B Instant · Static' },
+  { value: 'live_search', label: 'GPT-4o Mini · Live' },
+  { value: 'gemini_search', label: 'Gemini 2.5 Flash Lite · Live' },
+  { value: 'auto', label: 'Auto · Smart' },
 ];
 const DEFAULT_AVATAR_START_SEC = 0;
 const DEFAULT_AVATAR_LOOP_SEC = 20;
