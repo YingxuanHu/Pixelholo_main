@@ -249,6 +249,23 @@ def _sanitize_xyxy(box: tuple[int, int, int, int], width: int, height: int) -> t
     return x1, y1, x2, y2
 
 
+def _legacy_coords_to_xyxy(
+    coords_y1y2x1x2: np.ndarray,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Convert the detector's persisted full-face boxes to MuseTalk xyxy boxes.
+
+    `coords.npy` is stored in Wav2Lip's y1/y2/x1/x2 order.  MuseTalk itself
+    expects the complete detected face, not the tighter lower-face landmark
+    box used for an earlier visual experiment.
+    """
+    converted: list[list[int]] = []
+    for y1, y2, x1, x2 in np.asarray(coords_y1y2x1x2, dtype=np.int32):
+        converted.append(list(_sanitize_xyxy((int(x1), int(y1), int(x2), int(y2)), width, height)))
+    return np.asarray(converted, dtype=np.int32)
+
+
 def _align_mask_to_crop(
     mask: np.ndarray,
     crop_box: list[int],
@@ -488,8 +505,14 @@ def bake_musetalk_assets(
     settings = _musetalk_runtime_cache_settings()
     frame_h, frame_w = frames.shape[1:3]
 
-    coords_xyxy = _build_musetalk_boxes(frames, base_coords_y1y2x1x2)
-    np.save(cache_dir / "musetalk_coords.npy", coords_xyxy)
+    # MuseTalk's latent and mask cache must be prepared from the same
+    # full-face coordinate source used at inference.  The landmark-stabilized
+    # lower-face box is kept separately for diagnostics, but using it as the
+    # primary crop strips model context and can make generated lips appear
+    # unchanged from the recorded source video.
+    primary_coords_xyxy = _legacy_coords_to_xyxy(base_coords_y1y2x1x2, frame_w, frame_h)
+    landmark_coords_xyxy = _build_musetalk_boxes(frames, base_coords_y1y2x1x2)
+    np.save(cache_dir / "musetalk_coords.npy", landmark_coords_xyxy)
     _report_progress(progress, 0.08, "Aligning face frames")
 
     latents: list[torch.Tensor] = []
@@ -498,7 +521,7 @@ def bake_musetalk_assets(
 
     total_frames = max(1, len(frames))
     report_every = max(1, total_frames // 24)
-    for index, (frame, coord) in enumerate(zip(frames, coords_xyxy), start=1):
+    for index, (frame, coord) in enumerate(zip(frames, primary_coords_xyxy), start=1):
         raw_coord = _sanitize_xyxy(tuple(int(v) for v in coord), frame_w, frame_h)
         x1, y1, x2, y2 = _expand_musetalk_coord(
             raw_coord,
@@ -533,10 +556,10 @@ def bake_musetalk_assets(
             )
 
     _report_progress(progress, 0.96, "Saving lip-sync assets")
-    # The "_baked" suffix is the runtime cache suffix selected when
-    # MUSE_TALK_COORD_SOURCE=baked.  It intentionally does not overwrite a
-    # legacy detector-coordinate cache from older profiles.
-    cache_suffix = "_baked"
+    # No suffix is the runtime cache selected by the default full-face
+    # `legacy` coordinate source.  Preparing it here prevents a long cache
+    # rebuild the first time a newly created avatar is selected.
+    cache_suffix = ""
     latents_path = cache_dir / f"musetalk_latents{cache_suffix}.pt"
     masks_path = cache_dir / f"musetalk_masks{cache_suffix}.pkl"
     runtime_meta_path = cache_dir / f"musetalk_runtime_meta{cache_suffix}.json"
@@ -547,7 +570,7 @@ def bake_musetalk_assets(
                 "cache_version": int(settings["cache_version"]),
                 "coord_format": "xyxy",
                 "coords_sha1": hashlib.sha1(
-                    coords_xyxy.astype(np.int32, copy=False).tobytes()
+                    primary_coords_xyxy.astype(np.int32, copy=False).tobytes()
                 ).hexdigest(),
                 "parsing_mode": str(settings["parsing_mode"]),
                 "mask_arrays": mask_arrays,
@@ -561,7 +584,7 @@ def bake_musetalk_assets(
                 "cache_version": int(settings["cache_version"]),
                 "coord_format": "xyxy",
                 "coords_sha1": hashlib.sha1(
-                    coords_xyxy.astype(np.int32, copy=False).tobytes()
+                    primary_coords_xyxy.astype(np.int32, copy=False).tobytes()
                 ).hexdigest(),
                 "parsing_mode": str(settings["parsing_mode"]),
                 "coord_expand_x": float(settings["coord_expand_x"]),

@@ -85,12 +85,14 @@ class MuseTalkBridge:
         # (low infer fps + frame upsampling reduces base-frame progression speed).
         self.default_infer_fps = float(os.getenv("MUSE_TALK_INFER_FPS", "25.0"))
         self.infer_fps = self.default_infer_fps
-        # Avatar preparation writes landmark-stabilized MuseTalk coordinates.
-        # Prefer them at runtime: they are centred on the lower face rather
-        # than a broad detector rectangle, which preserves more of the source
-        # chin while giving the model a stable mouth target.
+        # MuseTalk was trained with a full-face crop.  A lower-face-only crop
+        # can look superficially sharper, but it removes the face context the
+        # diffusion model needs and can reduce a generated response to what
+        # appears to be the unmodified source clip.  Keep the detector's full
+        # face box as the default; the landmark crop remains available only as
+        # an explicit diagnostic/experimental override.
         self.default_coord_source = self._normalize_coord_source(
-            os.getenv("MUSE_TALK_COORD_SOURCE", "baked")
+            os.getenv("MUSE_TALK_COORD_SOURCE", "legacy")
         )
         self.coord_source = self.default_coord_source
 
@@ -282,13 +284,14 @@ class MuseTalkBridge:
         """
         preset_name = (preset or "realistic").strip().lower().replace("-", "_")
         preset_defaults = {
-            # Crisp detail is the web default.  Landmark coordinates and a
-            # conservative blend retain the original jawline around the model
-            # generated mouth.
-            "realistic": ("baked", 0.025, 0.96, 0.70),
-            "balanced": ("baked", 0.045, 0.97, 0.64),
-            "low_latency": ("baked", 0.0, 0.98, 0.60),
-            "stable": ("baked", 0.09, 0.96, 0.62),
+            # All supported presentation presets retain MuseTalk's required
+            # full-face context.  A lower-face landmark crop is still
+            # selectable through MUSE_TALK_COORD_SOURCE=baked for controlled
+            # experiments, never as the user-facing default.
+            "realistic": ("legacy", 0.025, 0.96, 0.70),
+            "balanced": ("legacy", 0.045, 0.97, 0.64),
+            "low_latency": ("legacy", 0.0, 0.98, 0.60),
+            "stable": ("legacy", 0.09, 0.96, 0.62),
         }
         coord_source, default_smooth, default_scale, default_sharpen = preset_defaults.get(
             preset_name,
@@ -1445,6 +1448,20 @@ class MuseTalkBridge:
                         )
                         output_frames.append(frame)
                     cursor += 1
+
+        # Never make a compositing failure look like a successful lip-sync
+        # response.  Returning only untouched source frames is particularly
+        # misleading to users because the audio continues normally while the
+        # video appears to be a slow source-video loop.
+        if frames and len(output_frames) == len(frames):
+            untouched = sum(
+                int(np.array_equal(output, source))
+                for output, source in zip(output_frames, frames)
+            )
+            if untouched == len(frames):
+                raise RuntimeError(
+                    "MuseTalk could not composite generated face frames; refusing to stream the source video as lip-sync output."
+                )
 
         if output_target_frames > 0 and output_frames and output_target_frames != len(output_frames):
             idx = np.linspace(0, len(output_frames) - 1, output_target_frames)
