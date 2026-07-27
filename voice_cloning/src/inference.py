@@ -1439,6 +1439,7 @@ def _stream_avatar_from_text_iter(
         _unregister_stream_stop_event(stop_event)
         raise
     is_musetalk = lipsync.__class__.__name__ == "MuseTalkBridge"
+    is_wav2lip = lipsync.__class__.__name__ == "LipSyncBridge"
     logger.info(
         "component=stream op=profile_ready profile=%s profile_type=%s backend=%s load_ms=%.2f",
         profile,
@@ -1570,12 +1571,16 @@ def _stream_avatar_from_text_iter(
                 )
             except (TypeError, ValueError):
                 first_chunk_max_chars = max(8, min(int(first_chunk_max_chars), 48))
-    musetalk_window_sec = 0.0
+    # Emit bounded audio/video windows instead of making the browser wait for
+    # an entire TTS sentence. MuseTalk already used this path. Wav2Lip needs it
+    # even more: rendering a multi-second batch before the first response made
+    # its output arrive after the audio would have finished playing.
+    stream_window_sec = 0.0
     if is_musetalk:
         if req.musetalk_stream_window_sec is not None:
-            musetalk_window_sec = max(0.2, min(float(req.musetalk_stream_window_sec), 3.0))
+            stream_window_sec = max(0.2, min(float(req.musetalk_stream_window_sec), 3.0))
         else:
-            musetalk_window_sec = float(
+            stream_window_sec = float(
                 profile_defaults.get(
                     "musetalk_stream_window_sec",
                     os.getenv("MUSE_TALK_STREAM_WINDOW_SEC", "1.2"),
@@ -1583,15 +1588,35 @@ def _stream_avatar_from_text_iter(
             )
         if mobile_profile and req.musetalk_stream_window_sec is None:
             try:
-                musetalk_window_sec = max(
+                stream_window_sec = max(
                     0.2,
                     min(
-                        float(musetalk_window_sec),
+                        float(stream_window_sec),
                         float(os.getenv("IOS_STREAM_MUSETALK_WINDOW_SEC", "0.55")),
                     ),
                 )
             except (TypeError, ValueError):
-                musetalk_window_sec = max(0.2, min(float(musetalk_window_sec), 0.55))
+                stream_window_sec = max(0.2, min(float(stream_window_sec), 0.55))
+    elif is_wav2lip:
+        # Wav2Lip is a compatibility renderer rather than the default path.
+        # Its full-sentence batches are expensive enough to cause an audible
+        # buffer gap, so use short windows by default. This may be overridden
+        # per profile for hardware that benefits from a larger batch.
+        try:
+            stream_window_sec = max(
+                0.4,
+                min(
+                    float(
+                        profile_defaults.get(
+                            "wav2lip_stream_window_sec",
+                            os.getenv("WAV2LIP_STREAM_WINDOW_SEC", "1.0"),
+                        )
+                    ),
+                    3.0,
+                ),
+            )
+        except (TypeError, ValueError):
+            stream_window_sec = 1.0
     musetalk_lookahead_sec = 0.0
     if is_musetalk:
         if req.musetalk_lookahead_sec is not None:
@@ -1648,7 +1673,7 @@ def _stream_avatar_from_text_iter(
         max_chars,
         max_words,
         getattr(lipsync, "infer_fps", None) if is_musetalk else "n/a",
-        round(float(musetalk_window_sec), 3) if is_musetalk else "n/a",
+        round(float(stream_window_sec), 3) if (is_musetalk or is_wav2lip) else "n/a",
         round(float(musetalk_lookahead_sec), 3) if is_musetalk else "n/a",
         first_chunk_max_chars if is_musetalk else "n/a",
         jpeg_quality,
@@ -1660,6 +1685,13 @@ def _stream_avatar_from_text_iter(
             maxsize=3
         )
         sentence_queue: queue.Queue[str | None] = queue.Queue(maxsize=10)
+        # Chatterbox and Wav2Lip both use CUDA. Letting the TTS worker start
+        # the next diffusion pass while Wav2Lip renders the current one turned
+        # a sub-second Wav2Lip batch into a multi-second stall. Serialize just
+        # these two GPU stages; MuseTalk keeps its existing overlap behavior.
+        serialize_wav2lip_gpu = is_wav2lip and torch.cuda.is_available()
+        tts_gpu_gate = threading.Event()
+        tts_gpu_gate.set()
         engine_cm = _acquire_tts_engine(req, model_path, config_path)
         chatterbox_settings = (
             float(req.tts_exaggeration) if req.tts_exaggeration is not None else 0.35,
@@ -1734,6 +1766,11 @@ def _stream_avatar_from_text_iter(
                     for chunk in sentence_chunks:
                         if stop_event.is_set():
                             return
+                        if serialize_wav2lip_gpu:
+                            while not stop_event.is_set() and not tts_gpu_gate.wait(timeout=0.2):
+                                pass
+                            if stop_event.is_set():
+                                return
                         if pad_text:
                             chunk = f"{pad_text_token} {chunk} {pad_text_token}"
                         is_first_tts_chunk = tts_chunk_index == 0
@@ -1803,6 +1840,10 @@ def _stream_avatar_from_text_iter(
                                 stitched, orig_sr=engine.sample_rate, target_sr=16000
                             )
                             _put_result("data", idx, stitched, audio_16k.astype(np.float32))
+                            if serialize_wav2lip_gpu:
+                                # Do not let the next Chatterbox pass contend
+                                # with the matching Wav2Lip render.
+                                tts_gpu_gate.clear()
                             idx += 1
                 tail = stitcher.flush()
                 if tail.size and not stop_event.is_set():
@@ -1966,9 +2007,9 @@ def _stream_avatar_from_text_iter(
             comma_pause_ms = max(50.0, float(pause_ms) * 0.35)
             comma_pause = np.zeros(int(engine.sample_rate * (comma_pause_ms / 1000.0)), dtype=np.float32)
             stitcher = AudioStitcher(sample_rate=engine.sample_rate, fade_len_ms=15.0)
-            if is_musetalk and musetalk_window_sec > 0:
-                window_src_samples = max(1, int(round(engine.sample_rate * musetalk_window_sec)))
-                window_tgt_samples = max(1, int(round(16000.0 * musetalk_window_sec)))
+            if stream_window_sec > 0:
+                window_src_samples = max(1, int(round(engine.sample_rate * stream_window_sec)))
+                window_tgt_samples = max(1, int(round(16000.0 * stream_window_sec)))
             if is_musetalk and musetalk_lookahead_sec > 0:
                 lookahead_src_samples = max(0, int(round(engine.sample_rate * musetalk_lookahead_sec)))
                 lookahead_tgt_samples = max(0, int(round(16000.0 * musetalk_lookahead_sec)))
@@ -1993,18 +2034,31 @@ def _stream_avatar_from_text_iter(
                         yield json.dumps({"event": "error", "detail": detail}) + "\n"
                     break
                 if kind == "done":
-                    if is_musetalk and pending_audio.size and pending_audio_16k.size:
+                    if stream_window_sec > 0 and pending_audio.size and pending_audio_16k.size:
                         yield from _emit_one(pending_audio, pending_audio_16k)
+                        if serialize_wav2lip_gpu:
+                            tts_gpu_gate.set()
                     break
 
                 if audio is None or audio_16k is None:
                     continue
 
-                if is_musetalk and window_src_samples > 0 and window_tgt_samples > 0:
+                if stream_window_sec > 0 and window_src_samples > 0 and window_tgt_samples > 0:
                     pending_audio = np.concatenate([pending_audio, audio.astype(np.float32, copy=False)])
                     pending_audio_16k = np.concatenate(
                         [pending_audio_16k, audio_16k.astype(np.float32, copy=False)]
                     )
+                    # A very short TTS fragment cannot be rendered yet. Allow
+                    # the worker to produce just enough additional audio, but
+                    # pause it again before the first Wav2Lip batch starts.
+                    if (
+                        serialize_wav2lip_gpu
+                        and (
+                            pending_audio.size < window_src_samples
+                            or pending_audio_16k.size < window_tgt_samples
+                        )
+                    ):
+                        tts_gpu_gate.set()
                     while (
                         pending_audio.size >= window_src_samples
                         and pending_audio_16k.size >= window_tgt_samples
@@ -2024,8 +2078,12 @@ def _stream_avatar_from_text_iter(
                         pending_audio = pending_audio[window_src_samples:]
                         pending_audio_16k = pending_audio_16k[window_tgt_samples:]
                         yield from _emit_one(sub_audio, sub_audio_16k, lookahead_16k=lookahead_16k)
+                        if serialize_wav2lip_gpu:
+                            tts_gpu_gate.set()
                 else:
                     yield from _emit_one(audio, audio_16k)
+                    if serialize_wav2lip_gpu:
+                        tts_gpu_gate.set()
         except Exception:
             logger.exception("Avatar stream failed")
             if binary_transport:
