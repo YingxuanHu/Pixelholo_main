@@ -424,6 +424,10 @@ const App: React.FC = () => {
   const audioUnlockedRef = useRef<boolean>(false);
   const streamAbortRef = useRef<AbortController | null>(null);
   const streamRunningRef = useRef(false);
+  // React state is asynchronous. Keep a synchronous lock from the instant a
+  // prompt is submitted through the end of playback so repeated Enter presses
+  // cannot queue several copies while profile warm-up is still pending.
+  const inferenceSubmissionRef = useRef(false);
   const streamSessionRef = useRef<number>(0);
   const isBusy = Object.values(stepStatuses).some(status => status === 'running');
   // A backend `done` event means all media has been delivered, not that the
@@ -1710,6 +1714,7 @@ const App: React.FC = () => {
       }
       playbackSettleTimerRef.current = null;
       setIsPlaybackActive(false);
+      inferenceSubmissionRef.current = false;
       setStepStatuses(prev => ({ ...prev, inference: 'done' }));
       videoStateRef.current = 'idle';
       setVideoState('idle');
@@ -1919,6 +1924,10 @@ const App: React.FC = () => {
 
   const runInference = useCallback(async (text: string, endpoint: string) => {
     if (!profile.name || !text) return;
+    // Textareas still receive Enter while the visible controls are updating.
+    // This ref closes that gap during warm-up, streaming, and queued playback.
+    if (inferenceSubmissionRef.current) return;
+    inferenceSubmissionRef.current = true;
     const selectionId = profileSelectionRef.current;
     const requestProfileName = profile.name;
     const requestProfileType = profileType;
@@ -1940,10 +1949,14 @@ const App: React.FC = () => {
       try {
         await warmupProfile(requestProfileName, requestProfileType);
       } catch (error) {
+        inferenceSubmissionRef.current = false;
         setUiNotice(`Could not prepare ${requestProfileName}: ${String(error)}`);
         return;
       }
-      if (selectionId !== profileSelectionRef.current) return;
+      if (selectionId !== profileSelectionRef.current) {
+        inferenceSubmissionRef.current = false;
+        return;
+      }
     }
     setUiNotice(null);
     clearPlaybackSettleTimer();
@@ -1951,10 +1964,14 @@ const App: React.FC = () => {
     await unlockAudio();
     // Profile selection can happen while the browser is unlocking audio. Do
     // not let this stale invocation create a stream with the old voice.
-    if (selectionId !== profileSelectionRef.current) return;
+    if (selectionId !== profileSelectionRef.current) {
+      inferenceSubmissionRef.current = false;
+      return;
+    }
     if (audioContextRef.current?.state !== 'running') {
       clearPlaybackSettleTimer();
       setIsPlaybackActive(false);
+      inferenceSubmissionRef.current = false;
       setUiNotice('Safari blocked audio. Click again to enable sound.');
       return;
     }
@@ -1980,7 +1997,10 @@ const App: React.FC = () => {
       streamAbortRef.current.abort();
       await interruptBackend();
     }
-    if (selectionId !== profileSelectionRef.current) return;
+    if (selectionId !== profileSelectionRef.current) {
+      inferenceSubmissionRef.current = false;
+      return;
+    }
     const controller = new AbortController();
     streamAbortRef.current = controller;
     streamRunningRef.current = true;
@@ -2049,6 +2069,7 @@ const App: React.FC = () => {
       sawError = true;
       clearPlaybackSettleTimer();
       setIsPlaybackActive(false);
+      inferenceSubmissionRef.current = false;
       setStepStatuses(prev => ({ ...prev, inference: 'error' }));
       setInferenceStageIndex(null);
     };
@@ -2232,6 +2253,7 @@ const App: React.FC = () => {
         });
       }
     } catch (err) {
+      inferenceSubmissionRef.current = false;
       if ((err as Error).name !== 'AbortError') {
         clearPlaybackSettleTimer();
         setIsPlaybackActive(false);
@@ -2286,6 +2308,7 @@ const App: React.FC = () => {
     if (streamAbortRef.current) streamAbortRef.current.abort();
     streamAbortRef.current = null;
     streamRunningRef.current = false;
+    inferenceSubmissionRef.current = false;
     // Invalidate stale stream callbacks before waiting for the backend's
     // best-effort interrupt response.
     streamSessionRef.current += 1;
@@ -2425,7 +2448,7 @@ const App: React.FC = () => {
 
   const sendComposerText = async () => {
     const text = inferenceText.trim();
-    if (!text) return;
+    if (!text || inferenceSubmissionRef.current) return;
     await runInference(text, composerMode === 'chat' ? '/chat' : '/speak');
   };
 
@@ -2490,6 +2513,7 @@ const App: React.FC = () => {
     }
     profileSelectionRef.current += 1;
     streamSessionRef.current += 1;
+    inferenceSubmissionRef.current = false;
     stopListeningRef.current?.();
     stopListening();
     stopAllAudio();
