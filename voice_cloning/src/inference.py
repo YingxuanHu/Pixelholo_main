@@ -203,17 +203,35 @@ _profile_mutation_locks: dict[tuple[str, str, str], threading.Lock] = {}
 _runtime_cleanup_thread_started = False
 
 
-def _acquire_profile_mutation_lock(profile: str, profile_type: str) -> tuple[threading.Lock, str]:
+def _acquire_profile_mutation_locks(
+    profiles: list[str], profile_type: str
+) -> tuple[list[threading.Lock], str]:
     workspace_id = current_workspace_id()
-    key = (workspace_id, profile_type, profile)
+    keys = sorted({(workspace_id, profile_type, profile) for profile in profiles})
     with _profile_mutation_locks_guard:
-        lock = _profile_mutation_locks.setdefault(key, threading.Lock())
-    if not lock.acquire(blocking=False):
+        locks = [_profile_mutation_locks.setdefault(key, threading.Lock()) for key in keys]
+    acquired: list[threading.Lock] = []
+    for lock in locks:
+        if lock.acquire(blocking=False):
+            acquired.append(lock)
+            continue
+        for held_lock in reversed(acquired):
+            held_lock.release()
         raise HTTPException(
             status_code=409,
             detail="This profile is already being updated. Wait for the current action to finish.",
         )
-    return lock, workspace_id
+    return acquired, workspace_id
+
+
+def _release_profile_mutation_locks(locks: list[threading.Lock]) -> None:
+    for lock in reversed(locks):
+        lock.release()
+
+
+def _acquire_profile_mutation_lock(profile: str, profile_type: str) -> tuple[threading.Lock, str]:
+    locks, workspace_id = _acquire_profile_mutation_locks([profile], profile_type)
+    return locks[0], workspace_id
 
 
 def _register_stream_stop_event(
@@ -3781,26 +3799,30 @@ def delete_profile(profile_name: str, profile_type: str | None = None):
                 status_code=409,
                 detail="Cannot delete profile while generation is running. Stop generation first.",
             )
-    paths = _profile_paths(profile, ptype)
-    existing = [path for path in paths if path.exists()]
-    if not existing:
-        raise HTTPException(status_code=404, detail="Profile not found")
+    locks, _workspace_id = _acquire_profile_mutation_locks([profile], ptype)
+    try:
+        paths = _profile_paths(profile, ptype)
+        existing = [path for path in paths if path.exists()]
+        if not existing:
+            raise HTTPException(status_code=404, detail="Profile not found")
 
-    removed: list[str] = []
-    for path in existing:
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink(missing_ok=True)
-        removed.append(str(path))
+        removed: list[str] = []
+        for path in existing:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+            removed.append(str(path))
 
-    _drop_warmup_cache_for_profile(profile, ptype)
-    return {
-        "status": "ok",
-        "profile": profile,
-        "profile_type": ptype,
-        "removed_paths": removed,
-    }
+        _drop_warmup_cache_for_profile(profile, ptype)
+        return {
+            "status": "ok",
+            "profile": profile,
+            "profile_type": ptype,
+            "removed_paths": removed,
+        }
+    finally:
+        _release_profile_mutation_locks(locks)
 
 
 @app.patch("/profiles/{profile_name}")
@@ -3822,49 +3844,52 @@ def rename_profile(profile_name: str, req: ProfileRenameRequest):
                 status_code=409,
                 detail="Cannot rename profile while generation is running. Stop generation first.",
             )
+    locks, _workspace_id = _acquire_profile_mutation_locks([old_name, new_name], ptype)
+    try:
+        source_paths = _profile_paths(old_name, ptype)
+        existing_sources = [path for path in source_paths if path.exists()]
+        if not existing_sources:
+            raise HTTPException(status_code=404, detail="Profile not found")
 
-    source_paths = _profile_paths(old_name, ptype)
-    existing_sources = [path for path in source_paths if path.exists()]
-    if not existing_sources:
-        raise HTTPException(status_code=404, detail="Profile not found")
+        destination_pairs: list[tuple[Path, Path]] = []
+        for source in source_paths:
+            dest = source.parent / new_name
+            if source.exists():
+                destination_pairs.append((source, dest))
+            if dest.exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Target profile already exists at {dest}",
+                )
 
-    destination_pairs: list[tuple[Path, Path]] = []
-    for source in source_paths:
-        dest = source.parent / new_name
-        if source.exists():
-            destination_pairs.append((source, dest))
-        if dest.exists():
-            raise HTTPException(
-                status_code=409,
-                detail=f"Target profile already exists at {dest}",
+        moved_paths: list[dict[str, str]] = []
+        path_replacements: dict[str, str] = {}
+        for source, dest in destination_pairs:
+            source_resolved = str(source.resolve())
+            shutil.move(str(source), str(dest))
+            dest_resolved = str(dest.resolve())
+            moved_paths.append({"from": source_resolved, "to": dest_resolved})
+            path_replacements[source_resolved] = dest_resolved
+
+        for _source, dest in destination_pairs:
+            _rewrite_profile_refs_in_dir(
+                dest,
+                old_name=old_name,
+                new_name=new_name,
+                path_replacements=path_replacements,
             )
 
-    moved_paths: list[dict[str, str]] = []
-    path_replacements: dict[str, str] = {}
-    for source, dest in destination_pairs:
-        source_resolved = str(source.resolve())
-        shutil.move(str(source), str(dest))
-        dest_resolved = str(dest.resolve())
-        moved_paths.append({"from": source_resolved, "to": dest_resolved})
-        path_replacements[source_resolved] = dest_resolved
-
-    for _source, dest in destination_pairs:
-        _rewrite_profile_refs_in_dir(
-            dest,
-            old_name=old_name,
-            new_name=new_name,
-            path_replacements=path_replacements,
-        )
-
-    _drop_warmup_cache_for_profile(old_name, ptype)
-    _drop_warmup_cache_for_profile(new_name, ptype)
-    return {
-        "status": "ok",
-        "profile_type": ptype,
-        "old_name": old_name,
-        "new_name": new_name,
-        "moved_paths": moved_paths,
-    }
+        _drop_warmup_cache_for_profile(old_name, ptype)
+        _drop_warmup_cache_for_profile(new_name, ptype)
+        return {
+            "status": "ok",
+            "profile_type": ptype,
+            "old_name": old_name,
+            "new_name": new_name,
+            "moved_paths": moved_paths,
+        }
+    finally:
+        _release_profile_mutation_locks(locks)
 
 
 @app.post("/upload")
