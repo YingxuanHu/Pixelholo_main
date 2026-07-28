@@ -287,6 +287,7 @@ button:disabled { cursor: not-allowed; }
 .ph-minimal-profile-copy small { overflow: hidden; color: #989b93; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .ph-minimal-profile-dot { width: 6px; height: 6px; margin-right: 3px; border-radius: 50%; background: #c9c7bf; }
 .ph-minimal-profile-dot.is-ready { background: #18a788; box-shadow: 0 0 0 4px rgba(24,167,136,.1); }
+.ph-minimal-profile-dot.is-preparing { background: #d69c42; box-shadow: 0 0 0 4px rgba(214,156,66,.12); animation: ph-status-pulse 1.2s ease-in-out infinite; }
 .ph-minimal-profile-menu-wrap { position: relative; flex: 0 0 auto; }
 .ph-minimal-profile-options { width: 27px; height: 27px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 6px; color: #9b9c94; background: transparent; font-size: 12px; letter-spacing: 1px; }
 .ph-minimal-profile-options:hover:not(:disabled) { color: #087f72; background: #dff1ed; }
@@ -298,6 +299,12 @@ button:disabled { cursor: not-allowed; }
 .ph-minimal-profile-menu button.is-danger:hover { background: #fff1ee; color: #a84c43; }
 .ph-minimal-main { width: 100%; min-width: 0; max-width: none; min-height: calc(100vh - 70px); margin: 0; padding: clamp(28px, 4vh, 52px) clamp(24px, 4vw, 52px) 32px; }
 .ph-minimal-create { max-width: 900px; margin: 0 auto; }
+.ph-minimal-profile-preparation { max-width: 720px; margin: clamp(36px, 9vh, 110px) auto 0; }
+.ph-minimal-profile-preparation-intro { text-align: center; }
+.ph-minimal-profile-preparation-intro h1 { margin: 10px 0 13px; color: #232421; font: 700 clamp(38px, 5vw, 58px)/1.02 'Playfair Display', Georgia, serif; letter-spacing: -.045em; }
+.ph-minimal-profile-preparation-intro p { max-width: 530px; margin: 0 auto; color: #797c74; font-size: 14px; line-height: 1.65; }
+.ph-minimal-profile-preparation-card { margin-top: 34px; padding: clamp(24px, 4vw, 38px); border: 1px solid #dce8e3; border-radius: 15px; background: #fff; box-shadow: 0 13px 45px rgba(36,37,32,.055); }
+.ph-profile-preparation-retry { width: 100%; margin-top: 22px; }
 .ph-minimal-intro { margin-bottom: 32px; text-align: center; }
 .ph-minimal-eyebrow { color: #0a8376; font: 500 10px 'DM Mono', monospace; letter-spacing: .12em; text-transform: uppercase; }
 .ph-minimal-intro h1, .ph-minimal-studio-heading h1 { margin: 10px 0 13px; color: #232421; font: 700 clamp(38px, 5vw, 58px)/1.02 'Playfair Display', Georgia, serif; letter-spacing: -.045em; }

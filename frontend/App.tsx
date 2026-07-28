@@ -356,6 +356,13 @@ const App: React.FC = () => {
   const [isCreatingProfile, setIsCreatingProfile] = useState(true);
   const [showWelcome, setShowWelcome] = useState(true);
   const [autoPrepareAfterUpload, setAutoPrepareAfterUpload] = useState(false);
+  // A saved source clip is a real profile, even before it is inference-ready.
+  // Keep a pending preparation target so selecting one of those profiles never
+  // falls back to the source-capture form or silently abandons the job.
+  const [pendingProfilePreparation, setPendingProfilePreparation] = useState<{
+    name: string;
+    profileType: ProfileType;
+  } | null>(null);
   const [lastUploadedFilename, setLastUploadedFilename] = useState<string | null>(null);
   const [lastUploadedAudioFilename, setLastUploadedAudioFilename] = useState<string | null>(null);
   const [sourceMode, setSourceMode] = useState<'upload' | 'camera'>('camera');
@@ -1197,6 +1204,7 @@ const App: React.FC = () => {
     uploadSubmissionRef.current = true;
     const uploadProfileName = profile.name.trim();
     const uploadProfileType = profileType;
+    let shouldPrepareAfterUpload = false;
     setUiNotice(null);
     setStepStatuses(prev => ({ ...prev, upload: 'running' }));
     setUploadPhaseVideo('uploading');
@@ -1230,7 +1238,10 @@ const App: React.FC = () => {
       // trips the duplicate-name validation.
       setIsCreatingProfile(false);
       if (options.autoPrepare) {
-        setAutoPrepareAfterUpload(true);
+        // Do not set this until `finally`. The old behavior set it while the
+        // upload single-flight ref was still true; the preparation effect then
+        // exited early and was never invoked again.
+        shouldPrepareAfterUpload = true;
       }
       await loadProfiles();
     } catch (err) {
@@ -1239,6 +1250,9 @@ const App: React.FC = () => {
       setPreprocessLogs([createLog(`Upload failed: ${String(err)}`, 'error')]);
     } finally {
       uploadSubmissionRef.current = false;
+      if (shouldPrepareAfterUpload) {
+        setAutoPrepareAfterUpload(true);
+      }
     }
   };
 
@@ -1608,6 +1622,18 @@ const App: React.FC = () => {
     setAutoPrepareAfterUpload(false);
     void startPreprocess();
   }, [autoPrepareAfterUpload, lastUploadedFilename, startPreprocess, stepStatuses.preprocess, stepStatuses.upload]);
+
+  // A raw source can exist after a refresh, an interrupted browser request, or
+  // an older client build. Selecting it must resume preparation automatically;
+  // a user should never have to record the same video again.
+  useEffect(() => {
+    const target = pendingProfilePreparation;
+    if (!target) return;
+    if (target.name !== profile.name || target.profileType !== profileType) return;
+    if (preprocessSubmissionRef.current || uploadSubmissionRef.current) return;
+    setPendingProfilePreparation(null);
+    void startPreprocess();
+  }, [pendingProfilePreparation, profile.name, profileType, startPreprocess]);
 
   const handleCreateAvatar = async () => {
     if (!profile.name.trim()) {
@@ -2592,6 +2618,12 @@ const App: React.FC = () => {
       : lastUploadedFilename || (currentProfileInfo?.raw_files ?? 0) > 0,
   );
   const publicProfileReady = Boolean(!isCreatingProfile && hasInferenceProfile && profile.name);
+  const publicProfilePreparing = Boolean(
+    !publicProfileReady
+      && !isCreatingProfile
+      && profile.name
+      && (currentProfileInfo?.has_data || profile.lastUploadedFile || lastUploadedFilename),
+  );
   const isComposerLocked = isInferenceActive || isStoppingInference || isWarmingUp || isProfileSwitching;
   const isProfileLoading = isWarmingUp || isProfileSwitching;
   const isSourceActionLocked = isBusy
@@ -2640,13 +2672,26 @@ const App: React.FC = () => {
     setProfile({ name: item.name, lastUploadedFile: null, fileSize: null });
     setIsCreatingProfile(false);
     setAutoPrepareAfterUpload(false);
+    setPendingProfilePreparation(null);
     setLastUploadedFilename(null);
     setLastUploadedAudioFilename(null);
     setInferenceText('');
     setInferenceChunks([]);
     setLatency(null);
     setUiNotice(null);
+    setStepStatuses(prev => ({
+      ...prev,
+      upload: 'idle',
+      preprocess: ready ? 'done' : (item.raw_files > 0 ? 'running' : 'idle'),
+      train: 'idle',
+      inference: 'idle',
+    }));
+    setPreprocessProgress(ready ? 1 : null);
+    setPreprocessActivity(ready ? 'Avatar ready' : (item.raw_files > 0 ? 'Starting preparation' : null));
     setActiveStep(ready ? 4 : 1);
+    if (!ready && item.raw_files > 0) {
+      setPendingProfilePreparation({ name: item.name, profileType: selectedProfileType });
+    }
     try {
       await stopPromise;
       if (selectionId !== profileSelectionRef.current) return;
@@ -2693,6 +2738,7 @@ const App: React.FC = () => {
     setShowWelcome(false);
     setIsCreatingProfile(true);
     setAutoPrepareAfterUpload(false);
+    setPendingProfilePreparation(null);
     setSourceMode('camera');
     setCameraState('idle');
     setCameraError(null);
@@ -2788,13 +2834,14 @@ const App: React.FC = () => {
             {profiles.map(item => {
               const selected = item.name === profile.name;
               const ready = profileIsInferenceReady(item);
+              const preparing = selected && stepStatuses.preprocess === 'running';
               const menuKey = `${item.profile_type || 'avatar'}:${item.name}`;
               return (
                 <div key={menuKey} className={`ph-minimal-profile-item ${selected ? 'is-selected' : ''}`}>
                   <button type="button" className="ph-minimal-profile-select" onClick={() => void selectProfile(item)} disabled={isProfileSwitchBlocked}>
                     <span className="ph-minimal-profile-avatar">{item.name.slice(0, 1).toUpperCase()}</span>
-                    <span className="ph-minimal-profile-copy"><strong>{item.name}</strong><small>{ready ? 'Ready to speak' : item.has_data ? 'Needs preparation' : 'Needs a source clip'}</small></span>
-                    <span className={`ph-minimal-profile-dot ${ready ? 'is-ready' : ''}`} />
+                    <span className="ph-minimal-profile-copy"><strong>{item.name}</strong><small>{ready ? 'Ready to speak' : preparing ? 'Preparing avatar…' : item.has_data ? 'Needs preparation' : 'Needs a source clip'}</small></span>
+                    <span className={`ph-minimal-profile-dot ${ready ? 'is-ready' : preparing ? 'is-preparing' : ''}`} />
                   </button>
                   <div className="ph-minimal-profile-menu-wrap" onClick={event => event.stopPropagation()}>
                     <button type="button" className="ph-minimal-profile-options" disabled={isBusy || isProfileSwitching || isProfileMutationPending} aria-label={`Profile options for ${item.name}`} onClick={() => setProfileMenuKey(prev => prev === menuKey ? null : menuKey)}>•••</button>
@@ -2816,7 +2863,46 @@ const App: React.FC = () => {
         </aside>
 
         <main className="ph-minimal-main">
-        {!publicProfileReady && (
+        {!publicProfileReady && (publicProfilePreparing ? (
+          <section className="ph-minimal-profile-preparation" aria-live="polite">
+            <div className="ph-minimal-profile-preparation-intro">
+              <span className="ph-minimal-eyebrow">Avatar profile</span>
+              <h1>{profile.name}</h1>
+              <p>Your source video is saved. PixelHolo is preparing its voice reference and face cache before this avatar can speak.</p>
+            </div>
+            <div className="ph-minimal-profile-preparation-card">
+              <div className="ph-minimal-preparing">
+                <div className="ph-minimal-preparing-heading">
+                  <span className="ph-minimal-preparing-pulse" />
+                  <div><strong>{stepStatuses.preprocess === 'error' ? 'Preparation needs attention' : 'Preparing your avatar'}</strong><p>{stepStatuses.preprocess === 'error' ? (preprocessLogs[preprocessLogs.length - 1]?.message || 'The source video is saved. Try preparation again.') : (preprocessActivity || 'Starting preparation')}</p></div>
+                  <b>{stepStatuses.preprocess === 'error' ? 'Paused' : preprocessDisplayProgress === null ? 'Starting…' : `${Math.round(preprocessDisplayProgress * 100)}%`}</b>
+                </div>
+                <span className="ph-minimal-preparing-track">
+                  <i
+                    className={preprocessDisplayProgress === null && stepStatuses.preprocess !== 'error' ? 'is-indeterminate' : ''}
+                    style={preprocessDisplayProgress === null ? undefined : { width: `${Math.round(preprocessDisplayProgress * 100)}%` }}
+                  />
+                </span>
+                <small>{stepStatuses.preprocess === 'error' ? 'Your source clip remains saved; you do not need to record it again.' : 'This screen updates as video, audio, and face-cache work completes.'}</small>
+              </div>
+              {stepStatuses.preprocess === 'error' && (
+                <button
+                  type="button"
+                  className="ph-minimal-secondary ph-profile-preparation-retry"
+                  onClick={() => {
+                    setPreprocessLogs([]);
+                    setPreprocessProgress(null);
+                    setPreprocessActivity('Restarting preparation');
+                    setStepStatuses(prev => ({ ...prev, preprocess: 'running' }));
+                    setPendingProfilePreparation({ name: profile.name, profileType });
+                  }}
+                >
+                  Retry preparation <span>→</span>
+                </button>
+              )}
+            </div>
+          </section>
+        ) : (
           <section className="ph-minimal-create">
             <div className="ph-minimal-intro">
               <span className="ph-minimal-eyebrow">New avatar</span>
@@ -2971,7 +3057,7 @@ const App: React.FC = () => {
               })()}
             </div>
           </section>
-        )}
+        ))}
 
         {publicProfileReady && (
           <section className="ph-minimal-studio">
