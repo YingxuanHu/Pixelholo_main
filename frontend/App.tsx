@@ -1477,10 +1477,15 @@ const App: React.FC = () => {
     }
   };
 
-  const startPreprocess = async () => {
+  const startPreprocess = async (options: { allowExistingProfile?: boolean } = {}) => {
     const preprocessProfileName = profile.name.trim();
     if (!preprocessProfileName || preprocessSubmissionRef.current || uploadSubmissionRef.current) return;
-    if (profileNameTaken) {
+    // Uploading first creates the source directory, so the profile list can
+    // legitimately contain this name by the time automatic preparation
+    // begins.  That is not a duplicate draft; it is the exact saved source
+    // this call must prepare.  Explicit callers only bypass this guard after
+    // saving/selecting that source, never while a user is naming a fresh form.
+    if (profileNameTaken && !options.allowExistingProfile) {
       setUiNotice('That profile name is already in use. Choose a different name, such as “Alvin 2”.');
       minimalNameInputRef.current?.focus();
       return;
@@ -1620,7 +1625,7 @@ const App: React.FC = () => {
       return;
     }
     setAutoPrepareAfterUpload(false);
-    void startPreprocess();
+    void startPreprocess({ allowExistingProfile: true });
   }, [autoPrepareAfterUpload, lastUploadedFilename, startPreprocess, stepStatuses.preprocess, stepStatuses.upload]);
 
   // A raw source can exist after a refresh, an interrupted browser request, or
@@ -1632,7 +1637,7 @@ const App: React.FC = () => {
     if (target.name !== profile.name || target.profileType !== profileType) return;
     if (preprocessSubmissionRef.current || uploadSubmissionRef.current) return;
     setPendingProfilePreparation(null);
-    void startPreprocess();
+    void startPreprocess({ allowExistingProfile: true });
   }, [pendingProfilePreparation, profile.name, profileType, startPreprocess]);
 
   const handleCreateAvatar = async () => {
