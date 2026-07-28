@@ -2966,7 +2966,15 @@ const App: React.FC = () => {
                 )}
 
                 {uiNotice && <div className="ph-minimal-error">{uiNotice}</div>}
-                <div className="ph-minimal-composer-footer"><span><i className={`ph-status-dot ${isListening ? 'checking' : isInferenceActive ? 'checking' : 'online'}`} /> {isListening ? 'Listening…' : inferenceStatusLabel}</span><div className="ph-minimal-composer-actions"><button type="button" className={`ph-minimal-mic-button ${isListening ? 'is-listening' : ''}`} onClick={() => (isListening ? stopListening() : startListening())} disabled={!hasSpeechSupport || isInferenceActive || isWarmingUp} title={hasSpeechSupport ? 'Speak; it will send automatically when you stop' : 'Voice input is not supported by this browser'} aria-label={hasSpeechSupport ? 'Voice input' : 'Voice input unavailable'} aria-pressed={isListening}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm6-3a1 1 0 0 0-2 0 1 1 0 0 0-2 0 6 6 0 0 0 5 5.91V19H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-2.09A6 6 0 0 0 18 11Z" /></svg></button>{isInferenceActive && <button type="button" className="ph-minimal-stop is-active" onClick={() => void stopInference()}>Stop</button>}</div></div>
+                <div className="ph-minimal-composer-footer">
+                  <span><i className={`ph-status-dot ${isListening || isInferenceActive || isStoppingInference ? 'checking' : 'online'}`} /> {isListening ? 'Listening…' : inferenceStatusLabel}</span>
+                  <div className="ph-minimal-composer-actions">
+                    <button type="button" className={`ph-minimal-mic-button ${isListening ? 'is-listening' : ''}`} onClick={() => (isListening ? stopListening() : startListening())} disabled={!hasSpeechSupport || isComposerLocked} title={hasSpeechSupport ? 'Speak; it will send automatically when you stop' : 'Voice input is not supported by this browser'} aria-label={hasSpeechSupport ? 'Voice input' : 'Voice input unavailable'} aria-pressed={isListening}>
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm6-3a1 1 0 0 0-2 0 1 1 0 0 0-2 0 6 6 0 0 0 5 5.91V19H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-2.09A6 6 0 0 0 18 11Z" /></svg>
+                    </button>
+                    {(isInferenceActive || isStoppingInference) && <button type="button" className="ph-minimal-stop is-active" onClick={() => void stopInference()} disabled={isStoppingInference}>{isStoppingInference ? 'Stopping…' : 'Stop'}</button>}
+                  </div>
+                </div>
               </section>
             </div>
 
