@@ -2751,7 +2751,11 @@ const App: React.FC = () => {
     setPreprocessStats(null);
     setPreprocessProgress(null);
     setPreprocessActivity(null);
-    setStepStatuses(prev => ({ ...prev, upload: 'idle', preprocess: 'idle', inference: 'idle' }));
+    // A new profile is an independent workflow.  In particular, do not carry
+    // a legacy StyleTTS training state from the previously selected profile:
+    // `isBusy` intentionally locks source controls while a job is active, so
+    // retaining that state made a fresh upload/record form appear disabled.
+    setStepStatuses(prev => ({ ...prev, upload: 'idle', preprocess: 'idle', train: 'idle', inference: 'idle' }));
     setActiveStep(1);
     setUiNotice(null);
   };
