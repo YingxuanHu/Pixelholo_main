@@ -49,6 +49,7 @@ type VoiceControlBackendDefaults = {
 };
 type ProfileRuntimeSettings = {
   voice_controls?: Partial<VoiceControlValues>;
+  system_prompt?: string;
 };
 type BinaryStreamPacketMetadata = {
   event?: string;
@@ -73,6 +74,7 @@ type VideoFrameSource = string | {
   bitmap?: ImageBitmap;
   bitmapPromise?: Promise<ImageBitmap | null>;
   bitmapState?: 'pending' | 'ready' | 'failed';
+  decodePaintAttached?: boolean;
   drawn?: boolean;
 };
 type QueuedVideoFrame = {
@@ -107,6 +109,11 @@ const BINARY_STREAM_MAGIC = [80, 72, 83, 49]; // PHS1
 const BINARY_STREAM_HEADER_BYTES = 12;
 const BINARY_STREAM_ENABLED = (env.VITE_PIXELHOLO_BINARY_STREAM as string | undefined) !== '0';
 const BINARY_PCM_AUDIO_ENABLED = (env.VITE_PIXELHOLO_BINARY_PCM_AUDIO as string | undefined) !== '0';
+// Firefox's ImageBitmap JPEG decoder can complete well after its presentation
+// deadline.  Use its regular image decoder instead, then present whichever
+// decoded frame is newest.  This is an automatic compatibility path; users do
+// not need to change a browser setting.
+const IS_FIREFOX_BROWSER = typeof navigator !== 'undefined' && /firefox/i.test(navigator.userAgent);
 const LOCAL_STORAGE_API_BASE_KEY = 'voxclone_api_base';
 const LOCAL_STORAGE_WORKSPACE_KEY = 'pixelholo_workspace_id';
 const WORKSPACE_HEADER = 'X-PixelHolo-Workspace';
@@ -166,6 +173,9 @@ const DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE = Number(
   (env.VITE_PIXELHOLO_AVATAR_MAX_FRAME_EDGE as string | undefined)?.trim() || '1280',
 );
 const BEST_WEB_MUSETALK_JPEG_QUALITY = 95;
+const FIREFOX_AVATAR_MAX_FRAME_EDGE = 768;
+const FIREFOX_AVATAR_FPS = 18;
+const FIREFOX_MUSETALK_JPEG_QUALITY = 88;
 const DEFAULT_AUDIO_START_DELAY_SEC = envNumber('VITE_PIXELHOLO_AUDIO_START_DELAY_SEC', 0.04, 0.02, 0.25);
 const AVATAR_AUDIO_START_DELAY_SEC = envNumber('VITE_PIXELHOLO_AVATAR_AUDIO_START_DELAY_SEC', 0.34, 0.12, 1.0);
 const AVATAR_AUDIO_CHUNK_LEAD_SEC = envNumber('VITE_PIXELHOLO_AVATAR_AUDIO_CHUNK_LEAD_SEC', 0.08, 0.02, 0.5);
@@ -205,6 +215,9 @@ const normalizeRuntimeSettings = (settings: any): ProfileRuntimeSettings => {
       emotion: normalizeVoiceEmotion(settings.voice_controls.emotion),
       emotionIntensity: Number(settings.voice_controls.emotion_intensity ?? settings.voice_controls.emotionIntensity ?? 0.5),
     });
+  }
+  if (typeof settings?.system_prompt === 'string') {
+    normalized.system_prompt = settings.system_prompt;
   }
   return normalized;
 };
@@ -418,6 +431,7 @@ const App: React.FC = () => {
   );
   const [voiceControlDefaults, setVoiceControlDefaults] = useState<VoiceControlValues>(DEFAULT_VOICE_CONTROL_VALUES);
   const [voiceControlValues, setVoiceControlValues] = useState<VoiceControlValues>(DEFAULT_VOICE_CONTROL_VALUES);
+  const [avatarInstructions, setAvatarInstructions] = useState('');
   const [voiceControlsStatus, setVoiceControlsStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('ready');
   const [voiceControlsError, setVoiceControlsError] = useState<string | null>(null);
   const [voiceControlsDirty, setVoiceControlsDirty] = useState(false);
@@ -469,6 +483,7 @@ const App: React.FC = () => {
   const videoNextFrameTimeRef = useRef<number | null>(null);
   const videoStateRef = useRef<'idle' | 'buffering' | 'playing'>('idle');
   const videoDrawSerialRef = useRef(0);
+  const videoLastPaintedTimeRef = useRef(Number.NEGATIVE_INFINITY);
   const playbackSettleTimerRef = useRef<number | null>(null);
   const audioStartDelayRef = useRef<number>(DEFAULT_AUDIO_START_DELAY_SEC);
   const videoFpsRef = useRef<number>(DEFAULT_VIDEO_FPS);
@@ -952,6 +967,7 @@ const App: React.FC = () => {
         body: JSON.stringify({
           profile_type: profileType,
           voice_controls: voiceControlValues,
+          system_prompt: avatarInstructions.trim(),
         }),
       });
       if (!res.ok) throw new Error(await readErrorDetail(res));
@@ -968,6 +984,7 @@ const App: React.FC = () => {
     profile.name,
     profileType,
     readErrorDetail,
+    avatarInstructions,
     voiceControlValues,
   ]);
 
@@ -976,6 +993,7 @@ const App: React.FC = () => {
       setVoiceControlBackendDefaults(DEFAULT_VOICE_CONTROL_BACKEND_DEFAULTS);
       setVoiceControlDefaults(DEFAULT_VOICE_CONTROL_VALUES);
       setVoiceControlValues(DEFAULT_VOICE_CONTROL_VALUES);
+      setAvatarInstructions('');
       setVoiceControlsStatus('ready');
       setVoiceControlsError(null);
       setVoiceControlsDirty(false);
@@ -989,6 +1007,7 @@ const App: React.FC = () => {
     setVoiceControlBackendDefaults(DEFAULT_VOICE_CONTROL_BACKEND_DEFAULTS);
     setVoiceControlDefaults(DEFAULT_VOICE_CONTROL_VALUES);
     setVoiceControlValues(DEFAULT_VOICE_CONTROL_VALUES);
+    setAvatarInstructions('');
     setVoiceControlsStatus('loading');
     setVoiceControlsError(null);
     setVoiceControlsDirty(false);
@@ -1048,6 +1067,7 @@ const App: React.FC = () => {
         setVoiceControlBackendDefaults(backendDefaults);
         setVoiceControlDefaults(controls);
         setVoiceControlValues(selectedControls);
+        setAvatarInstructions(runtimeSettings.system_prompt ?? '');
         setVoiceControlsStatus('ready');
         setVoiceControlsDirty(false);
         setRuntimeSettingsStatus('idle');
@@ -1794,6 +1814,7 @@ const App: React.FC = () => {
       videoRafRef.current = null;
     }
     videoDrawSerialRef.current += 1;
+    videoLastPaintedTimeRef.current = Number.NEGATIVE_INFINITY;
     for (const item of frameQueueRef.current) {
       releaseFrameSource(item.frame);
     }
@@ -1814,12 +1835,6 @@ const App: React.FC = () => {
     }
   }, [releaseFrameSource]);
 
-  const isFramePendingDecode = useCallback((frameSource: VideoFrameSource) => (
-    typeof frameSource !== 'string'
-    && !!frameSource.bitmapPromise
-    && frameSource.bitmapState === 'pending'
-  ), []);
-
   const waitForFramePredecode = useCallback(async (frames?: VideoFrameSource[]) => {
     const pending = (frames ?? [])
       .filter((frame): frame is Exclude<VideoFrameSource, string> => (
@@ -1836,7 +1851,7 @@ const App: React.FC = () => {
     ]);
   }, []);
 
-  const drawFrame = useCallback((frameSource: VideoFrameSource) => {
+  const drawFrame = useCallback((frameSource: VideoFrameSource, presentationTime: number) => {
     const canvas = videoCanvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -1845,14 +1860,19 @@ const App: React.FC = () => {
     // browsers that render the streamed frame below the canvas's CSS size.
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
-    const drawSerial = ++videoDrawSerialRef.current;
+    // A stream can decode frames out of order.  The old renderer compared each
+    // Image load to the *latest requested* frame, which discards every Firefox
+    // frame that takes more than one 25 FPS tick to decode.  Keep a generation
+    // for profile switches and paint any newly decoded frame that is newer than
+    // the frame currently on screen instead.
+    const playbackGeneration = videoDrawSerialRef.current;
     const sourceUrl = typeof frameSource === 'string' ? frameSource : frameSource.url;
     const bitmap = typeof frameSource === 'string' ? undefined : frameSource.bitmap;
     const cleanup = () => {
       releaseFrameSource(frameSource);
     };
     const drawCover = (source: CanvasImageSource, sourceWidth: number, sourceHeight: number) => {
-      if (!sourceWidth || !sourceHeight) return;
+      if (!sourceWidth || !sourceHeight) return false;
       const targetRatio = canvas.width / canvas.height;
       const sourceRatio = sourceWidth / sourceHeight;
       let sx = 0;
@@ -1867,11 +1887,38 @@ const App: React.FC = () => {
         sy = (sourceHeight - sh) / 2;
       }
       ctx.drawImage(source, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+      return true;
+    };
+    const canPaint = () => (
+      playbackGeneration === videoDrawSerialRef.current
+      && presentationTime >= videoLastPaintedTimeRef.current
+      && (typeof frameSource === 'string' || !frameSource.drawn)
+    );
+    const paint = (source: CanvasImageSource, sourceWidth: number, sourceHeight: number) => {
+      if (!canPaint()) return;
+      if (drawCover(source, sourceWidth, sourceHeight)) {
+        videoLastPaintedTimeRef.current = presentationTime;
+      }
+    };
+    const drawWithImage = () => {
+      if (!canPaint()) {
+        cleanup();
+        return;
+      }
+      const img = new Image();
+      img.onload = () => {
+        paint(img, img.naturalWidth || img.width, img.naturalHeight || img.height);
+        cleanup();
+      };
+      img.onerror = () => {
+        cleanup();
+      };
+      img.src = sourceUrl.startsWith('blob:') || sourceUrl.startsWith('data:')
+        ? sourceUrl
+        : `data:image/jpeg;base64,${sourceUrl}`;
     };
     if (bitmap) {
-      if (drawSerial === videoDrawSerialRef.current) {
-        drawCover(bitmap, bitmap.width, bitmap.height);
-      }
+      paint(bitmap, bitmap.width, bitmap.height);
       cleanup();
       return;
     }
@@ -1880,22 +1927,20 @@ const App: React.FC = () => {
       && frameSource.bitmapPromise
       && frameSource.bitmapState === 'pending'
     ) {
-      cleanup();
+      if (!frameSource.decodePaintAttached) {
+        frameSource.decodePaintAttached = true;
+        void frameSource.bitmapPromise.then((decodedBitmap) => {
+          if (decodedBitmap) {
+            paint(decodedBitmap, decodedBitmap.width, decodedBitmap.height);
+            cleanup();
+            return;
+          }
+          drawWithImage();
+        });
+      }
       return;
     }
-    const img = new Image();
-    img.onload = () => {
-      if (drawSerial === videoDrawSerialRef.current) {
-        drawCover(img, img.naturalWidth || img.width, img.naturalHeight || img.height);
-      }
-      cleanup();
-    };
-    img.onerror = () => {
-      cleanup();
-    };
-    img.src = sourceUrl.startsWith('blob:') || sourceUrl.startsWith('data:')
-      ? sourceUrl
-      : `data:image/jpeg;base64,${sourceUrl}`;
+    drawWithImage();
   }, [releaseFrameSource]);
 
   const startVideoLoop = useCallback(() => {
@@ -1915,10 +1960,6 @@ const App: React.FC = () => {
         const now = ctx.currentTime;
         let frameToDraw: QueuedVideoFrame | null = null;
         while (frameQueueRef.current.length > 0 && frameQueueRef.current[0].t <= now) {
-          const candidate = frameQueueRef.current[0];
-          if (isFramePendingDecode(candidate.frame)) {
-            break;
-          }
           const shifted = frameQueueRef.current.shift() || null;
           if (frameToDraw) {
             releaseFrameSource(frameToDraw.frame);
@@ -1926,7 +1967,7 @@ const App: React.FC = () => {
           frameToDraw = shifted;
         }
         if (frameToDraw) {
-          drawFrame(frameToDraw.frame);
+          drawFrame(frameToDraw.frame, frameToDraw.t);
         }
         if (!frameQueueRef.current.length && videoStateRef.current === 'playing') {
           videoStateRef.current = 'buffering';
@@ -1940,7 +1981,7 @@ const App: React.FC = () => {
       videoRafRef.current = window.requestAnimationFrame(tick);
     };
     videoRafRef.current = window.requestAnimationFrame(tick);
-  }, [drawFrame, isFramePendingDecode, releaseFrameSource]);
+  }, [drawFrame, releaseFrameSource]);
 
   const enqueueFrames = useCallback((frames: VideoFrameSource[], startAt: number, duration: number, fps?: number) => {
     if (!frames || frames.length === 0) return;
@@ -2086,6 +2127,9 @@ const App: React.FC = () => {
     };
     if (endpoint === '/chat') {
       payload.llm_mode = llmMode;
+      // Send a just-edited prompt immediately; the server also loads the
+      // saved per-profile setting as a fallback for other clients.
+      payload.system_prompt = avatarInstructions.trim();
     }
     if ((voiceControlsStatus === 'ready' || voiceControlsDirty) && voiceControlValues) {
       payload.pace_scale = resolvePaceScale(voiceControlValues.pace);
@@ -2108,14 +2152,26 @@ const App: React.FC = () => {
       payload.avatar_profile = requestProfileName;
       payload.lipsync_backend = avatarBackend;
       if (Number.isFinite(DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE) && DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE > 0) {
-        payload.avatar_max_frame_edge = Math.round(DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE);
+        payload.avatar_max_frame_edge = Math.round(
+          IS_FIREFOX_BROWSER
+            ? Math.min(DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE, FIREFOX_AVATAR_MAX_FRAME_EDGE)
+            : DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE,
+        );
+      }
+      if (IS_FIREFOX_BROWSER) {
+        // Firefox is more prone to decoder starvation with a 25 FPS stream of
+        // 1280px JPEGs.  This rendition is still above the preview's displayed
+        // resolution, while keeping decode and presentation real-time.
+        payload.avatar_fps = FIREFOX_AVATAR_FPS;
       }
       if (avatarBackend === 'musetalk') {
         payload.musetalk_preset = museTalkPreset;
         // Preserve as much source detail as the real-time MuseTalk renderer can
         // deliver.  This does not change the model's native reconstruction size,
         // but it avoids adding JPEG artifacts over lips, teeth, and the jawline.
-        payload.musetalk_jpeg_quality = BEST_WEB_MUSETALK_JPEG_QUALITY;
+        payload.musetalk_jpeg_quality = IS_FIREFOX_BROWSER
+          ? FIREFOX_MUSETALK_JPEG_QUALITY
+          : BEST_WEB_MUSETALK_JPEG_QUALITY;
       }
     }
 
@@ -2255,7 +2311,7 @@ const App: React.FC = () => {
             ? {
                 Accept: BINARY_STREAM_MEDIA_TYPE,
                 'X-PixelHolo-Transport': 'binary',
-                'X-PixelHolo-Client': 'web',
+                'X-PixelHolo-Client': IS_FIREFOX_BROWSER ? 'firefox' : 'web',
                 ...(BINARY_PCM_AUDIO_ENABLED ? { 'X-PixelHolo-Audio-Format': 'pcm_s16le' } : {}),
               }
             : {}),
@@ -2285,7 +2341,7 @@ const App: React.FC = () => {
             const frameSource: Exclude<VideoFrameSource, string> = {
               url: URL.createObjectURL(blob),
             };
-            if ('createImageBitmap' in window) {
+            if (!IS_FIREFOX_BROWSER && 'createImageBitmap' in window) {
               frameSource.bitmapState = 'pending';
               frameSource.bitmapPromise = createImageBitmap(blob)
                 .then(bitmap => {
@@ -2336,6 +2392,7 @@ const App: React.FC = () => {
   }, [
     apiBase,
     apiFetch,
+    avatarInstructions,
     avatarBackend,
     clearPlaybackSettleTimer,
     enqueueFrames,
@@ -2965,12 +3022,14 @@ const App: React.FC = () => {
 
                 {showVoiceSettings && (
                   <div className="ph-minimal-advanced-panel">
+                    <label className="ph-minimal-system-prompt"><span>Avatar instructions <b>Optional</b></span><textarea value={avatarInstructions} maxLength={1200} disabled={isComposerLocked} onChange={event => { setAvatarInstructions(event.target.value); setRuntimeSettingsStatus('idle'); setRuntimeSettingsError(null); }} placeholder="e.g. You are Maya, a warm and curious travel guide. Introduce yourself as Maya." /></label>
                     <label><span>Expressiveness <b>{Math.round((voiceControlValues?.expressiveness ?? 0.5) * 100)}%</b></span><input type="range" min="0.25" max="1" step="0.01" value={voiceControlValues?.expressiveness ?? 0.5} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ expressiveness: Number(event.target.value) })} /></label>
                     <label><span>Variation / temperature <b>{(voiceControlValues?.variation ?? 0.8).toFixed(2)}</b></span><input type="range" min="0.1" max="1.2" step="0.01" value={voiceControlValues?.variation ?? 0.8} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ variation: Number(event.target.value) })} /></label>
                     <label><span>Voice match / CFG <b>{Math.round((voiceControlValues?.guidance ?? 0.5) * 100)}%</b></span><input type="range" min="0" max="1" step="0.01" value={voiceControlValues?.guidance ?? 0.5} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ guidance: Number(event.target.value) })} /></label>
                     <label><span>Repetition penalty <b>{(voiceControlValues?.repetition ?? 1.2).toFixed(2)}</b></span><input type="range" min="0.9" max="2" step="0.01" value={voiceControlValues?.repetition ?? 1.2} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ repetition: Number(event.target.value) })} /></label>
                     <label><span>Emotion intensity <b>{Math.round((voiceControlValues?.emotionIntensity ?? 0.5) * 100)}%</b></span><input type="range" min="0" max="1" step="0.05" value={voiceControlValues?.emotionIntensity ?? 0.5} disabled={isComposerLocked || voiceControlValues?.emotion === 'neutral'} onChange={event => handleVoiceControlsChange({ emotionIntensity: Number(event.target.value) })} /></label>
-                    <div className="ph-minimal-advanced-actions"><button type="button" onClick={resetVoiceControls} disabled={isComposerLocked}>Reset</button><button type="button" className="is-accent" onClick={() => void saveRuntimeSettings()} disabled={isComposerLocked || runtimeSettingsStatus === 'saving'}>{runtimeSettingsStatus === 'saved' ? 'Saved' : runtimeSettingsStatus === 'saving' ? 'Saving…' : 'Save defaults'}</button></div>
+                    {runtimeSettingsError && <p className="ph-minimal-settings-error" role="alert">{runtimeSettingsError}</p>}
+                    <div className="ph-minimal-advanced-actions"><button type="button" onClick={resetVoiceControls} disabled={isComposerLocked}>Reset voice</button><button type="button" className="is-accent" onClick={() => void saveRuntimeSettings()} disabled={isComposerLocked || runtimeSettingsStatus === 'saving'}>{runtimeSettingsStatus === 'saved' ? 'Saved' : runtimeSettingsStatus === 'saving' ? 'Saving…' : 'Save profile settings'}</button></div>
                   </div>
                 )}
 

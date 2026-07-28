@@ -1,13 +1,15 @@
 import contextlib
+from contextvars import ContextVar
 import logging
 import json
 import os
 import re
 import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Generator, List
 
@@ -412,6 +414,21 @@ class LLMRoute:
         return f"{self.resolved_mode}:{self.model}"
 
 
+@dataclass
+class ConversationState:
+    """Mutable state for one workspace/profile conversation only."""
+
+    system_prompt: str
+    history: List[Dict[str, str]]
+    turn_index: int = 0
+    last_live_turn_index: int | None = None
+    last_live_until: float = 0.0
+    last_live_context_terms: set[str] = field(default_factory=set)
+    last_live_context_summary: str = ""
+    last_active: float = field(default_factory=time.monotonic)
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
 class LLMService:
     def __init__(self, system_prompt: str = "You are a helpful, concise AI assistant."):
         _load_env_files()
@@ -433,7 +450,12 @@ class LLMService:
         )
         self.live_search_model = os.environ.get("OPENAI_LIVE_SEARCH_MODEL", LIVE_SEARCH_MODEL).strip() or LIVE_SEARCH_MODEL
         self.system_prompt = system_prompt
-        self.history: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        self._conversations: dict[str, ConversationState] = {}
+        self._conversations_lock = threading.Lock()
+        self._conversation_context: ContextVar[ConversationState | None] = ContextVar(
+            "pixelholo_llm_conversation",
+            default=None,
+        )
         self._warmed_routes: set[str] = set()
         self._realtime_rate_limit_until = 0.0
         self.service_tier = os.environ.get("GROQ_SERVICE_TIER", "").strip().lower()
@@ -510,11 +532,38 @@ class LLMService:
             DEFAULT_FIRST_CHUNK_SOFT_MAX_CHARS,
             minimum=32,
         )
-        self._turn_index = 0
-        self._last_live_turn_index: int | None = None
-        self._last_live_until = 0.0
-        self._last_live_context_terms: set[str] = set()
-        self._last_live_context_summary = ""
+
+    def _conversation_state(self, conversation_key: str | None, system_prompt: str | None) -> ConversationState:
+        """Return a bounded, prompt-aware conversation state.
+
+        The service instance is shared for model warmup, but conversation memory
+        is not.  This prevents one visitor's prompt, persona, or answer from
+        appearing in another anonymous workspace.
+        """
+        key = (conversation_key or "legacy").strip()[:512] or "legacy"
+        prompt = (system_prompt or self.system_prompt).strip() or self.system_prompt
+        now = time.monotonic()
+        with self._conversations_lock:
+            state = self._conversations.get(key)
+            if state is None or state.system_prompt != prompt:
+                state = ConversationState(
+                    system_prompt=prompt,
+                    history=[{"role": "system", "content": prompt}],
+                )
+                self._conversations[key] = state
+            state.last_active = now
+            # Keep memory bounded even if public visitors continuously create
+            # new workspaces. Active states are never evicted mid-stream.
+            if len(self._conversations) > 128:
+                stale = sorted(
+                    ((candidate.last_active, candidate_key) for candidate_key, candidate in self._conversations.items() if candidate_key != key),
+                )
+                for _last_active, stale_key in stale[: max(0, len(self._conversations) - 128)]:
+                    self._conversations.pop(stale_key, None)
+            return state
+
+    def _active_conversation(self) -> ConversationState | None:
+        return self._conversation_context.get()
 
     @property
     def stream_warmed(self) -> bool:
@@ -613,14 +662,49 @@ class LLMService:
         mode: str | None = None,
         model: str | None = None,
         cancel_event=None,
+        system_prompt: str | None = None,
+        conversation_key: str | None = None,
     ) -> Generator[str, None, None]:
         """
         Sends text to Groq and yields complete spoken-friendly chunks as they are generated.
         """
+        state = self._conversation_state(conversation_key, system_prompt)
+        # A duplicate request from the same browser/profile waits rather than
+        # interleaving history. Other profiles and other visitors have their
+        # own locks and can stream concurrently.
+        with state.lock:
+            context_token = self._conversation_context.set(state)
+            try:
+                yield from self._stream_response_for_conversation(
+                    state,
+                    user_input,
+                    min_words=min_words,
+                    min_chars=min_chars,
+                    max_chars=max_chars,
+                    mode=mode,
+                    model=model,
+                    cancel_event=cancel_event,
+                )
+            finally:
+                state.last_active = time.monotonic()
+                self._conversation_context.reset(context_token)
+
+    def _stream_response_for_conversation(
+        self,
+        state: ConversationState,
+        user_input: str,
+        *,
+        min_words: int,
+        min_chars: int,
+        max_chars: int,
+        mode: str | None,
+        model: str | None,
+        cancel_event=None,
+    ) -> Generator[str, None, None]:
         if self._is_cancelled(cancel_event):
             return
-        self._turn_index += 1
-        self.history.append({"role": "user", "content": user_input})
+        state.turn_index += 1
+        state.history.append({"role": "user", "content": user_input})
         route = self.resolve_route(user_input=user_input, mode=mode, model=model)
 
         if route.uses_current_tools:
@@ -630,7 +714,7 @@ class LLMService:
             if self._is_cancelled(cancel_event):
                 return
             if direct_weather is not None:
-                self.history.append({"role": "assistant", "content": direct_weather})
+                state.history.append({"role": "assistant", "content": direct_weather})
                 self._mark_live_context("direct_weather", user_input=user_input, assistant_text=direct_weather)
                 yield direct_weather
                 return
@@ -649,7 +733,7 @@ class LLMService:
                     route.model,
                     rate_limit_wait,
                 )
-                self.history.append({"role": "assistant", "content": message})
+                state.history.append({"role": "assistant", "content": message})
                 yield message
                 return
             route = LLMRoute(
@@ -718,7 +802,7 @@ class LLMService:
         if full_response_text:
             if self._is_cancelled(cancel_event):
                 return
-            self.history.append({"role": "assistant", "content": full_response_text})
+            state.history.append({"role": "assistant", "content": full_response_text})
             if completed_route and completed_route.uses_current_tools:
                 self._mark_live_context("live_route", user_input=user_input, assistant_text=full_response_text)
 
@@ -1366,16 +1450,19 @@ class LLMService:
     def _mark_live_context(self, reason: str, *, user_input: str = "", assistant_text: str = "") -> None:
         if max(self.auto_live_followup_turns, self.auto_live_topic_turns) <= 0:
             return
-        self._last_live_turn_index = self._turn_index
-        self._last_live_until = time.monotonic() + float(self.auto_live_followup_ttl_seconds)
-        self._last_live_context_terms = self._extract_live_context_terms(user_input, assistant_text)
-        self._last_live_context_summary = self._build_live_context_summary(user_input, assistant_text)
+        state = self._active_conversation()
+        if state is None:
+            return
+        state.last_live_turn_index = state.turn_index
+        state.last_live_until = time.monotonic() + float(self.auto_live_followup_ttl_seconds)
+        state.last_live_context_terms = self._extract_live_context_terms(user_input, assistant_text)
+        state.last_live_context_summary = self._build_live_context_summary(user_input, assistant_text)
         logger.info(
             "component=llm op=live_context status=marked reason=%s turn=%s ttl_sec=%s terms=%s",
             reason,
-            self._turn_index,
+            state.turn_index,
             self.auto_live_followup_ttl_seconds,
-            ",".join(sorted(self._last_live_context_terms)),
+            ",".join(sorted(state.last_live_context_terms)),
         )
 
     def _should_continue_live_context(self, user_input: str) -> bool:
@@ -1408,14 +1495,15 @@ class LLMService:
         return False
 
     def _has_recent_live_context(self, max_turns: int | None = None) -> bool:
-        if self._last_live_turn_index is None:
+        state = self._active_conversation()
+        if state is None or state.last_live_turn_index is None:
             return False
-        if time.monotonic() > self._last_live_until:
+        if time.monotonic() > state.last_live_until:
             return False
         allowed_turns = self.auto_live_followup_turns if max_turns is None else max_turns
         if allowed_turns <= 0:
             return False
-        return self._turn_index - self._last_live_turn_index <= allowed_turns
+        return state.turn_index - state.last_live_turn_index <= allowed_turns
 
     def _has_recent_live_topic_context(self) -> bool:
         return self._has_recent_live_context(max(self.auto_live_followup_turns, self.auto_live_topic_turns))
@@ -1429,9 +1517,10 @@ class LLMService:
         return "?" in text or bool(_QUESTION_LIKE_PATTERN.search(text))
 
     def _live_context_overlap(self, text: str) -> int:
-        if not self._has_recent_live_topic_context() or not self._last_live_context_terms:
+        state = self._active_conversation()
+        if not state or not self._has_recent_live_topic_context() or not state.last_live_context_terms:
             return 0
-        return len(self._extract_live_context_terms(text) & self._last_live_context_terms)
+        return len(self._extract_live_context_terms(text) & state.last_live_context_terms)
 
     @staticmethod
     def _extract_live_context_terms(*texts: str) -> set[str]:
@@ -1456,13 +1545,14 @@ class LLMService:
 
     def _messages_with_live_context_hint(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
         routed_messages = list(messages)
-        if not self._has_recent_live_topic_context() or not self._last_live_context_summary:
+        state = self._active_conversation()
+        if not state or not self._has_recent_live_topic_context() or not state.last_live_context_summary:
             return routed_messages
         live_context_prompt = (
             "Recent live-search information from this conversation is authoritative. "
             "Do not contradict or correct it using older training data. "
             "Use it when relevant, and if the user asks for new current facts, rely on live search routing. "
-            f"Recent live context: {self._last_live_context_summary}"
+            f"Recent live context: {state.last_live_context_summary}"
         )
         if routed_messages and routed_messages[0].get("role") == "system":
             routed_messages[0] = {
@@ -1774,17 +1864,19 @@ class LLMService:
         return bounded
 
     def _conversation_window(self, route: LLMRoute | None = None) -> List[Dict[str, str]]:
-        if not self.history:
+        state = self._active_conversation()
+        history = state.history if state is not None else [{"role": "system", "content": self.system_prompt}]
+        if not history:
             return []
-        first = self.history[0]
+        first = history[0]
         uses_realtime_tools = bool(route and route.uses_current_tools)
         max_messages = self.realtime_history_messages if uses_realtime_tools else MAX_HISTORY_MESSAGES
         max_message_chars = self.realtime_max_message_chars if uses_realtime_tools else self.max_message_chars
         max_total_chars = self.realtime_max_history_chars if uses_realtime_tools else self.max_history_chars
         if first.get("role") == "system":
-            messages = [first] + self.history[1:][-max_messages:]
+            messages = [first] + history[1:][-max_messages:]
         else:
-            messages = self.history[-max_messages:]
+            messages = history[-max_messages:]
         return self._bounded_messages(
             messages,
             max_message_chars=max_message_chars,

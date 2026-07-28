@@ -133,6 +133,13 @@ DEFAULT_PAUSE_MS = 40
 # clipping while giving the voice encoder a useful signal.
 CHATTERBOX_REFERENCE_TARGET_RMS = 0.075
 CHATTERBOX_REFERENCE_MAX_PEAK = 0.75
+PROFILE_RUNTIME_SETTINGS_FILENAME = "runtime_settings.json"
+MAX_PROFILE_SYSTEM_PROMPT_CHARS = 4000
+DEFAULT_AVATAR_SYSTEM_PROMPT = (
+    "You are the speaking voice of a PixelHolo avatar. Speak naturally, warmly, and concisely. "
+    "Do not invent the avatar's name, biography, memories, or human identity. "
+    "Do not call yourself an AI assistant unless the user asks directly or the avatar instructions explicitly say to."
+)
 
 _WORD_RE = re.compile(r"[A-Za-z']+|[^A-Za-z']+")
 _WORD_ONLY_RE = re.compile(r"[A-Za-z']+$")
@@ -1044,6 +1051,54 @@ def _sanitize_profile_name(name: str, field_name: str = "profile") -> str:
     return cleaned
 
 
+def _profile_runtime_settings_path(profile: str, profile_type: str | None) -> Path:
+    return resolve_dataset_root(profile, _normalize_profile_type(profile_type)) / PROFILE_RUNTIME_SETTINGS_FILENAME
+
+
+def _load_profile_runtime_settings(profile: str, profile_type: str | None) -> dict[str, Any]:
+    path = _profile_runtime_settings_path(profile, profile_type)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("component=profile_settings op=load status=invalid path=%s", path)
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _normalize_profile_system_prompt(value: object) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail="system_prompt must be a string")
+    cleaned = " ".join(value.strip().split())
+    if len(cleaned) > MAX_PROFILE_SYSTEM_PROMPT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"system_prompt must be at most {MAX_PROFILE_SYSTEM_PROMPT_CHARS} characters",
+        )
+    return cleaned
+
+
+def _profile_system_prompt(
+    profile: str | None,
+    profile_type: str | None,
+    request_prompt: str | None,
+) -> str:
+    # A request prompt intentionally takes precedence so the user can preview
+    # an unsaved edit.  Saved settings remain the source of truth for all
+    # future requests and non-web clients.
+    custom_prompt = _normalize_profile_system_prompt(request_prompt)
+    if request_prompt is None and profile:
+        custom_prompt = _normalize_profile_system_prompt(
+            _load_profile_runtime_settings(profile, profile_type).get("system_prompt")
+        )
+    if not custom_prompt:
+        return DEFAULT_AVATAR_SYSTEM_PROMPT
+    return f"{DEFAULT_AVATAR_SYSTEM_PROMPT}\n\nAvatar instructions from the profile owner:\n{custom_prompt}"
+
+
 def _profile_paths(profile_name: str, profile_type: str) -> list[Path]:
     ptype = _normalize_profile_type(profile_type)
     candidates: list[Path] = [
@@ -1370,11 +1425,30 @@ def _resolve_voice_controls_for_profile(
     profile_type: str | None,
 ) -> dict[str, float]:
     ptype = _normalize_profile_type(profile_type)
-    model_path = _resolve_model_path(None, profile, ptype)
-    config_path = _resolve_config_path(model_path, None, profile, ptype)
-    req = GenerateRequest(text="", speaker=profile, profile_type=ptype)
-    params = _resolve_inference_params(model_path, config_path, req, profile, ptype)
-    profile_defaults = _load_profile_defaults_for_speaker(model_path, profile, ptype)
+    # Avatar profiles have a data directory; the retained StyleTTS2 profiles
+    # may only have legacy training/output files.  Treat either representation
+    # as an existing profile so opening the new controls never rejects a valid
+    # older profile merely because it has no zero-shot source directory.
+    if not any(path.exists() for path in _profile_paths(profile, ptype)):
+        raise HTTPException(status_code=404, detail="Profile not found")
+    try:
+        model_path = _resolve_model_path(None, profile, ptype)
+        config_path = _resolve_config_path(model_path, None, profile, ptype)
+        req = GenerateRequest(text="", speaker=profile, profile_type=ptype)
+        params = _resolve_inference_params(model_path, config_path, req, profile, ptype)
+        profile_defaults = _load_profile_defaults_for_speaker(model_path, profile, ptype)
+    except HTTPException as exc:
+        # Avatar-first PixelHolo profiles use Chatterbox zero-shot conditioning
+        # and therefore have no StyleTTS2 checkpoint.  They still need a stable
+        # set of front-end defaults and saved runtime settings.
+        if exc.status_code != 400 or exc.detail != "model_path is required":
+            raise
+        params = {
+            "f0_scale": DEFAULT_F0_SCALE,
+            "embedding_scale": DEFAULT_EMBEDDING_SCALE,
+            "diffusion_steps": DEFAULT_DIFFUSION_STEPS,
+        }
+        profile_defaults = {}
 
     def _coerce_float(value, default: float) -> float:
         try:
@@ -2400,6 +2474,7 @@ def _stream_voice_from_text_iter(
 class GenerateRequest(BaseModel):
     text: str
     llm_mode: str | None = None
+    system_prompt: str | None = None
     tts_backend: str | None = None
     tts_exaggeration: float | None = None
     tts_temperature: float | None = None
@@ -2450,6 +2525,12 @@ class GenerateRequest(BaseModel):
     musetalk_max_chunk_chars: int | None = None
     musetalk_first_chunk_chars: int | None = None
     return_base64: bool = False
+
+
+class ProfileRuntimeSettingsRequest(BaseModel):
+    profile_type: str | None = None
+    voice_controls: dict[str, Any] | None = None
+    system_prompt: str | None = None
 
 
 class PreprocessRequest(BaseModel):
@@ -3778,15 +3859,61 @@ def profile_voice_controls(profile_name: str, profile_type: str | None = None):
     ptype = _normalize_profile_type(profile_type)
     try:
         controls = _resolve_voice_controls_for_profile(profile, ptype)
-    except HTTPException as exc:
-        if exc.status_code == 400 and exc.detail == "model_path is required":
-            raise HTTPException(status_code=404, detail="Profile model not found") from exc
+    except HTTPException:
         raise
     return {
         "profile": profile,
         "profile_type": ptype,
+        "tts_backend": "chatterbox",
         "controls": controls,
+        "runtime_settings": _load_profile_runtime_settings(profile, ptype),
     }
+
+
+@app.patch("/profiles/{profile_name}/runtime-settings")
+def update_profile_runtime_settings(profile_name: str, req: ProfileRuntimeSettingsRequest):
+    profile = _sanitize_profile_name(profile_name, "profile_name")
+    ptype = _normalize_profile_type(req.profile_type)
+    if not any(path.exists() for path in _profile_paths(profile, ptype)):
+        raise HTTPException(status_code=404, detail="Profile not found")
+    # Access the legacy Pydantic v1 attribute only when running under v1.  The
+    # eager default argument form emits a deprecation warning under Pydantic v2.
+    provided_fields = getattr(req, "model_fields_set", None)
+    if provided_fields is None:
+        provided_fields = getattr(req, "__fields_set__", set())
+    if not ({"voice_controls", "system_prompt"} & set(provided_fields)):
+        raise HTTPException(status_code=400, detail="Provide voice_controls or system_prompt to update")
+
+    locks, _workspace_id = _acquire_profile_mutation_locks([profile], ptype)
+    try:
+        settings = _load_profile_runtime_settings(profile, ptype)
+        if "voice_controls" in provided_fields:
+            if req.voice_controls is None:
+                settings.pop("voice_controls", None)
+            else:
+                # JSON round-trip keeps the settings document data-only and
+                # rejects values such as NaN before it reaches disk.
+                try:
+                    controls = json.loads(json.dumps(req.voice_controls, allow_nan=False))
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(status_code=400, detail="voice_controls must contain JSON values") from exc
+                settings["voice_controls"] = controls
+        if "system_prompt" in provided_fields:
+            settings["system_prompt"] = _normalize_profile_system_prompt(req.system_prompt)
+
+        destination = _profile_runtime_settings_path(profile, ptype)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(".tmp")
+        temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(destination)
+        return {
+            "status": "ok",
+            "profile": profile,
+            "profile_type": ptype,
+            "runtime_settings": settings,
+        }
+    finally:
+        _release_profile_mutation_locks(locks)
 
 
 @app.delete("/profiles/{profile_name}")
@@ -4395,7 +4522,19 @@ def chat(req: GenerateRequest, request: Request):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Text is empty.")
     llm = _get_llm_service()
-    llm_stream = llm.stream_response(req.text, mode=req.llm_mode)
+    profile_type = req.profile_type or PROFILE_TYPE_VOICE
+    profile = req.avatar_profile or req.speaker
+    # LLM history must never be global: anonymous workspaces are isolated just
+    # like their files, and profiles in the same workspace can intentionally
+    # have different personas.  The service serializes only this exact
+    # conversation key; other visitors and profiles remain independent.
+    conversation_key = f"{current_workspace_id()}:{profile_type}:{profile or 'default'}"
+    llm_stream = llm.stream_response(
+        req.text,
+        mode=req.llm_mode,
+        system_prompt=_profile_system_prompt(profile, profile_type, req.system_prompt),
+        conversation_key=conversation_key,
+    )
     # Stabilize LLM mode with conservative defaults if not provided.
     if req.alpha is None:
         req.alpha = 0.2
@@ -4416,7 +4555,6 @@ def chat(req: GenerateRequest, request: Request):
         req.smart_trim_db = 0.0
     if req.smart_trim_pad_ms is None:
         req.smart_trim_pad_ms = 0.0
-    profile_type = req.profile_type or PROFILE_TYPE_VOICE
     binary_transport = _binary_stream_requested(request)
     mobile_profile = _mobile_stream_requested(request)
     if profile_type == PROFILE_TYPE_AVATAR or req.avatar_profile:

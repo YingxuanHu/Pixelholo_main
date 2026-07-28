@@ -446,6 +446,10 @@ button:disabled { cursor: not-allowed; }
 .ph-minimal-advanced-panel label > span { display: flex; justify-content: space-between; margin-bottom: 5px; }
 .ph-minimal-advanced-panel b { color: #087f72; font: 500 10px 'DM Mono', monospace; }
 .ph-minimal-advanced-panel input[type='range'] { width: 100%; accent-color: #087f72; }
+.ph-minimal-advanced-panel .ph-minimal-system-prompt textarea { width: 100%; min-height: 76px; resize: vertical; padding: 9px 10px; border: 1px solid #d9e4e0; border-radius: 7px; outline: 0; color: #3f4c47; background: #f8fbfa; font: 500 11px/1.5 'DM Sans', sans-serif; }
+.ph-minimal-advanced-panel .ph-minimal-system-prompt textarea:focus { border-color: #80c7bb; box-shadow: 0 0 0 3px rgba(8,127,114,.08); }
+.ph-minimal-advanced-panel .ph-minimal-system-prompt textarea:disabled { cursor: not-allowed; opacity: .55; }
+.ph-minimal-settings-error { margin: -2px 0 10px; color: #b15a50; font-size: 10px; line-height: 1.4; }
 .ph-minimal-advanced-actions { display: flex; justify-content: flex-end; gap: 12px; }
 .ph-minimal-advanced-actions button { padding: 0; border: 0; color: #8d9088; background: transparent; font-size: 10px; font-weight: 700; }
 .ph-minimal-advanced-actions button.is-accent { color: #087f72; }
