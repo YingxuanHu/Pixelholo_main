@@ -2379,7 +2379,6 @@ const App: React.FC = () => {
     if (streamAbortRef.current) streamAbortRef.current.abort();
     streamAbortRef.current = null;
     streamRunningRef.current = false;
-    inferenceSubmissionRef.current = false;
     // Invalidate stale stream callbacks before waiting for the backend's
     // best-effort interrupt response.
     streamSessionRef.current += 1;
