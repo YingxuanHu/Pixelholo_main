@@ -107,10 +107,14 @@ private struct CameraPreviewRepresentable: UIViewRepresentable {
         guard let connection = layer.connection, connection.isVideoMirroringSupported else {
             return
         }
-        // Match the saved movie. The preview must not be selfie-mirrored when
-        // the captured clip and the generated avatar are both unmirrored.
+        // Mirror only the live selfie preview so moving left appears as moving
+        // left on screen. CameraManager still saves the movie unmirrored for
+        // the avatar pipeline.
+        let usesFrontCamera = session.inputs
+            .compactMap { $0 as? AVCaptureDeviceInput }
+            .contains { $0.device.position == .front }
         connection.automaticallyAdjustsVideoMirroring = false
-        connection.isVideoMirrored = false
+        connection.isVideoMirrored = usesFrontCamera
     }
 }
 

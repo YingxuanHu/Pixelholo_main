@@ -351,6 +351,10 @@ button:disabled { cursor: not-allowed; }
 .ph-camera-recorder { display: flex; flex-direction: column; align-items: center; gap: 17px; margin-top: 2px; }
 .ph-camera-stage { position: relative; width: min(100%, 420px); min-height: 0; aspect-ratio: 3 / 4; overflow: hidden; border-radius: 10px; background: #1e2926; }
 .ph-camera-stage video { width: 100%; height: 100%; display: block; object-fit: cover; transform: none; }
+/* The live alignment view behaves like a familiar selfie mirror. The recorded
+   clip is never transformed, so the avatar source remains physically correct. */
+.ph-camera-stage.is-ready video,
+.ph-camera-stage.is-recording video { transform: scaleX(-1); }
 .ph-camera-guide { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; align-items: center; justify-content: center; pointer-events: none; }
 .ph-camera-head-frame { width: 46%; height: 72%; border: 2px dashed rgba(219,250,242,.88); border-radius: 48% 48% 43% 43%; box-shadow: 0 0 0 999px rgba(9,22,19,.24); }
 .ph-camera-guide small { margin-top: 10px; padding: 4px 7px; border-radius: 4px; color: #e5f5f1; background: rgba(15,29,25,.62); font-size: 9px; }
