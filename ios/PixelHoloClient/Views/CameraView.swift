@@ -92,6 +92,7 @@ private struct CameraPreviewRepresentable: UIViewRepresentable {
         let view = PreviewView()
         view.previewLayer.videoGravity = .resizeAspectFill
         view.previewLayer.session = session
+        configureMirroring(for: view.previewLayer)
         return view
     }
 
@@ -99,6 +100,17 @@ private struct CameraPreviewRepresentable: UIViewRepresentable {
         if uiView.previewLayer.session !== session {
             uiView.previewLayer.session = session
         }
+        configureMirroring(for: uiView.previewLayer)
+    }
+
+    private func configureMirroring(for layer: AVCaptureVideoPreviewLayer) {
+        guard let connection = layer.connection, connection.isVideoMirroringSupported else {
+            return
+        }
+        // Match the saved movie. The preview must not be selfie-mirrored when
+        // the captured clip and the generated avatar are both unmirrored.
+        connection.automaticallyAdjustsVideoMirroring = false
+        connection.isVideoMirrored = false
     }
 }
 

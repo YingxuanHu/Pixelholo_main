@@ -154,7 +154,12 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
         if let connection = movieOutput.connection(with: .video) {
             if connection.isVideoMirroringSupported {
-                connection.isVideoMirrored = (videoDevice.position == .front)
+                // PixelHolo uses the recorded movie as the avatar source.  A
+                // selfie-style mirrored recording produces a permanently
+                // mirrored avatar, so preserve the camera's real orientation
+                // for both front and rear cameras.
+                connection.automaticallyAdjustsVideoMirroring = false
+                connection.isVideoMirrored = false
             }
             if connection.isVideoStabilizationSupported {
                 connection.preferredVideoStabilizationMode = .auto
