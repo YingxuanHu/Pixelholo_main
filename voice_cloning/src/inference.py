@@ -194,7 +194,26 @@ _lipsync_last_used: dict[str, float] = {}
 _active_stream_lock = threading.Lock()
 _active_stream_stop_events: dict[str, set[threading.Event]] = {}
 _warmup_profile_lock = threading.Lock()
+# Mutating a profile (uploading, preprocessing, training, renaming, or
+# deleting) changes a shared directory tree. Browser controls prevent this in
+# the normal flow, but a second tab or a slow double-click can still reach the
+# API. Keep one mutation in flight per anonymous-workspace/profile pair.
+_profile_mutation_locks_guard = threading.Lock()
+_profile_mutation_locks: dict[tuple[str, str, str], threading.Lock] = {}
 _runtime_cleanup_thread_started = False
+
+
+def _acquire_profile_mutation_lock(profile: str, profile_type: str) -> tuple[threading.Lock, str]:
+    workspace_id = current_workspace_id()
+    key = (workspace_id, profile_type, profile)
+    with _profile_mutation_locks_guard:
+        lock = _profile_mutation_locks.setdefault(key, threading.Lock())
+    if not lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="This profile is already being updated. Wait for the current action to finish.",
+        )
+    return lock, workspace_id
 
 
 def _register_stream_stop_event(
@@ -3858,12 +3877,18 @@ def upload(
         raise HTTPException(status_code=400, detail="profile is required")
     if not file.filename:
         raise HTTPException(status_code=400, detail="file is required")
-    dest_dir = raw_videos_dir(profile, profile_type)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    filename = Path(file.filename).name
-    dest_path = dest_dir / filename
-    with dest_path.open("wb") as handle:
-        shutil.copyfileobj(file.file, handle)
+    profile = _sanitize_profile_name(profile, "profile")
+    profile_type = _normalize_profile_type(profile_type)
+    lock, _workspace_id = _acquire_profile_mutation_lock(profile, profile_type)
+    try:
+        dest_dir = raw_videos_dir(profile, profile_type)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        filename = Path(file.filename).name
+        dest_path = dest_dir / filename
+        with dest_path.open("wb") as handle:
+            shutil.copyfileobj(file.file, handle)
+    finally:
+        lock.release()
     return {"saved_path": str(dest_path), "filename": filename}
 
 
@@ -3877,21 +3902,27 @@ def upload_audio(
         raise HTTPException(status_code=400, detail="profile is required")
     if not file.filename:
         raise HTTPException(status_code=400, detail="file is required")
-    dest_dir = raw_audio_dir(profile, profile_type)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    filename = Path(file.filename).name
-    dest_path = dest_dir / filename
-    with dest_path.open("wb") as handle:
-        shutil.copyfileobj(file.file, handle)
+    profile = _sanitize_profile_name(profile, "profile")
+    profile_type = _normalize_profile_type(profile_type)
+    lock, _workspace_id = _acquire_profile_mutation_lock(profile, profile_type)
+    try:
+        dest_dir = raw_audio_dir(profile, profile_type)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        filename = Path(file.filename).name
+        dest_path = dest_dir / filename
+        with dest_path.open("wb") as handle:
+            shutil.copyfileobj(file.file, handle)
+    finally:
+        lock.release()
     return {"saved_path": str(dest_path), "filename": filename}
 
 
 @app.post("/preprocess")
 def preprocess(req: PreprocessRequest):
-    profile = req.profile.strip()
+    profile = _sanitize_profile_name(req.profile, "profile")
     if not profile:
         raise HTTPException(status_code=400, detail="profile is required")
-    profile_type = req.profile_type or PROFILE_TYPE_VOICE
+    profile_type = _normalize_profile_type(req.profile_type)
     raw_dir = raw_videos_dir(profile, profile_type)
     audio_dir = raw_audio_dir(profile, profile_type)
     filename = req.filename
@@ -3967,32 +3998,35 @@ def preprocess(req: PreprocessRequest):
             "--name",
             profile,
         ]
-    workspace_id = current_workspace_id()
+    lock, workspace_id = _acquire_profile_mutation_lock(profile, profile_type)
     def _preprocess_stream() -> Iterator[str]:
         # StreamingResponse advances this generator in worker contexts that can
         # change between yielded lines. Do not carry a ContextVar token across
         # yields: resetting such a token crashes the response after preprocessing
         # succeeds, leaving the client appearing stuck. The subprocess receives
         # its workspace explicitly and cache invalidation does too.
-        yield from _stream_subprocess(
-            command,
-            cwd=PROJECT_ROOT,
-            workspace_id=workspace_id,
-        )
-        # A re-prepared profile may have the same directory name but different
-        # frame/latent files. Drop warmup markers so the next selection reloads
-        # the new cache instead of reusing stale in-memory assets.
-        _drop_warmup_cache_for_profile(profile, profile_type, workspace_id)
+        try:
+            yield from _stream_subprocess(
+                command,
+                cwd=PROJECT_ROOT,
+                workspace_id=workspace_id,
+            )
+            # A re-prepared profile may have the same directory name but different
+            # frame/latent files. Drop warmup markers so the next selection reloads
+            # the new cache instead of reusing stale in-memory assets.
+            _drop_warmup_cache_for_profile(profile, profile_type, workspace_id)
+        finally:
+            lock.release()
 
     return StreamingResponse(_preprocess_stream(), media_type="text/plain")
 
 
 @app.post("/train")
 def train(req: TrainRequest):
-    profile = req.profile.strip()
+    profile = _sanitize_profile_name(req.profile, "profile")
     if not profile:
         raise HTTPException(status_code=400, detail="profile is required")
-    profile_type = req.profile_type or PROFILE_TYPE_VOICE
+    profile_type = _normalize_profile_type(req.profile_type)
     dataset_path = resolve_dataset_root(profile, profile_type)
     if not dataset_path.exists():
         raise HTTPException(status_code=400, detail=f"dataset not found: {dataset_path}")
@@ -4021,51 +4055,54 @@ def train(req: TrainRequest):
         command.append("--auto_build_lexicon")
     if not req.early_stop:
         command.append("--no_early_stop")
-    workspace_id = current_workspace_id()
+    lock, workspace_id = _acquire_profile_mutation_lock(profile, profile_type)
     def _train_stream() -> Iterator[str]:
-        child_env = os.environ.copy()
-        child_env.update(workspace_environment(workspace_id))
-        process = subprocess.Popen(
-            command,
-            cwd=PROJECT_ROOT,
-            env=child_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
-            yield f"{line.rstrip()}\n"
-        exit_code = process.wait()
-        if exit_code != 0:
-            logger.error(
-                "component=backend op=train_subprocess status=error exit_code=%s profile=%s profile_type=%s cmd=%s",
-                exit_code,
-                profile,
-                profile_type,
-                command,
-            )
-            yield f"[process exited {exit_code}]\n"
-            yield "ERROR: Subprocess failed. See logs above for details.\n"
-            return
-        yield f"[process exited {exit_code}]\n"
-        yield "[warmup] starting...\n"
-        warmup_token = set_workspace_id(workspace_id)
         try:
-            try:
-                _warmup_profile(profile, profile_type, force=True)
-                warmup_message = "[warmup] done\n"
-            except Exception as exc:
-                logger.exception(
-                    "component=backend op=warmup_profile status=error profile=%s profile_type=%s",
+            child_env = os.environ.copy()
+            child_env.update(workspace_environment(workspace_id))
+            process = subprocess.Popen(
+                command,
+                cwd=PROJECT_ROOT,
+                env=child_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                yield f"{line.rstrip()}\n"
+            exit_code = process.wait()
+            if exit_code != 0:
+                logger.error(
+                    "component=backend op=train_subprocess status=error exit_code=%s profile=%s profile_type=%s cmd=%s",
+                    exit_code,
                     profile,
                     profile_type,
+                    command,
                 )
-                warmup_message = f"[warmup] failed: {exc}\n"
+                yield f"[process exited {exit_code}]\n"
+                yield "ERROR: Subprocess failed. See logs above for details.\n"
+                return
+            yield f"[process exited {exit_code}]\n"
+            yield "[warmup] starting...\n"
+            warmup_token = set_workspace_id(workspace_id)
+            try:
+                try:
+                    _warmup_profile(profile, profile_type, force=True)
+                    warmup_message = "[warmup] done\n"
+                except Exception as exc:
+                    logger.exception(
+                        "component=backend op=warmup_profile status=error profile=%s profile_type=%s",
+                        profile,
+                        profile_type,
+                    )
+                    warmup_message = f"[warmup] failed: {exc}\n"
+            finally:
+                reset_workspace_id(warmup_token)
+            yield warmup_message
         finally:
-            reset_workspace_id(warmup_token)
-        yield warmup_message
+            lock.release()
 
     return StreamingResponse(_train_stream(), media_type="text/plain")
 

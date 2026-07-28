@@ -383,6 +383,15 @@ const App: React.FC = () => {
   const [uploadBytesAudio, setUploadBytesAudio] = useState<{ loaded: number; total: number }>({ loaded: 0, total: 0 });
   const uploadVideoLastPctRef = useRef(0);
   const uploadAudioLastPctRef = useRef(0);
+  // React state is not synchronous: a second click can arrive before a
+  // disabled control re-renders. These refs make setup actions single-flight.
+  const uploadSubmissionRef = useRef(false);
+  const uploadAudioSubmissionRef = useRef(false);
+  const preprocessSubmissionRef = useRef(false);
+  const cameraOpenRef = useRef(false);
+  const cameraRecordingRef = useRef(false);
+  const profileMutationRef = useRef(false);
+  const profileSwitchRef = useRef(false);
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
   const minimalNameInputRef = useRef<HTMLInputElement | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
@@ -414,6 +423,9 @@ const App: React.FC = () => {
   const [voiceControlsDirty, setVoiceControlsDirty] = useState(false);
   const [videoState, setVideoState] = useState<'idle' | 'buffering' | 'playing'>('idle');
   const [isPlaybackActive, setIsPlaybackActive] = useState(false);
+  const [isStoppingInference, setIsStoppingInference] = useState(false);
+  const [isProfileSwitching, setIsProfileSwitching] = useState(false);
+  const [isProfileMutationPending, setIsProfileMutationPending] = useState(false);
   const [videoFps, setVideoFps] = useState(DEFAULT_VIDEO_FPS);
   const [videoQueue, setVideoQueue] = useState(0);
 
@@ -428,6 +440,8 @@ const App: React.FC = () => {
   // prompt is submitted through the end of playback so repeated Enter presses
   // cannot queue several copies while profile warm-up is still pending.
   const inferenceSubmissionRef = useRef(false);
+  const inferenceRequestRef = useRef(0);
+  const stopInferenceRef = useRef(false);
   const streamSessionRef = useRef<number>(0);
   const isBusy = Object.values(stepStatuses).some(status => status === 'running');
   // A backend `done` event means all media has been delivered, not that the
@@ -435,12 +449,14 @@ const App: React.FC = () => {
   // can always stop the current response until audio and frames have drained.
   const isInferenceActive = stepStatuses.inference === 'running' || isPlaybackActive;
   const hasInferenceOutput = inferenceChunks.length > 0 || videoState === 'playing';
-  const inferenceStatusLabel = isInferenceActive
+  const inferenceStatusLabel = isStoppingInference
+    ? 'Stopping…'
+    : isInferenceActive
     ? (hasInferenceOutput ? 'Streaming…' : 'Generating…')
     : 'Ready to stream';
   const isProfileSwitchBlocked = Object.entries(stepStatuses).some(
     ([step, status]) => step !== 'inference' && status === 'running',
-  );
+  ) || isProfileSwitching || isProfileMutationPending;
   const warmedProfilesRef = useRef<Map<string, number>>(new Map());
   const warmupInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
   const profileSelectionRef = useRef(0);
@@ -611,7 +627,7 @@ const App: React.FC = () => {
 
   const handleRenameProfile = useCallback(
     async (item: ProfileInfo) => {
-      if (isBusy) {
+      if (isBusy || profileMutationRef.current || profileSwitchRef.current) {
         setUiNotice('Stop the current job before renaming profiles.');
         return;
       }
@@ -620,6 +636,8 @@ const App: React.FC = () => {
       if (nextNameRaw === null) return;
       const nextName = nextNameRaw.trim();
       if (!nextName || nextName === item.name) return;
+      profileMutationRef.current = true;
+      setIsProfileMutationPending(true);
       setProfileMenuKey(null);
       try {
         const res = await apiFetch(`${apiBase}/profiles/${encodeURIComponent(item.name)}`, {
@@ -638,6 +656,9 @@ const App: React.FC = () => {
         await loadProfiles();
       } catch (err) {
         setUiNotice(`Rename failed: ${String(err)}`);
+      } finally {
+        profileMutationRef.current = false;
+        setIsProfileMutationPending(false);
       }
     },
     [apiBase, apiFetch, invalidateWarmupEntriesForProfile, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
@@ -645,7 +666,7 @@ const App: React.FC = () => {
 
   const handleDeleteProfile = useCallback(
     async (item: ProfileInfo) => {
-      if (isBusy) {
+      if (isBusy || profileMutationRef.current || profileSwitchRef.current) {
         setUiNotice('Stop the current job before deleting profiles.');
         return;
       }
@@ -654,6 +675,8 @@ const App: React.FC = () => {
         `Delete profile "${item.name}" and all related files (data, training checkpoints, inference cache)?`,
       );
       if (!confirmed) return;
+      profileMutationRef.current = true;
+      setIsProfileMutationPending(true);
       setProfileMenuKey(null);
       try {
         const params = new URLSearchParams({ profile_type: currentType });
@@ -674,6 +697,9 @@ const App: React.FC = () => {
         await loadProfiles();
       } catch (err) {
         setUiNotice(`Delete failed: ${String(err)}`);
+      } finally {
+        profileMutationRef.current = false;
+        setIsProfileMutationPending(false);
       }
     },
     [apiBase, apiFetch, invalidateWarmupEntriesForProfile, isBusy, loadProfiles, profile.name, profileType, readErrorDetail],
@@ -1142,19 +1168,23 @@ const App: React.FC = () => {
 
   const handleUpload = async (file: File, options: { autoPrepare?: boolean } = {}) => {
     if (!profile.name || !file) return;
+    if (uploadSubmissionRef.current || preprocessSubmissionRef.current) return;
     if (profileNameTaken) {
       setUiNotice('That profile name is already in use. Choose a different name, such as “Alvin 2”.');
       minimalNameInputRef.current?.focus();
       return;
     }
+    uploadSubmissionRef.current = true;
+    const uploadProfileName = profile.name.trim();
+    const uploadProfileType = profileType;
     setUiNotice(null);
     setStepStatuses(prev => ({ ...prev, upload: 'running' }));
     setUploadPhaseVideo('uploading');
     setUploadProgressVideo(0);
     setUploadBytesVideo({ loaded: 0, total: 0 });
     const form = new FormData();
-    form.append('profile', profile.name);
-    form.append('profile_type', profileType);
+    form.append('profile', uploadProfileName);
+    form.append('profile_type', uploadProfileType);
     form.append('file', file);
     try {
       const responseText = await uploadWithProgress(`${apiBase}/upload`, form, (loaded, total) => {
@@ -1175,18 +1205,20 @@ const App: React.FC = () => {
       setCapturedCameraFile(null);
       setStepStatuses(prev => ({ ...prev, upload: 'done' }));
       setUploadPhaseVideo('idle');
+      // The source directory now belongs to this draft. Treat it as the
+      // current profile before refreshing the sidebar so its own name never
+      // trips the duplicate-name validation.
+      setIsCreatingProfile(false);
       if (options.autoPrepare) {
-        // The camera capture is already a complete source clip. Treat it as
-        // the new profile immediately so the duplicate-name guard does not
-        // mistake the profile we just created for an unrelated existing one.
-        setIsCreatingProfile(false);
         setAutoPrepareAfterUpload(true);
       }
-      loadProfiles();
+      await loadProfiles();
     } catch (err) {
       setStepStatuses(prev => ({ ...prev, upload: 'error' }));
       setUploadPhaseVideo('error');
       setPreprocessLogs([createLog(`Upload failed: ${String(err)}`, 'error')]);
+    } finally {
+      uploadSubmissionRef.current = false;
     }
   };
 
@@ -1210,6 +1242,7 @@ const App: React.FC = () => {
       window.clearInterval(cameraTimerRef.current);
       cameraTimerRef.current = null;
     }
+    cameraRecordingRef.current = false;
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state !== 'inactive') {
       recorder.ondataavailable = null;
@@ -1234,6 +1267,7 @@ const App: React.FC = () => {
   }, [clearCameraPreview]);
 
   const openCamera = useCallback(async () => {
+    if (cameraOpenRef.current || cameraRecordingRef.current) return;
     if (profileNameTaken) {
       setUiNotice('That profile name is already in use. Choose a different name, such as “Alvin 2”.');
       minimalNameInputRef.current?.focus();
@@ -1244,6 +1278,7 @@ const App: React.FC = () => {
       setCameraError('Camera capture is not supported by this browser.');
       return;
     }
+    cameraOpenRef.current = true;
     setCameraState('requesting');
     setCameraError(null);
     try {
@@ -1269,6 +1304,8 @@ const App: React.FC = () => {
             ? 'No camera or microphone was found. Connect one, then choose Enable camera again.'
             : `Could not open the camera: ${String(error)}`,
       );
+    } finally {
+      cameraOpenRef.current = false;
     }
   }, [profileNameTaken, stopCameraStream]);
 
@@ -1300,12 +1337,14 @@ const App: React.FC = () => {
   }, []);
 
   const startCameraRecording = useCallback(() => {
+    if (cameraRecordingRef.current || cameraOpenRef.current) return;
     const stream = cameraStreamRef.current;
     if (!stream || typeof MediaRecorder === 'undefined') {
       setCameraState('error');
       setCameraError('This browser cannot record video. Try Chrome or Safari with camera access enabled.');
       return;
     }
+    cameraRecordingRef.current = true;
     const mimeType = [
       'video/webm;codecs=vp9,opus',
       'video/webm;codecs=vp8,opus',
@@ -1320,6 +1359,7 @@ const App: React.FC = () => {
         if (event.data.size > 0) cameraChunksRef.current.push(event.data);
       };
       recorder.onerror = () => {
+        cameraRecordingRef.current = false;
         setCameraState('error');
         setCameraError('Camera recording failed. Please try again.');
       };
@@ -1327,6 +1367,7 @@ const App: React.FC = () => {
         const blobType = recorder.mimeType || mimeType || 'video/webm';
         const blob = new Blob(cameraChunksRef.current, { type: blobType });
         if (blob.size === 0) {
+          cameraRecordingRef.current = false;
           setCameraState('error');
           setCameraError('No video was captured. Please try recording again.');
           return;
@@ -1337,6 +1378,7 @@ const App: React.FC = () => {
         cameraStreamRef.current?.getTracks().forEach(track => track.stop());
         cameraStreamRef.current = null;
         mediaRecorderRef.current = null;
+        cameraRecordingRef.current = false;
         setCameraState('recorded');
         setProfile(prev => ({
           ...prev,
@@ -1358,6 +1400,7 @@ const App: React.FC = () => {
         });
       }, 1000);
     } catch (error) {
+      cameraRecordingRef.current = false;
       setCameraState('error');
       setCameraError(`Could not start recording: ${String(error)}`);
     }
@@ -1367,6 +1410,8 @@ const App: React.FC = () => {
 
   const handleUploadAudio = async (file: File) => {
     if (!profile.name) return;
+    if (uploadAudioSubmissionRef.current || preprocessSubmissionRef.current) return;
+    uploadAudioSubmissionRef.current = true;
     setUiNotice(null);
     setStepStatuses(prev => ({ ...prev, upload: 'running' }));
     setUploadPhaseAudio('uploading');
@@ -1393,16 +1438,21 @@ const App: React.FC = () => {
       setStepStatuses(prev => ({ ...prev, upload: 'error' }));
       setUploadPhaseAudio('error');
       setPreprocessLogs([createLog(`Audio upload failed: ${String(err)}`, 'error')]);
+    } finally {
+      uploadAudioSubmissionRef.current = false;
     }
   };
 
   const startPreprocess = async () => {
-    if (!profile.name) return;
+    const preprocessProfileName = profile.name.trim();
+    if (!preprocessProfileName || preprocessSubmissionRef.current || uploadSubmissionRef.current) return;
     if (profileNameTaken) {
       setUiNotice('That profile name is already in use. Choose a different name, such as “Alvin 2”.');
       minimalNameInputRef.current?.focus();
       return;
     }
+    preprocessSubmissionRef.current = true;
+    const selectionId = profileSelectionRef.current;
     setUiNotice(null);
     setStepStatuses(prev => ({ ...prev, preprocess: 'running' }));
     setPreprocessLogs([createLog('Pipeline starting...', 'info')]);
@@ -1415,7 +1465,7 @@ const App: React.FC = () => {
     setPreprocessStageIndex(preprocessSteps.length > 0 ? 0 : null);
     let sawError = false;
     const payload = {
-      profile: profile.name,
+      profile: preprocessProfileName,
       filename: lastUploadedFilename ?? null,
       audio_filename: lastUploadedAudioFilename ?? null,
       profile_type: profileType,
@@ -1435,7 +1485,7 @@ const App: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) throw new Error(await readErrorDetail(res));
       await streamResponseLines(res, line => {
         const progressMarker = line.match(/^PIXELHOLO_PROGRESS\s+(.+)$/);
         if (progressMarker) {
@@ -1512,13 +1562,17 @@ const App: React.FC = () => {
       setPreprocessProgress(1);
       setPreprocessActivity('Avatar ready');
       setPreprocessStageIndex(preprocessSteps.length ? preprocessSteps.length - 1 : null);
-      setIsCreatingProfile(false);
-      loadProfiles();
+      if (selectionId === profileSelectionRef.current) {
+        setIsCreatingProfile(false);
+      }
+      await loadProfiles();
     } catch (err) {
       setStepStatuses(prev => ({ ...prev, preprocess: 'error' }));
       setPreprocessActivity(null);
       setPreprocessLogs(prev => [...prev, createLog(`Preprocess failed: ${String(err)}`, 'error')]);
       setPreprocessStageIndex(null);
+    } finally {
+      preprocessSubmissionRef.current = false;
     }
   };
 
@@ -1548,7 +1602,7 @@ const App: React.FC = () => {
       return;
     }
     setProfileNameRequired(false);
-    if (capturedCameraFile && !lastUploadedFilename) {
+    if (sourceMode === 'camera' && capturedCameraFile) {
       await handleUpload(capturedCameraFile, { autoPrepare: true });
       return;
     }
@@ -1702,9 +1756,12 @@ const App: React.FC = () => {
     }
   }, []);
 
-  const settlePlayback = useCallback(() => {
+  const settlePlayback = useCallback((requestId: number) => {
     clearPlaybackSettleTimer();
     const check = () => {
+      // A cancelled or superseded response may still have a scheduled timer.
+      // Only the current request is allowed to mark the studio ready again.
+      if (requestId !== inferenceRequestRef.current) return;
       const audioContext = audioContextRef.current;
       const audioSettled = !audioContext || audioContext.currentTime + 0.05 >= audioEndTimeRef.current;
       const videoSettled = frameQueueRef.current.length === 0;
@@ -1928,6 +1985,12 @@ const App: React.FC = () => {
     // This ref closes that gap during warm-up, streaming, and queued playback.
     if (inferenceSubmissionRef.current) return;
     inferenceSubmissionRef.current = true;
+    const requestId = ++inferenceRequestRef.current;
+    const releaseInferenceLock = () => {
+      if (inferenceRequestRef.current === requestId) {
+        inferenceSubmissionRef.current = false;
+      }
+    };
     const selectionId = profileSelectionRef.current;
     const requestProfileName = profile.name;
     const requestProfileType = profileType;
@@ -1949,12 +2012,12 @@ const App: React.FC = () => {
       try {
         await warmupProfile(requestProfileName, requestProfileType);
       } catch (error) {
-        inferenceSubmissionRef.current = false;
+        releaseInferenceLock();
         setUiNotice(`Could not prepare ${requestProfileName}: ${String(error)}`);
         return;
       }
       if (selectionId !== profileSelectionRef.current) {
-        inferenceSubmissionRef.current = false;
+        releaseInferenceLock();
         return;
       }
     }
@@ -1965,13 +2028,13 @@ const App: React.FC = () => {
     // Profile selection can happen while the browser is unlocking audio. Do
     // not let this stale invocation create a stream with the old voice.
     if (selectionId !== profileSelectionRef.current) {
-      inferenceSubmissionRef.current = false;
+      releaseInferenceLock();
       return;
     }
     if (audioContextRef.current?.state !== 'running') {
       clearPlaybackSettleTimer();
       setIsPlaybackActive(false);
-      inferenceSubmissionRef.current = false;
+      releaseInferenceLock();
       setUiNotice('Safari blocked audio. Click again to enable sound.');
       return;
     }
@@ -1998,7 +2061,7 @@ const App: React.FC = () => {
       await interruptBackend();
     }
     if (selectionId !== profileSelectionRef.current) {
-      inferenceSubmissionRef.current = false;
+      releaseInferenceLock();
       return;
     }
     const controller = new AbortController();
@@ -2058,7 +2121,7 @@ const App: React.FC = () => {
       setInferenceStageIndex(inferenceSteps.length ? inferenceSteps.length - 1 : null);
       // Keep inference `running` until settlePlayback confirms that the browser
       // has played every scheduled audio sample and displayed every queued frame.
-      settlePlayback();
+      settlePlayback(requestId);
       if (streamAbortRef.current === controller) {
         streamAbortRef.current = null;
       }
@@ -2069,7 +2132,7 @@ const App: React.FC = () => {
       sawError = true;
       clearPlaybackSettleTimer();
       setIsPlaybackActive(false);
-      inferenceSubmissionRef.current = false;
+      releaseInferenceLock();
       setStepStatuses(prev => ({ ...prev, inference: 'error' }));
       setInferenceStageIndex(null);
     };
@@ -2253,7 +2316,7 @@ const App: React.FC = () => {
         });
       }
     } catch (err) {
-      inferenceSubmissionRef.current = false;
+      releaseInferenceLock();
       if ((err as Error).name !== 'AbortError') {
         clearPlaybackSettleTimer();
         setIsPlaybackActive(false);
@@ -2303,6 +2366,14 @@ const App: React.FC = () => {
   }, [inferenceText, runInference]);
 
   const stopInference = async () => {
+    if (stopInferenceRef.current) return;
+    stopInferenceRef.current = true;
+    // Invalidate both a stream and a request that is still warming up before
+    // it can start the backend request. Keep the send lock held until local
+    // audio/video and the backend interrupt have both finished.
+    const stopRequestId = ++inferenceRequestRef.current;
+    inferenceSubmissionRef.current = true;
+    setIsStoppingInference(true);
     stopListeningRef.current?.();
     stopListening();
     if (streamAbortRef.current) streamAbortRef.current.abort();
@@ -2314,11 +2385,19 @@ const App: React.FC = () => {
     streamSessionRef.current += 1;
     clearPlaybackSettleTimer();
     setIsPlaybackActive(false);
-    await interruptBackend();
-    await resetAudio();
-    resetVideo();
-    setStepStatuses(prev => ({ ...prev, inference: 'idle' }));
-    setInferenceStageIndex(null);
+    try {
+      await interruptBackend();
+      await resetAudio();
+      resetVideo();
+      setStepStatuses(prev => ({ ...prev, inference: 'idle' }));
+      setInferenceStageIndex(null);
+    } finally {
+      if (inferenceRequestRef.current === stopRequestId) {
+        inferenceSubmissionRef.current = false;
+      }
+      stopInferenceRef.current = false;
+      setIsStoppingInference(false);
+    }
   };
 
   const trainingCommand = [
@@ -2442,9 +2521,18 @@ const App: React.FC = () => {
       && (capturedCameraFile || lastUploadedFilename || (currentProfileInfo?.raw_files ?? 0) > 0),
   );
   const publicSourceReady = Boolean(
-    capturedCameraFile || lastUploadedFilename || (currentProfileInfo?.raw_files ?? 0) > 0,
+    sourceMode === 'camera'
+      ? capturedCameraFile
+      : lastUploadedFilename || (currentProfileInfo?.raw_files ?? 0) > 0,
   );
   const publicProfileReady = Boolean(!isCreatingProfile && hasInferenceProfile && profile.name);
+  const isComposerLocked = isInferenceActive || isStoppingInference || isWarmingUp || isProfileSwitching;
+  const isProfileLoading = isWarmingUp || isProfileSwitching;
+  const isSourceActionLocked = isBusy
+    || autoPrepareAfterUpload
+    || uploadPhaseVideo === 'uploading'
+    || cameraState === 'requesting'
+    || cameraState === 'recording';
 
   const sendComposerText = async () => {
     const text = inferenceText.trim();
@@ -2466,10 +2554,13 @@ const App: React.FC = () => {
   const composerDisplayText = isListening ? speechTranscript : inferenceText;
 
   const selectProfile = async (item: ProfileInfo) => {
-    if (isProfileSwitchBlocked) {
+    if (isProfileSwitchBlocked || profileSwitchRef.current || profileMutationRef.current) {
       setUiNotice('Finish the current profile preparation before switching avatars.');
       return;
     }
+    if (item.name === profile.name && item.profile_type === profileType) return;
+    profileSwitchRef.current = true;
+    setIsProfileSwitching(true);
     const selectionId = ++profileSelectionRef.current;
     // Invalidate the old request synchronously, then update the visible
     // profile immediately. The backend interrupt can finish in the background;
@@ -2490,24 +2581,38 @@ const App: React.FC = () => {
     setLatency(null);
     setUiNotice(null);
     setActiveStep(ready ? 4 : 1);
-    await stopPromise;
-    if (selectionId !== profileSelectionRef.current) return;
-    if (ready) {
-      try {
-        await warmupProfile(item.name, selectedProfileType);
-        if (selectionId === profileSelectionRef.current) {
-          setUiNotice(null);
-        }
-      } catch (error) {
-        if (selectionId === profileSelectionRef.current) {
-          setUiNotice(`Could not warm up ${item.name}: ${String(error)}`);
+    try {
+      await stopPromise;
+      if (selectionId !== profileSelectionRef.current) return;
+      if (ready) {
+        try {
+          await warmupProfile(item.name, selectedProfileType);
+          if (selectionId === profileSelectionRef.current) {
+            setUiNotice(null);
+          }
+        } catch (error) {
+          if (selectionId === profileSelectionRef.current) {
+            setUiNotice(`Could not warm up ${item.name}: ${String(error)}`);
+          }
         }
       }
+    } finally {
+      profileSwitchRef.current = false;
+      setIsProfileSwitching(false);
     }
   };
 
   const resetNewProfile = () => {
-    if (isBusy || isPlaybackActive) {
+    if (
+      isBusy
+      || isPlaybackActive
+      || isStoppingInference
+      || uploadSubmissionRef.current
+      || preprocessSubmissionRef.current
+      || profileMutationRef.current
+      || profileSwitchRef.current
+      || cameraRecordingRef.current
+    ) {
       setUiNotice('Stop the current response before creating a new profile.');
       return;
     }
@@ -2539,10 +2644,18 @@ const App: React.FC = () => {
     setUiNotice(null);
   };
 
+  const showWelcomeSafely = () => {
+    if (isBusy || isPlaybackActive || isStoppingInference || profileSwitchRef.current || profileMutationRef.current) {
+      setUiNotice('Finish the current action before leaving this screen.');
+      return;
+    }
+    setShowWelcome(true);
+  };
+
   return (
     <div className="ph-minimal-app">
       <header className="ph-minimal-header">
-        <button type="button" className="ph-minimal-brand" onClick={() => setShowWelcome(true)} aria-label="Go to PixelHolo home">
+        <button type="button" className="ph-minimal-brand" onClick={showWelcomeSafely} aria-label="Go to PixelHolo home">
           <span className="ph-minimal-mark">✦</span>
         <span>PixelHolo</span>
       </button>
@@ -2618,7 +2731,7 @@ const App: React.FC = () => {
                     <span className={`ph-minimal-profile-dot ${ready ? 'is-ready' : ''}`} />
                   </button>
                   <div className="ph-minimal-profile-menu-wrap" onClick={event => event.stopPropagation()}>
-                    <button type="button" className="ph-minimal-profile-options" disabled={isBusy} aria-label={`Profile options for ${item.name}`} onClick={() => setProfileMenuKey(prev => prev === menuKey ? null : menuKey)}>•••</button>
+                    <button type="button" className="ph-minimal-profile-options" disabled={isBusy || isProfileSwitching || isProfileMutationPending} aria-label={`Profile options for ${item.name}`} onClick={() => setProfileMenuKey(prev => prev === menuKey ? null : menuKey)}>•••</button>
                     {profileMenuKey === menuKey && (
                       <div className="ph-minimal-profile-menu">
                         <button type="button" onClick={() => void handleRenameProfile(item)}>Rename</button>
@@ -2669,7 +2782,7 @@ const App: React.FC = () => {
                         autoComplete="off"
                         spellCheck={false}
                         aria-invalid={profileNameTaken || (profileNameRequired && !profile.name.trim())}
-                        disabled={isBusy}
+                        disabled={isSourceActionLocked}
                       />
                       {profileNameTaken && (
                         <div className="ph-minimal-name-availability" role="alert">
@@ -2689,7 +2802,7 @@ const App: React.FC = () => {
                           role="tab"
                           aria-selected={sourceMode === 'camera'}
                           className={sourceMode === 'camera' ? 'is-selected' : ''}
-                          disabled={isBusy}
+                          disabled={isSourceActionLocked}
                           onClick={() => {
                             if (profileNameTaken) {
                               setUiNotice('Choose a new profile name before recording.');
@@ -2706,6 +2819,7 @@ const App: React.FC = () => {
                           role="tab"
                           aria-selected={sourceMode === 'upload'}
                           className={sourceMode === 'upload' ? 'is-selected' : ''}
+                          disabled={isSourceActionLocked}
                           onClick={() => {
                             setSourceMode('upload');
                             stopCameraStream();
@@ -2723,7 +2837,7 @@ const App: React.FC = () => {
                       {sourceMode === 'upload' ? (
                         <div className="ph-minimal-file-list">
                           <label className={`ph-minimal-file-row ${sourceUploaded ? 'is-complete' : ''} ${!profile.name || profileNameTaken ? 'is-disabled' : ''}`}>
-                            <input type="file" accept="video/*" onChange={event => event.target.files?.[0] && void handleUpload(event.target.files[0])} disabled={!profile.name || profileNameTaken || isBusy} />
+                            <input type="file" accept="video/*" onChange={event => event.target.files?.[0] && void handleUpload(event.target.files[0])} disabled={!profile.name || profileNameTaken || isSourceActionLocked} />
                             <span className="ph-minimal-file-icon">▣</span>
                             <span className="ph-minimal-file-copy"><strong>Talking video</strong><small>{profile.lastUploadedFile || (sourceUploaded ? 'Video uploaded · ready to prepare' : 'Face + voice source · 5–20 seconds · 720p+ · front-lit')}</small></span>
                             <span className="ph-minimal-file-action">{uploadPhaseVideo === 'uploading' ? `${uploadProgressVideo}%` : sourceUploaded ? 'Replace' : 'Choose'}</span>
@@ -2740,7 +2854,7 @@ const App: React.FC = () => {
                             </div>
                             {cameraState === 'requesting' && <div className="ph-camera-overlay">Opening camera…</div>}
                             {cameraState === 'idle' && <div className="ph-camera-idle-state"><span aria-hidden="true">◌</span><strong>Camera preview</strong></div>}
-                            {cameraState === 'idle' && <button type="button" className="ph-camera-enable-button" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Enable camera</button>}
+                            {cameraState === 'idle' && <button type="button" className="ph-camera-enable-button" onClick={() => void openCamera()} disabled={profileNameTaken || isSourceActionLocked}>Enable camera</button>}
                             {cameraState === 'recorded' && <div className="ph-camera-captured-badge">Recording captured · looping preview</div>}
                           </div>
                           <div className="ph-camera-panel">
@@ -2748,10 +2862,10 @@ const App: React.FC = () => {
                             <p className="ph-camera-instructions">Keep the camera at eye level and look directly into the lens, not at your screen. Use bright, even light, keep your eyes and mouth visible, and speak naturally in a quiet room.</p>
                             {cameraError && <div className="ph-minimal-error">{cameraError}</div>}
                             <div className="ph-camera-actions">
-                              {cameraState === 'error' && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={profileNameTaken || isBusy}>Try camera again</button>}
-                              {cameraState === 'ready' && <button type="button" className="ph-minimal-primary" onClick={startCameraRecording} disabled={isBusy}>Start recording<span>●</span></button>}
+                              {cameraState === 'error' && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={profileNameTaken || isSourceActionLocked}>Try camera again</button>}
+                              {cameraState === 'ready' && <button type="button" className="ph-minimal-primary" onClick={startCameraRecording} disabled={isSourceActionLocked}>Start recording<span>●</span></button>}
                               {cameraState === 'recording' && <button type="button" className="ph-minimal-record-stop" onClick={stopCameraRecording}>Stop and use recording<span>■</span></button>}
-                              {cameraState === 'recorded' && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={isBusy}>Record again</button>}
+                              {cameraState === 'recorded' && <button type="button" className="ph-minimal-secondary" onClick={() => void openCamera()} disabled={isSourceActionLocked}>Record again</button>}
                               {uploadPhaseVideo === 'uploading' && <span className="ph-camera-upload-status">Uploading {uploadProgressVideo}%…</span>}
                             </div>
                           </div>
@@ -2778,7 +2892,7 @@ const App: React.FC = () => {
               {stepStatuses.preprocess === 'error' && <div className="ph-minimal-error">{preprocessLogs[preprocessLogs.length - 1]?.message || 'Could not prepare this avatar.'}</div>}
               {uiNotice && <div className="ph-minimal-error">{uiNotice}</div>}
 
-              <button type="button" className="ph-minimal-primary ph-minimal-create-action" onClick={() => void handleCreateAvatar()} disabled={profileNameTaken || autoPrepareAfterUpload || !publicSourceReady || stepStatuses.preprocess === 'running' || isBusy && stepStatuses.preprocess !== 'running'}>
+              <button type="button" className="ph-minimal-primary ph-minimal-create-action" onClick={() => void handleCreateAvatar()} disabled={profileNameTaken || autoPrepareAfterUpload || !publicSourceReady || isSourceActionLocked}>
                 {autoPrepareAfterUpload || stepStatuses.preprocess === 'running' ? 'Preparing…' : 'Create avatar'}<span>→</span>
               </button>
 
@@ -2797,15 +2911,15 @@ const App: React.FC = () => {
           <section className="ph-minimal-studio">
             <div className="ph-minimal-studio-heading">
               <div><span className="ph-minimal-eyebrow">Avatar</span><h1>{profile.name}</h1></div>
-              {isWarmingUp && <span className="ph-minimal-warmup-pill"><i /> Preparing this profile…</span>}
+              {isProfileLoading && <span className="ph-minimal-warmup-pill"><i /> Preparing this profile…</span>}
             </div>
 
             <div className="ph-minimal-workspace">
               <section className="ph-minimal-preview">
-                <div className="ph-minimal-preview-heading"><span>Live preview</span><span><i className={`ph-mini-dot ${isWarmingUp ? 'is-preparing' : isInferenceActive ? 'is-speaking' : ''}`} />{isWarmingUp ? 'Preparing' : isInferenceActive ? (videoState === 'playing' ? 'Speaking' : inferenceStatusLabel) : 'Ready'}</span></div>
+                <div className="ph-minimal-preview-heading"><span>Live preview</span><span><i className={`ph-mini-dot ${isProfileLoading ? 'is-preparing' : isInferenceActive ? 'is-speaking' : ''}`} />{isProfileLoading ? 'Preparing' : isInferenceActive ? (videoState === 'playing' ? 'Speaking' : inferenceStatusLabel) : 'Ready'}</span></div>
                 <div className="ph-minimal-canvas-wrap">
                   <canvas ref={videoCanvasRef} width={960} height={1280} aria-label="Live avatar preview" />
-                  {isWarmingUp && <div className="ph-minimal-buffering ph-minimal-preparing">Preparing avatar…</div>}
+                  {isProfileLoading && <div className="ph-minimal-buffering ph-minimal-preparing">Preparing avatar…</div>}
                   {videoState === 'buffering' && stepStatuses.inference === 'running' && <div className="ph-minimal-buffering">Buffering…</div>}
                 </div>
                 <div className="ph-minimal-preview-footer"><span>Chatterbox + {avatarBackend === 'wav2lip' ? 'Wav2Lip' : 'MuseTalk'}</span><span>{videoQueue ? `${videoQueue} frames` : `${videoFps} FPS`}</span></div>
@@ -2823,8 +2937,10 @@ const App: React.FC = () => {
                     onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendComposerText(); } }}
                     placeholder={isListening ? 'Listening…' : 'Ask your avatar something…'}
                     rows={5}
+                    readOnly={isComposerLocked}
+                    aria-busy={isComposerLocked}
                   />
-                  <button type="button" className={`ph-minimal-voice-button ${isListening ? 'is-listening' : ''}`} onClick={() => (isListening ? stopListening() : startListening())} disabled={!hasSpeechSupport || isInferenceActive || isWarmingUp} title={hasSpeechSupport ? 'Speak; it will send automatically when you stop' : 'Voice input is not supported by this browser'} aria-label={hasSpeechSupport ? (isListening ? 'Stop listening' : 'Voice input') : 'Voice input unavailable'} aria-pressed={isListening}>
+                  <button type="button" className={`ph-minimal-voice-button ${isListening ? 'is-listening' : ''}`} onClick={() => (isListening ? stopListening() : startListening())} disabled={!hasSpeechSupport || isComposerLocked} title={hasSpeechSupport ? 'Speak; it will send automatically when you stop' : 'Voice input is not supported by this browser'} aria-label={hasSpeechSupport ? (isListening ? 'Stop listening' : 'Voice input') : 'Voice input unavailable'} aria-pressed={isListening}>
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm6-3a1 1 0 0 0-2 0 4 4 0 0 1-8 0 1 1 0 0 0-2 0 6 6 0 0 0 5 5.91V19H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-2.09A6 6 0 0 0 18 11Z" /></svg>
                     <span>{isListening ? 'Stop listening' : 'Voice'}</span>
                   </button>
@@ -2832,20 +2948,20 @@ const App: React.FC = () => {
                 <div className="ph-minimal-composer-row"><span>{inferenceText.length} characters</span><span>{isListening ? (speechTranscript ? 'Listening…' : 'Start speaking…') : 'Enter to send · voice sends automatically'}</span></div>
 
                 <div className="ph-minimal-model-grid">
-                  <label><span>Lip sync</span><select value={avatarBackend} onChange={event => setAvatarBackend(event.target.value as 'musetalk' | 'wav2lip')}><option value="musetalk">MuseTalk</option><option value="wav2lip">Wav2Lip</option></select></label>
-                  <label><span>Assistant</span><select value={llmMode} onChange={event => setLlmMode(event.target.value as LLMMode)}>{LLM_MODE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                  <label><span>Lip sync</span><select value={avatarBackend} disabled={isComposerLocked} onChange={event => setAvatarBackend(event.target.value as 'musetalk' | 'wav2lip')}><option value="musetalk">MuseTalk</option><option value="wav2lip">Wav2Lip</option></select></label>
+                  <label><span>Assistant</span><select value={llmMode} disabled={isComposerLocked} onChange={event => setLlmMode(event.target.value as LLMMode)}>{LLM_MODE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
                 </div>
 
-                <div className="ph-minimal-control-row"><label>Emotion<select value={voiceControlValues?.emotion || 'neutral'} onChange={event => handleVoiceControlsChange({ emotion: event.target.value as VoiceEmotion })}>{(['neutral', 'happy', 'sad', 'angry', 'scared', 'disgust'] as VoiceEmotion[]).map(emotion => <option key={emotion} value={emotion}>{emotion[0].toUpperCase() + emotion.slice(1)}</option>)}</select></label><button type="button" className="ph-minimal-advanced-button" onClick={() => setShowVoiceSettings(prev => !prev)}>{showVoiceSettings ? 'Hide options' : 'More options'}</button></div>
+                <div className="ph-minimal-control-row"><label>Emotion<select value={voiceControlValues?.emotion || 'neutral'} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ emotion: event.target.value as VoiceEmotion })}>{(['neutral', 'happy', 'sad', 'angry', 'scared', 'disgust'] as VoiceEmotion[]).map(emotion => <option key={emotion} value={emotion}>{emotion[0].toUpperCase() + emotion.slice(1)}</option>)}</select></label><button type="button" className="ph-minimal-advanced-button" disabled={isComposerLocked} onClick={() => setShowVoiceSettings(prev => !prev)}>{showVoiceSettings ? 'Hide options' : 'More options'}</button></div>
 
                 {showVoiceSettings && (
                   <div className="ph-minimal-advanced-panel">
-                    <label><span>Expressiveness <b>{Math.round((voiceControlValues?.expressiveness ?? 0.5) * 100)}%</b></span><input type="range" min="0.25" max="1" step="0.01" value={voiceControlValues?.expressiveness ?? 0.5} onChange={event => handleVoiceControlsChange({ expressiveness: Number(event.target.value) })} /></label>
-                    <label><span>Variation / temperature <b>{(voiceControlValues?.variation ?? 0.8).toFixed(2)}</b></span><input type="range" min="0.1" max="1.2" step="0.01" value={voiceControlValues?.variation ?? 0.8} onChange={event => handleVoiceControlsChange({ variation: Number(event.target.value) })} /></label>
-                    <label><span>Voice match / CFG <b>{Math.round((voiceControlValues?.guidance ?? 0.5) * 100)}%</b></span><input type="range" min="0" max="1" step="0.01" value={voiceControlValues?.guidance ?? 0.5} onChange={event => handleVoiceControlsChange({ guidance: Number(event.target.value) })} /></label>
-                    <label><span>Repetition penalty <b>{(voiceControlValues?.repetition ?? 1.2).toFixed(2)}</b></span><input type="range" min="0.9" max="2" step="0.01" value={voiceControlValues?.repetition ?? 1.2} onChange={event => handleVoiceControlsChange({ repetition: Number(event.target.value) })} /></label>
-                    <label><span>Emotion intensity <b>{Math.round((voiceControlValues?.emotionIntensity ?? 0.5) * 100)}%</b></span><input type="range" min="0" max="1" step="0.05" value={voiceControlValues?.emotionIntensity ?? 0.5} disabled={voiceControlValues?.emotion === 'neutral'} onChange={event => handleVoiceControlsChange({ emotionIntensity: Number(event.target.value) })} /></label>
-                    <div className="ph-minimal-advanced-actions"><button type="button" onClick={resetVoiceControls}>Reset</button><button type="button" className="is-accent" onClick={() => void saveRuntimeSettings()} disabled={runtimeSettingsStatus === 'saving'}>{runtimeSettingsStatus === 'saved' ? 'Saved' : runtimeSettingsStatus === 'saving' ? 'Saving…' : 'Save defaults'}</button></div>
+                    <label><span>Expressiveness <b>{Math.round((voiceControlValues?.expressiveness ?? 0.5) * 100)}%</b></span><input type="range" min="0.25" max="1" step="0.01" value={voiceControlValues?.expressiveness ?? 0.5} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ expressiveness: Number(event.target.value) })} /></label>
+                    <label><span>Variation / temperature <b>{(voiceControlValues?.variation ?? 0.8).toFixed(2)}</b></span><input type="range" min="0.1" max="1.2" step="0.01" value={voiceControlValues?.variation ?? 0.8} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ variation: Number(event.target.value) })} /></label>
+                    <label><span>Voice match / CFG <b>{Math.round((voiceControlValues?.guidance ?? 0.5) * 100)}%</b></span><input type="range" min="0" max="1" step="0.01" value={voiceControlValues?.guidance ?? 0.5} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ guidance: Number(event.target.value) })} /></label>
+                    <label><span>Repetition penalty <b>{(voiceControlValues?.repetition ?? 1.2).toFixed(2)}</b></span><input type="range" min="0.9" max="2" step="0.01" value={voiceControlValues?.repetition ?? 1.2} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ repetition: Number(event.target.value) })} /></label>
+                    <label><span>Emotion intensity <b>{Math.round((voiceControlValues?.emotionIntensity ?? 0.5) * 100)}%</b></span><input type="range" min="0" max="1" step="0.05" value={voiceControlValues?.emotionIntensity ?? 0.5} disabled={isComposerLocked || voiceControlValues?.emotion === 'neutral'} onChange={event => handleVoiceControlsChange({ emotionIntensity: Number(event.target.value) })} /></label>
+                    <div className="ph-minimal-advanced-actions"><button type="button" onClick={resetVoiceControls} disabled={isComposerLocked}>Reset</button><button type="button" className="is-accent" onClick={() => void saveRuntimeSettings()} disabled={isComposerLocked || runtimeSettingsStatus === 'saving'}>{runtimeSettingsStatus === 'saved' ? 'Saved' : runtimeSettingsStatus === 'saving' ? 'Saving…' : 'Save defaults'}</button></div>
                   </div>
                 )}
 
