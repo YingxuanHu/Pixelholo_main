@@ -2998,7 +2998,7 @@ const App: React.FC = () => {
                       {sourceMode === 'upload' ? (
                         <div className="ph-minimal-file-list">
                           <label className={`ph-minimal-file-row ${sourceUploaded ? 'is-complete' : ''} ${!profile.name || profileNameTaken ? 'is-disabled' : ''}`}>
-                            <input type="file" accept="video/*" onChange={event => event.target.files?.[0] && void handleUpload(event.target.files[0])} disabled={!profile.name || profileNameTaken || isSourceActionLocked} />
+                            <input type="file" accept="video/*" onChange={event => event.target.files?.[0] && void handleUpload(event.target.files[0], { autoPrepare: true })} disabled={!profile.name || profileNameTaken || isSourceActionLocked} />
                             <span className="ph-minimal-file-icon">▣</span>
                             <span className="ph-minimal-file-copy"><strong>Talking video</strong><small>{profile.lastUploadedFile || (sourceUploaded ? 'Video uploaded · ready to prepare' : 'Face + voice source · 5–20 seconds · 720p+ · front-lit')}</small></span>
                             <span className="ph-minimal-file-action">{uploadPhaseVideo === 'uploading' ? `${uploadProgressVideo}%` : sourceUploaded ? 'Replace' : 'Choose'}</span>
