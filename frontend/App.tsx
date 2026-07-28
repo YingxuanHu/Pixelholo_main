@@ -1722,10 +1722,14 @@ const App: React.FC = () => {
   };
 
   const interruptBackend = useCallback(async () => {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 1800);
     try {
-      await apiFetch(`${apiBase}/interrupt`, { method: 'POST', keepalive: true });
+      await apiFetch(`${apiBase}/interrupt`, { method: 'POST', keepalive: true, signal: controller.signal });
     } catch {
       // ignore best-effort interrupt failures
+    } finally {
+      window.clearTimeout(timeout);
     }
   }, [apiBase, apiFetch]);
 
@@ -2384,12 +2388,18 @@ const App: React.FC = () => {
     streamSessionRef.current += 1;
     clearPlaybackSettleTimer();
     setIsPlaybackActive(false);
+    // Stop local output synchronously. The browser no longer has anything to
+    // play, so it must not keep presenting this request as "Generating" while
+    // the best-effort server interrupt is in flight.
+    stopAllAudio();
+    resetVideo();
+    setStepStatuses(prev => ({ ...prev, inference: 'idle' }));
+    setInferenceStageIndex(null);
     try {
       await interruptBackend();
-      await resetAudio();
-      resetVideo();
-      setStepStatuses(prev => ({ ...prev, inference: 'idle' }));
-      setInferenceStageIndex(null);
+      // Suspending an AudioContext is cleanup, not user-visible work. Do not
+      // leave the cancel state stuck if a browser delays that promise.
+      void resetAudio();
     } finally {
       if (inferenceRequestRef.current === stopRequestId) {
         inferenceSubmissionRef.current = false;
