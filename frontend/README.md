@@ -4,7 +4,7 @@ The frontend is the React 19 + Vite web app for PixelHolo. It keeps the main
 flow simple: create a profile from one talking video, type or speak a prompt,
 and watch the answer appear in the portrait preview.
 
-![PixelHolo avatar studio preview](../docs/assets/avatar-studio-preview.png)
+![PixelHolo Alvin avatar studio preview](../docs/assets/avatar-studio-preview.png)
 
 This is a representative development capture, not a benchmark or a promise
 that the layout will never change. The canvas and controls are still being
@@ -15,7 +15,7 @@ refined for different screen sizes.
 1. The landing page introduces PixelHolo and links to **Create a profile**.
 2. The user chooses a unique profile name. If the name is already in use, the
    form explains the problem instead of opening that profile.
-3. The user uploads a video or records a guided **20-second** camera sample.
+3. The user uploads a video or records a guided **25-second** camera sample.
    The camera view includes a head-position guide, lighting tips, and a short
    script to read.
 4. That same video supplies the face and voice. The backend extracts the audio,
@@ -33,19 +33,33 @@ refined for different screen sizes.
 
 ## Local development
 
-Start the FastAPI worker in one terminal:
+The frontend commands below were verified with a clean dependency install:
+
+```bash
+cd frontend
+npm ci
+npm run typecheck
+npm run build
+```
+
+For the live application, start a pre-provisioned FastAPI worker in one
+terminal. Full Chatterbox + MuseTalk inference needs a Linux NVIDIA GPU host,
+the MuseTalk weights, and a worker environment where both model stacks have
+already been resolved; the repository's legacy `setup_env.sh` is not a
+complete one-command model installer. See the root
+[`README`](../README.md#full-local-gpu-worker) before setting up a new GPU host.
 
 ```bash
 cd voice_cloning
 source .venv/bin/activate
-uvicorn src.inference:app --host 0.0.0.0 --port 8000
+python -m uvicorn src.inference:app --host 0.0.0.0 --port 8000
 ```
 
 Then start the Vite app in a second terminal:
 
 ```bash
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
@@ -153,12 +167,14 @@ to `127.0.0.1:8000`. Change those addresses when deploying to another host.
 
 - **No microphone button:** use a browser that supports SpeechRecognition and
   grant microphone permission. Text prompts still work without it.
-- **Camera tab is disabled:** enter a unique profile name first, and use HTTPS
-  or `localhost` so `getUserMedia()` is allowed.
+- **Camera permission does not appear:** click **Enable camera**, then allow
+  camera and microphone access in the browser. Camera recording can begin
+  before naming the profile; a unique name is required only when creating it.
+  Use HTTPS or `localhost` so `getUserMedia()` is allowed.
 - **The old face appears after switching:** wait for “Preparing this profile…”;
   the preview stays blank until the selected profile is warm.
 - **No frames:** check `/lipsync_backend` and confirm it reports `musetalk`, then
   make sure the profile contains `avatar_cache/frames.npy` and `coords.npy`.
 - **Video is large or cropped:** use a portrait source (`9:16` or `3:4`) and
-  let the client cap frames at **1,080 px**. The canvas preserves the portrait
-  instead of stretching it horizontally.
+  let the client cap frames at **1,280 px** (**768 px** in Firefox). The canvas
+  preserves the portrait instead of stretching it horizontally.

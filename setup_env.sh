@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Bootstrap the shared PixelHolo Python environment.
+# Bootstrap the legacy shared PixelHolo Python environment.
+# This does not install Chatterbox, clone MuseTalk, or download model weights.
 # Usage:
 #   bash setup_env.sh
 
@@ -41,5 +42,7 @@ conda run -p "${ENV_PATH}" pip install \
   webrtcvad demucs pynini munch tensorboard transformers einops-exts monotonic-align auraloss pesq scikit-learn==1.2.2 faster-whisper montreal-forced-aligner==2.2.17 pgvector hdbscan \
   praatio jiwer torchmetrics onnx onnxruntime-gpu speechbrain >/dev/null
 
-echo "[env] All dependencies installed. Activate with:"
+echo "[env] Legacy shared dependencies installed."
+echo "[env] Chatterbox, MuseTalk, and their weights still require separate provisioning."
+echo "[env] Activate with:"
 echo "       conda activate ${ENV_PATH}"

@@ -83,30 +83,37 @@ measurements from a particular GPU:
 | MuseTalk stream window / look-ahead | 1.2 s / 0.16 s |
 | MuseTalk JPEG quality | 92 |
 
-## Install
+## Runtime setup and verification
 
-Install the system tools first:
+Verify the required system tool first:
 
 ```bash
 # package-manager commands vary by Linux distribution
 ffmpeg -version
-espeak-ng --version
 ```
 
-Then create the worker environment:
+Full Chatterbox + MuseTalk inference must run on a Linux NVIDIA GPU host. The
+worker environment needs Chatterbox, the MuseTalk runtime dependencies, and the
+model assets in the next section. Verify a pre-provisioned environment before
+starting the server:
 
 ```bash
 cd voice_cloning
-python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -c "import chatterbox.tts; print('Chatterbox import OK')"
+ffmpeg -version
 ```
 
-The repository-level [`setup_env.sh`](../setup_env.sh) is an alternative conda
-bootstrap. It creates a Python **3.10** environment and installs a nightly CUDA
-**13.0** PyTorch stack. Read the script first if the host uses a different
-driver or toolkit.
+`espeak-ng` is needed by some legacy preprocessing and StyleTTS2 workflows,
+but is not required to import the active Chatterbox + MuseTalk runtime.
+
+`requirements.txt` is useful for the repository's Python dependencies, but it
+does not yet provide a conflict-free fresh-install lockfile for the active
+Chatterbox + MuseTalk stack. In particular, the older StyleTTS2 dependencies
+and newer one-shot dependencies are still co-located. The repository-level
+[`setup_env.sh`](../setup_env.sh) is a legacy CUDA bootstrap and does not
+install Chatterbox, clone MuseTalk, or download model weights. Do not treat
+either command as a complete one-command inference setup.
 
 ## Install model assets
 
@@ -162,7 +169,7 @@ For the best source clip:
 
 - Prefer a portrait clip (`9:16` or `3:4`) at **720p or higher**.
 - Record **5–20 seconds** of clear speech; the guided camera flow records
-  **20 seconds**.
+  **25 seconds**.
 - Face the camera with bright, even light from the front. Keep eyes and mouth
   visible and avoid a bright window behind you.
 - Keep music, echo, multiple speakers, and large head turns out of the sample.
@@ -176,7 +183,7 @@ audio with `ffmpeg`.
 ```bash
 cd voice_cloning
 source .venv/bin/activate
-uvicorn src.inference:app --host 0.0.0.0 --port 8000
+python -m uvicorn src.inference:app --host 0.0.0.0 --port 8000
 ```
 
 Check which runtimes the worker resolved:
@@ -203,20 +210,20 @@ Chatterbox and MuseTalk are the defaults:
 ```bash
 LIPSYNC_BACKEND=musetalk \
 PIXELHOLO_TTS_BACKEND=chatterbox \
-uvicorn src.inference:app --host 0.0.0.0 --port 8000
+python -m uvicorn src.inference:app --host 0.0.0.0 --port 8000
 ```
 
 To run the legacy Wav2Lip path:
 
 ```bash
-LIPSYNC_BACKEND=wav2lip uvicorn src.inference:app --host 0.0.0.0 --port 8000
+LIPSYNC_BACKEND=wav2lip python -m uvicorn src.inference:app --host 0.0.0.0 --port 8000
 ```
 
 To let MuseTalk fall back to Wav2Lip if initialization fails:
 
 ```bash
 LIPSYNC_BACKEND=musetalk LIPSYNC_BACKEND_FALLBACK=1 \
-uvicorn src.inference:app --host 0.0.0.0 --port 8000
+python -m uvicorn src.inference:app --host 0.0.0.0 --port 8000
 ```
 
 ## Warmup and streaming
@@ -250,7 +257,7 @@ curl -N -X POST http://127.0.0.1:8000/speak \
     "lipsync_backend":"musetalk",
     "avatar_emotion":"neutral",
     "avatar_fps":25,
-    "avatar_max_frame_edge":1080
+    "avatar_max_frame_edge":1280
   }' > avatar.stream
 ```
 
@@ -390,5 +397,5 @@ skipped. The script does not change profile or model files.
   split requirements. `ValueError: high <= 0` means there are not enough
   segments.
 - **GPU memory errors:** reduce MuseTalk batch/window settings, cap the browser
-  frame edge at **1,080 px**, or use the standalone Wav2Lip runner for offline
-  output.
+  frame edge at **1,280 px** (**768 px** in Firefox), or use the standalone
+  Wav2Lip runner for offline output.

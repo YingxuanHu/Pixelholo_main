@@ -17,7 +17,7 @@ Here is a representative view of the avatar studio. The layout will continue to
 change as the UI evolves, but the output stays portrait-oriented and the active
 Chatterbox + MuseTalk pipeline is shown below the preview.
 
-![PixelHolo avatar studio preview](docs/assets/avatar-studio-preview.png)
+![PixelHolo Alvin avatar studio preview](docs/assets/avatar-studio-preview.png)
 
 ## Repository layout
 
@@ -59,7 +59,7 @@ These are the defaults currently in code, not performance claims. Run
 | Setting | Default | Why it matters |
 | --- | ---: | --- |
 | Source clip shown in onboarding | 5–20 s | Enough speech for a one-shot voice reference without a long upload |
-| Guided camera capture | 20 s | Gives the face and voice pipeline a consistent sample |
+| Guided camera capture | 25 s | Gives the face and voice pipeline a consistent sample |
 | Processed voice sample rate | 24,000 Hz mono | Matches Chatterbox's normal output rate |
 | Speech segment length | 2–10 s | Keeps Whisper/VAD segments usable for reference and training paths |
 | Minimum accepted words per segment | 4 | Drops very short/noisy speech fragments |
@@ -71,72 +71,67 @@ These are the defaults currently in code, not performance claims. Run
 | MuseTalk look-ahead | 0.16 s | Adds a small scheduling buffer for frame/audio alignment |
 | First MuseTalk text chunk | 72 characters | Starts the avatar quickly before cruise-sized chunks |
 | MuseTalk JPEG quality | 92 | Keeps streamed frames sharp without maximum-size JPEGs |
-| Browser avatar frame edge cap | 1,080 px | Prevents a high-resolution source from overwhelming the browser |
+| Browser avatar frame edge cap | 1,280 px (768 px in Firefox) | Preserves detail while keeping browser decoding bounded |
 | Warmup cache age | 120 s | Reuses a recently prepared profile while avoiding stale resources |
 
 ## Quickstart (local development)
 
-### Prerequisites
+### Frontend-only smoke test (verified)
 
-For practical Chatterbox/MuseTalk inference, use a Linux host with an NVIDIA
-GPU. You will also need `ffmpeg`, `espeak-ng`, Node.js 18 or newer, and a
-Python version supported by the pinned packages. There are two ways to set up
-the Python environment:
-
-- `setup_env.sh` creates a conda environment at `.venv` with Python 3.10 and
-  installs the shared CUDA-oriented stack.
-- The commands below create separate `voice_cloning/.venv` and
-  `lip_syncing/.venv` environments, which is useful when you want to keep the
-  two dependency sets isolated.
-
-Before trying a real stream, download the model repositories and weights
-described in [`voice_cloning/README.md`](voice_cloning/README.md) and
-[`lip_syncing/README.md`](lip_syncing/README.md).
-
-### Option A: shared conda bootstrap
+This is the quickest way to run and validate the local UI. It works on macOS,
+Windows, and Linux with Node.js 18 or newer. It does not start the AI worker,
+so the app correctly reports the engine as offline until a backend is running.
 
 ```bash
-bash setup_env.sh
-conda activate "$PWD/.venv"
-```
-
-The script installs a nightly PyTorch CUDA 13.0 wheel. Read it first if the
-machine uses a different driver or CUDA toolkit.
-
-### Option B: separate virtual environments
-
-```bash
-cd voice_cloning
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-deactivate
-
-cd ../lip_syncing
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-deactivate
-
-cd ../frontend
-npm install
-```
-
-Start the services in separate terminals:
-
-```bash
-# Terminal 1: FastAPI inference worker
-cd voice_cloning
-source .venv/bin/activate
-uvicorn src.inference:app --host 0.0.0.0 --port 8000
-
-# Terminal 2: Vite development server
 cd frontend
+npm ci
+npm run typecheck
+npm run build
 npm run dev
 ```
 
 Open [http://127.0.0.1:5174](http://127.0.0.1:5174). The port is explicit in
 `frontend/vite.config.ts`.
+
+### Full local GPU worker
+
+Chatterbox + MuseTalk inference requires a Linux NVIDIA GPU host, `ffmpeg`,
+the MuseTalk repository and weights, and a Python environment in which the two
+model stacks are installed together. The existing
+[`setup_env.sh`](setup_env.sh) is a legacy CUDA bootstrap: it does **not**
+install Chatterbox, clone MuseTalk, or download any model weights. It is not a
+complete one-command local setup.
+
+The current repository does not yet ship a conflict-free, fully pinned model
+lockfile for a fresh GPU machine. Use a pre-provisioned worker environment for
+real inference, then verify it before starting the API:
+
+```bash
+# On the Linux GPU host, from the repository root.
+source voice_cloning/.venv/bin/activate
+python -c "import chatterbox.tts; print('Chatterbox import OK')"
+test -d lip_syncing/lib/MuseTalk/models
+ffmpeg -version
+
+cd voice_cloning
+python -m uvicorn src.inference:app --host 0.0.0.0 --port 8000
+```
+
+`espeak-ng` is needed by some legacy preprocessing and StyleTTS2 workflows, but
+is not required to import the active Chatterbox + MuseTalk runtime.
+
+Wait for Uvicorn to report `Application startup complete`, then, in a second
+terminal, confirm that the worker is reachable and the desired backends
+resolved before opening the UI:
+
+```bash
+curl -fsS http://127.0.0.1:8000/lipsync_backend
+```
+
+Then run the frontend commands above. See
+[`voice_cloning/README.md`](voice_cloning/README.md) for the required model
+assets and [`lip_syncing/README.md`](lip_syncing/README.md) for the MuseTalk
+directory layout.
 
 For an optional LLM assistant, create a root `.env` file:
 
@@ -247,7 +242,7 @@ curl -N -X POST "$API/speak" \
     "lipsync_backend":"musetalk",
     "avatar_emotion":"neutral",
     "avatar_fps":25,
-    "avatar_max_frame_edge":1080
+    "avatar_max_frame_edge":1280
   }' > avatar.stream
 ```
 
@@ -405,11 +400,11 @@ machine before enabling them.
 
 | Symptom | Checks |
 | --- | --- |
-| `ModuleNotFoundError` | Activate the matching `voice_cloning/.venv` or `lip_syncing/.venv`; make sure you are using the right interpreter. |
+| `ModuleNotFoundError` | Activate `voice_cloning/.venv`; the worker interpreter must contain both Chatterbox and MuseTalk runtime dependencies. |
 | Audio works but no avatar frames | Check the MuseTalk repo and weights, `LIPSYNC_BACKEND`, and the profile's `avatar_cache/frames.npy` and `coords.npy`. |
 | First prompt is slow | Call `POST /warmup` for the selected profile and backend; the first model load is expected to be slower. |
 | Wrong profile face/voice after switching | Send the selected profile and workspace header with every request. The UI clears the preview during warmup on purpose. |
-| Stream stalls or runs out of memory | Check GPU memory, lower MuseTalk batch/window settings, and cap browser frames at `1080` px. |
+| Stream stalls or runs out of memory | Check GPU memory, lower MuseTalk batch/window settings, and cap browser frames at `1280` px (`768` px in Firefox). |
 | `ERR_NAME_NOT_RESOLVED` in a browser | DNS or the tunnel is not routing the hostname yet. Test the VM proxy directly before debugging the app. |
 | Profile list looks empty | A new browser/device has a new anonymous workspace; requests without a header see the legacy developer workspace. |
 

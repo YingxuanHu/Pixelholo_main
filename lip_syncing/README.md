@@ -29,24 +29,34 @@ JPEG frames alongside Chatterbox audio. The current defaults are:
 | Look-ahead | 0.16 s |
 | JPEG quality | 92 |
 | Face scale | 1.0 (clamped to 0.75–1.15) |
-| Browser frame edge cap | 1,080 px in the current frontend |
+| Browser frame edge cap | 1,280 px in the current frontend (768 px in Firefox) |
 
 These are tuning defaults, not benchmark results. Change them after measuring a
 representative prompt set on the deployment GPU.
 
-Install the MuseTalk repository and weights like this:
+Install the MuseTalk repository and weights like this. The resulting runtime
+dependencies must be available to the **worker** environment
+(`voice_cloning/.venv`); creating an isolated `lip_syncing/.venv` alone does
+not make the FastAPI worker able to import MuseTalk.
 
 ```bash
 cd lip_syncing
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-
 mkdir -p lib
 cd lib
 git clone https://github.com/TMElyralab/MuseTalk.git
 cd MuseTalk
 bash download_weights.sh
+```
+
+The repository does not yet provide a conflict-free, fully pinned fresh-install
+lockfile for the combined Chatterbox, MuseTalk, and legacy StyleTTS2 stacks.
+Use a pre-provisioned GPU worker for live inference and verify it from
+`voice_cloning/` before launching Uvicorn:
+
+```bash
+source .venv/bin/activate
+python -c "import chatterbox.tts; print('Chatterbox import OK')"
+test -d ../lip_syncing/lib/MuseTalk/models
 ```
 
 If the environment has been changed, select MuseTalk explicitly when starting
@@ -55,7 +65,7 @@ the worker:
 ```bash
 cd ../../voice_cloning
 source .venv/bin/activate
-LIPSYNC_BACKEND=musetalk uvicorn src.inference:app --host 0.0.0.0 --port 8000
+LIPSYNC_BACKEND=musetalk python -m uvicorn src.inference:app --host 0.0.0.0 --port 8000
 ```
 
 Call `POST /warmup` for a profile before its first prompt. The first warmup may
@@ -100,14 +110,14 @@ Select Wav2Lip for the API:
 ```bash
 cd voice_cloning
 source .venv/bin/activate
-LIPSYNC_BACKEND=wav2lip uvicorn src.inference:app --host 0.0.0.0 --port 8000
+LIPSYNC_BACKEND=wav2lip python -m uvicorn src.inference:app --host 0.0.0.0 --port 8000
 ```
 
 To let MuseTalk fall back automatically when initialization fails:
 
 ```bash
 LIPSYNC_BACKEND=musetalk LIPSYNC_BACKEND_FALLBACK=1 \
-uvicorn src.inference:app --host 0.0.0.0 --port 8000
+python -m uvicorn src.inference:app --host 0.0.0.0 --port 8000
 ```
 
 ## Why bake the avatar?
@@ -170,6 +180,7 @@ python src/speak_video.py \
 - **Wav2Lip checkpoint errors:** make sure both the S3FD detector and
   `wav2lip_gan.pth` are under `lip_syncing/models/`.
 - **Out of memory:** lower batch sizes, reduce the browser frame edge cap from
-  **1,080**, or use a smaller source for offline tests.
+  **1,280** (or use Firefox's **768 px** cap), or use a smaller source for
+  offline tests.
 - **Stale profile after switching:** wait for the selected profile to warm up;
   the frontend intentionally leaves the preview blank until it is ready.
