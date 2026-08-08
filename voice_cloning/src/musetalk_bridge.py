@@ -160,6 +160,14 @@ class MuseTalkBridge:
         self.silence_min_duration_ms = int(
             np.clip(int(os.getenv("MUSE_TALK_SILENCE_MIN_DURATION_MS", "280")), 40, 800)
         )
+        # Do not replace generated visemes with held frames in the production
+        # path.  Even a carefully tuned RMS gate cannot distinguish every
+        # quiet phoneme and word boundary from a conversational pause.  This
+        # was added after the original working stream and is therefore opt-in
+        # for controlled diagnostics only.
+        self.suppress_silence_motion = os.getenv(
+            "MUSE_TALK_SUPPRESS_SILENCE_MOTION", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self.default_runtime_max_frame_edge = _env_int(
             "MUSE_TALK_RUNTIME_MAX_FRAME_EDGE",
             0,
@@ -1284,6 +1292,15 @@ class MuseTalkBridge:
             run_start = run_end
         return stable
 
+    def _silence_hold_enabled(self, requested: bool | None) -> bool:
+        """Resolve the optional pause experiment without changing normal sync.
+
+        ``None`` is what the public streaming pipeline passes.  It must use
+        the bridge's opt-in setting rather than silently re-enabling frame
+        holding for regular generated speech.
+        """
+        return self.suppress_silence_motion if requested is None else bool(requested)
+
     def _extract_whisper_prompts(
         self,
         audio_buffer: np.ndarray,
@@ -1496,7 +1513,7 @@ class MuseTalkBridge:
         fps: float | None = None,
         lookahead_16k: np.ndarray | None = None,
         *,
-        suppress_silence_motion: bool = True,
+        suppress_silence_motion: bool | None = None,
     ) -> list[np.ndarray]:
         timing_enabled = os.getenv("MUSE_TALK_PHASE_TIMING", "0") == "1"
         started_at = time.perf_counter() if timing_enabled else 0.0
@@ -1529,6 +1546,12 @@ class MuseTalkBridge:
         infer_target_frames = self._compute_infer_target_frames(audio_chunk, infer_fps)
         if infer_target_frames <= 0:
             infer_target_frames = 1
+        # MuseTalk's audio-conditioned frames are the synchronization source.
+        # Holding frames while the TTS is still speaking makes the displayed
+        # mouth lag its audio, so production defaults to the historical
+        # all-viseme path.  An explicit request or diagnostic environment flag
+        # can still enable the pause experiment when it is being evaluated.
+        use_silence_hold = self._silence_hold_enabled(suppress_silence_motion)
         silence_frames = (
             self._stable_silence_mask(
                 audio_chunk,
@@ -1537,7 +1560,7 @@ class MuseTalkBridge:
                 rms_threshold=self.silence_rms_threshold,
                 min_duration_ms=self.silence_min_duration_ms,
             )
-            if suppress_silence_motion
+            if use_silence_hold
             else np.zeros(infer_target_frames, dtype=bool)
         )
 

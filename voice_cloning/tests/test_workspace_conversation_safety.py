@@ -93,6 +93,17 @@ class _OpenAIResponseLLM(LLMService):
 
 
 class WorkspaceConversationSafetyTests(unittest.TestCase):
+    def test_musetalk_keeps_visemes_enabled_in_the_default_stream_path(self):
+        # The public request path does not pass an override.  It must not
+        # freeze the generated mouth for quiet samples because low-energy
+        # phonemes and word boundaries are still speech.
+        bridge = object.__new__(MuseTalkBridge)
+        bridge.suppress_silence_motion = False
+
+        self.assertFalse(bridge._silence_hold_enabled(None))
+        self.assertTrue(bridge._silence_hold_enabled(True))
+        self.assertFalse(bridge._silence_hold_enabled(False))
+
     def test_musetalk_holds_only_sustained_silence(self):
         fps = 25
         audio = np.full(16000, 0.08, dtype=np.float32)
