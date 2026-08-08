@@ -12,13 +12,17 @@ import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
+import torch
 
 from src.inference import (
     ProfileRuntimeSettingsRequest,
+    _plan_stream_tts_chunks,
     _profile_system_prompt,
     _profile_runtime_settings_path,
+    _gpu_keepalive_interval_seconds,
     update_profile_runtime_settings,
 )
 from src.llm.llm_service import LEGACY_FAST_MODEL, LLMRoute, LLMService
@@ -118,6 +122,84 @@ class WorkspaceConversationSafetyTests(unittest.TestCase):
             min_duration_ms=120,
         )
         self.assertFalse(short_mask.any())
+
+    def test_musetalk_preserves_the_source_chin_below_the_mouth_region(self):
+        # This is intentionally model-free.  It verifies the compositor mask
+        # boundary that prevents a low-resolution generated face from replacing
+        # the source chin and changing its geometry between stream windows.
+        bridge = object.__new__(MuseTalkBridge)
+        bridge.mouth_mask_bottom_ratio = 0.68
+        bridge.mouth_mask_bottom_feather = 0.08
+        alpha = np.ones((100, 80), dtype=np.float32)
+
+        protected = bridge._restrict_chin_blend(
+            alpha,
+            face_box=(10, 20, 70, 80),
+            crop_box=(0, 0, 80, 100),
+        )
+
+        self.assertEqual(float(protected[45, 40]), 1.0)
+        self.assertGreater(float(protected[57, 40]), 0.0)
+        self.assertLess(float(protected[57, 40]), 1.0)
+        self.assertEqual(float(protected[66, 40]), 0.0)
+
+    def test_musetalk_uses_a_stable_face_track_for_runtime_compositing(self):
+        # A face detector can vary by a few pixels between adjacent source
+        # frames. The generated image must follow a stable track or its chin
+        # and jaw visibly resize even when the source subject is still.
+        raw = np.array(
+            [
+                [20, 15, 80, 95],
+                [24, 13, 84, 98],
+                [15, 17, 75, 92],
+                [23, 14, 83, 96],
+                [17, 16, 77, 94],
+            ],
+            dtype=np.int32,
+        )
+        stable = MuseTalkBridge._smooth_xyxy_boxes(raw, width=120, height=140, window=5)
+        raw_center_x = (raw[:, 0] + raw[:, 2]) / 2.0
+        stable_center_x = (stable[:, 0] + stable[:, 2]) / 2.0
+        self.assertLess(float(np.ptp(stable_center_x)), float(np.ptp(raw_center_x)))
+
+    def test_musetalk_pads_only_the_invisible_tail_batch(self):
+        # The final short model batch used to create a new CUDA execution
+        # shape, which can stall a warm stream for seconds. Padding repeats the
+        # final sample for execution only, while the logical output count stays
+        # unchanged.
+        bridge = object.__new__(MuseTalkBridge)
+        bridge.static_batch_padding = True
+        bridge.batch_size = 24
+        whisper = torch.arange(6 * 2 * 3, dtype=torch.float32).reshape(6, 2, 3)
+        latent = torch.arange(6 * 2 * 2 * 2, dtype=torch.float32).reshape(6, 2, 2, 2)
+
+        padded_whisper, padded_latent, logical_size = bridge._pad_runtime_batch(whisper, latent)
+
+        self.assertEqual(logical_size, 6)
+        self.assertEqual(tuple(padded_whisper.shape), (24, 2, 3))
+        self.assertEqual(tuple(padded_latent.shape), (24, 2, 2, 2))
+        self.assertTrue(torch.equal(padded_whisper[:6], whisper))
+        self.assertTrue(torch.equal(padded_latent[:6], latent))
+        self.assertTrue(torch.equal(padded_whisper[6:], whisper[-1:].expand(18, -1, -1)))
+
+    def test_gpu_keepalive_interval_is_configurable_and_bounded(self):
+        with patch.dict("os.environ", {"PIXELHOLO_GPU_KEEPALIVE_INTERVAL_SEC": "0"}):
+            self.assertEqual(_gpu_keepalive_interval_seconds(), 0.0)
+        with patch.dict("os.environ", {"PIXELHOLO_GPU_KEEPALIVE_INTERVAL_SEC": "999"}):
+            self.assertEqual(_gpu_keepalive_interval_seconds(), 10.0)
+        with patch.dict("os.environ", {"PIXELHOLO_GPU_KEEPALIVE_INTERVAL_SEC": "invalid"}):
+            self.assertEqual(_gpu_keepalive_interval_seconds(), 0.5)
+
+    def test_first_stream_chunk_keeps_a_playback_cushion(self):
+        chunks = _plan_stream_tts_chunks(
+            "A short first sentence. A second phrase gives the player enough audio to stay smooth.",
+            max_chars=120,
+            max_words=48,
+            first_chunk_max_chars=72,
+            is_first_global_chunk=True,
+        )
+        self.assertGreaterEqual(len(chunks[0]), 64)
+        self.assertLessEqual(len(chunks[0]), 120)
 
     def test_live_gpt_keeps_search_available_without_forcing_it(self):
         recorder = _OpenAIResponseRecorder()

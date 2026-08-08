@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import importlib
 import queue
@@ -24,7 +25,7 @@ import time
 import uuid
 import warnings
 from pathlib import Path
-from typing import Any, Iterator, Protocol
+from typing import Any, AsyncIterator, Callable, Iterator, Protocol
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 import numpy as np
@@ -50,7 +51,19 @@ SILENCE_CULLING_ENABLED = True
 SILENCE_RMS_THRESHOLD = 0.003
 
 _AI_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+# MuseTalk uses CUDA state that is initialized per execution thread.  Its
+# warm-up and live rendering must therefore use this same dedicated worker.
+# Otherwise a synchronous /warmup request can warm a Starlette worker thread
+# while the first streamed response still pays initialization on Uvicorn's
+# event-loop thread.
+_AVATAR_RENDER_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+# Chatterbox and the avatar renderers use the same CUDA device.  Running a
+# diffusion pass at the same time as a MuseTalk or Wav2Lip batch creates very
+# uneven per-window latency.  One short GPU stage at a time is more reliable
+# for real-time playback than nominally faster, contended execution.
+_avatar_gpu_lock = threading.Lock()
 _RUNTIME_INSTANCE_ID = uuid.uuid4().hex
+_gpu_keepalive_process: subprocess.Popen[bytes] | None = None
 
 _llm_service: LLMService | None = None
 
@@ -488,12 +501,30 @@ def _plan_stream_tts_chunks(
         and first_chunk_max_chars is not None
         and len(text) > int(first_chunk_max_chars)
     ):
-        return _split_text_prosody(
+        planned = _split_text_prosody(
             text,
             max_chars=max_chars,
             max_words=max_words,
             first_chunk_max_chars=int(first_chunk_max_chars),
         )
+        # Prosody splitting correctly favors a sentence boundary, but it can
+        # leave the first GPU call with only a very short sentence. That gives
+        # the browser roughly one audio window, then it has to wait for the
+        # next TTS pass. Merge a following phrase when it still fits the normal
+        # cap so the first result creates a useful playback cushion.
+        target_first_chars = max(48, int(round(int(first_chunk_max_chars) * 0.9)))
+        if len(planned) > 1 and len(planned[0]) < target_first_chars:
+            merged = planned[0]
+            cursor = 1
+            while cursor < len(planned) and len(merged) < target_first_chars:
+                candidate = f"{merged} {planned[cursor]}".strip()
+                if len(candidate) > int(max_chars):
+                    break
+                merged = candidate
+                cursor += 1
+            if cursor > 1:
+                planned = [merged, *planned[cursor:]]
+        return planned
 
     if len(text) <= single_max_chars and len(text.split()) <= single_max_words:
         return [text]
@@ -1164,7 +1195,7 @@ def _drop_warmup_cache_for_profile(
 ) -> None:
     ptype = _normalize_profile_type(profile_type)
     workspace_id = normalize_workspace_id(workspace_id or current_workspace_id())
-    global _warmed_tts_profiles, _warmed_tts_engine_keys, _warmed_lipsync_profiles
+    global _warmed_tts_profiles, _warmed_tts_engine_keys, _warmed_tts_audio_16k, _warmed_lipsync_profiles
     _warmed_tts_profiles = {
         key
         for key in _warmed_tts_profiles
@@ -1178,6 +1209,16 @@ def _drop_warmup_cache_for_profile(
     _warmed_tts_engine_keys = {
         key: value
         for key, value in _warmed_tts_engine_keys.items()
+        if not (
+            len(key) >= 4
+            and key[0] == profile_name
+            and key[1] == ptype
+            and key[3] == workspace_id
+        )
+    }
+    _warmed_tts_audio_16k = {
+        key: value
+        for key, value in _warmed_tts_audio_16k.items()
         if not (
             len(key) >= 4
             and key[0] == profile_name
@@ -1478,6 +1519,7 @@ def _stream_avatar_from_text_iter(
     text_iter: Iterator[str],
     binary_transport: bool = False,
     mobile_profile: bool = False,
+    request: Request | None = None,
 ) -> StreamingResponse:
     start_time = time.perf_counter()
     workspace_id = current_workspace_id()
@@ -1803,16 +1845,21 @@ def _stream_avatar_from_text_iter(
         mobile_max_frame_edge or "full",
     )
 
-    def _generator() -> Iterator[str]:
+    async def _generator() -> AsyncIterator[str | bytes]:
         result_queue: queue.Queue[tuple[str, int, np.ndarray | None, np.ndarray | None]] = queue.Queue(
             maxsize=3
         )
         sentence_queue: queue.Queue[str | None] = queue.Queue(maxsize=10)
-        # Chatterbox and Wav2Lip both use CUDA. Letting the TTS worker start
-        # the next diffusion pass while Wav2Lip renders the current one turned
-        # a sub-second Wav2Lip batch into a multi-second stall. Serialize just
-        # these two GPU stages; MuseTalk keeps its existing overlap behavior.
-        serialize_wav2lip_gpu = is_wav2lip and torch.cuda.is_available()
+        # A single stream may have an audio worker and a renderer operating at
+        # once.  Both use CUDA, including the default Chatterbox + MuseTalk
+        # path, so overlapping them makes packet cadence unpredictable.  Keep
+        # the short GPU stages exclusive while leaving all CPU and network work
+        # concurrent.
+        serialize_avatar_gpu = (is_musetalk or is_wav2lip) and torch.cuda.is_available()
+        # Once TTS has supplied enough audio for a video window, the renderer
+        # gets priority. Without this hand-off the audio worker can repeatedly
+        # reacquire the CUDA lock for later sentences and leave the browser
+        # waiting at a window boundary even though audio is already queued.
         tts_gpu_gate = threading.Event()
         tts_gpu_gate.set()
         engine_cm = _acquire_tts_engine(req, model_path, config_path)
@@ -1824,6 +1871,22 @@ def _stream_avatar_from_text_iter(
         ) if tts_backend == "chatterbox" else None
         engine: ChatterboxEngine | StyleTTS2RepoEngine | None = None
         stitcher: AudioStitcher | None = None
+
+        async def _client_disconnected() -> bool:
+            if stop_event.is_set():
+                return True
+            if request is None:
+                return False
+            try:
+                disconnected = await request.is_disconnected()
+            except RuntimeError:
+                # Starlette can close a request scope while a response is being
+                # torn down.  The cancellation path below still releases all
+                # shared profile state.
+                return stop_event.is_set()
+            if disconnected:
+                stop_event.set()
+            return disconnected or stop_event.is_set()
 
         def _sentence_reader() -> None:
             try:
@@ -1889,7 +1952,7 @@ def _stream_avatar_from_text_iter(
                     for chunk in sentence_chunks:
                         if stop_event.is_set():
                             return
-                        if serialize_wav2lip_gpu:
+                        if serialize_avatar_gpu:
                             while not stop_event.is_set() and not tts_gpu_gate.wait(timeout=0.2):
                                 pass
                             if stop_event.is_set():
@@ -1898,22 +1961,45 @@ def _stream_avatar_from_text_iter(
                             chunk = f"{pad_text_token} {chunk} {pad_text_token}"
                         is_first_tts_chunk = tts_chunk_index == 0
                         chunk_seed = seed
-                        future = _AI_EXECUTOR.submit(
-                            _generate_with_seed,
-                            engine,
-                            chunk_seed,
-                            chunk,
-                            sentence_ref,
-                            params["alpha"],
-                            params["beta"],
-                            params["diffusion_steps"],
-                            params["embedding_scale"],
-                            params["f0_scale"],
-                            phonemizer_lang,
-                            lexicon,
-                            is_first_tts_chunk,
-                            chatterbox_settings,
-                        )
+                        def _generate_chunk() -> np.ndarray:
+                            # A Future that has started cannot be forcefully
+                            # stopped. Check again *after* taking the GPU lock
+                            # so a cancelled request that was waiting behind a
+                            # renderer never begins a stale TTS generation.
+                            # Without this second check it can steal a GPU
+                            # window from the profile the user has just chosen.
+                            if stop_event.is_set():
+                                return np.zeros(0, dtype=np.float32)
+                            generation_args = (
+                                engine,
+                                chunk_seed,
+                                chunk,
+                                sentence_ref,
+                                params["alpha"],
+                                params["beta"],
+                                params["diffusion_steps"],
+                                params["embedding_scale"],
+                                params["f0_scale"],
+                                phonemizer_lang,
+                                lexicon,
+                                is_first_tts_chunk,
+                                chatterbox_settings,
+                            )
+                            if serialize_avatar_gpu:
+                                with _avatar_gpu_lock:
+                                    if stop_event.is_set():
+                                        return np.zeros(0, dtype=np.float32)
+                                    generated = _generate_with_seed(*generation_args)
+                                    # CUDA launches are asynchronous. Keep the
+                                    # lock until this generation has actually
+                                    # finished, otherwise MuseTalk can begin
+                                    # against unfinished Chatterbox work and
+                                    # create a delayed media window.
+                                    torch.cuda.synchronize()
+                                    return generated
+                            return _generate_with_seed(*generation_args)
+
+                        future = _AI_EXECUTOR.submit(_generate_chunk)
                         tts_started = time.perf_counter()
                         while True:
                             if stop_event.is_set():
@@ -1929,12 +2015,23 @@ def _stream_avatar_from_text_iter(
                             continue
                         if is_first_tts_chunk:
                             logger.info(
-                                "component=stream op=first_tts_chunk profile=%s backend=%s tts_ms=%.2f elapsed_ms=%.2f chars=%d",
+                                "component=stream op=first_tts_chunk profile=%s backend=%s tts_ms=%.2f elapsed_ms=%.2f chars=%d audio_sec=%.3f",
                                 profile,
                                 tts_backend,
                                 (time.perf_counter() - tts_started) * 1000.0,
                                 (time.perf_counter() - start_time) * 1000.0,
                                 len(chunk),
+                                float(len(audio) / max(1, engine.sample_rate)),
+                            )
+                        else:
+                            logger.info(
+                                "component=stream op=tts_chunk profile=%s backend=%s chunk=%d tts_ms=%.2f chars=%d audio_sec=%.3f",
+                                profile,
+                                tts_backend,
+                                tts_chunk_index,
+                                (time.perf_counter() - tts_started) * 1000.0,
+                                len(chunk),
+                                float(len(audio) / max(1, engine.sample_rate)),
                             )
                         audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
                         if smart_trim_db and smart_trim_db > 0:
@@ -1962,11 +2059,16 @@ def _stream_avatar_from_text_iter(
                             audio_16k = librosa.resample(
                                 stitched, orig_sr=engine.sample_rate, target_sr=16000
                             )
-                            _put_result("data", idx, stitched, audio_16k.astype(np.float32))
-                            if serialize_wav2lip_gpu:
-                                # Do not let the next Chatterbox pass contend
-                                # with the matching Wav2Lip render.
+                            if serialize_avatar_gpu:
+                                # Claim the hand-off *before* publishing this
+                                # result.  Clearing it afterwards races with
+                                # the audio worker's next loop, which can let a
+                                # second Chatterbox pass take CUDA ahead of
+                                # MuseTalk's first video window.  That race
+                                # was visible as a pause after the first few
+                                # words despite both models being warm.
                                 tts_gpu_gate.clear()
+                            _put_result("data", idx, stitched, audio_16k.astype(np.float32))
                             idx += 1
                 tail = stitcher.flush()
                 if tail.size and not stop_event.is_set():
@@ -1984,6 +2086,7 @@ def _stream_avatar_from_text_iter(
 
         last_frame: np.ndarray | None = None
         musetalk_prev_tail_frames: list[np.ndarray] = []
+        last_media_built_at: float | None = None
         musetalk_frame_crossfade = 0
         if is_musetalk:
             try:
@@ -2013,12 +2116,12 @@ def _stream_avatar_from_text_iter(
         pending_audio = np.zeros(0, dtype=np.float32)
         pending_audio_16k = np.zeros(0, dtype=np.float32)
 
-        def _emit_one(
+        async def _emit_one(
             sub_audio: np.ndarray,
             sub_audio_16k: np.ndarray,
             lookahead_16k: np.ndarray | None = None,
-        ) -> Iterator[str | bytes]:
-            nonlocal last_frame, emit_index, musetalk_prev_tail_frames
+        ) -> list[str | bytes]:
+            nonlocal last_frame, emit_index, musetalk_prev_tail_frames, last_media_built_at
             rms = (
                 float(np.sqrt(np.mean(np.square(sub_audio))))
                 if sub_audio is not None and sub_audio.size
@@ -2030,45 +2133,73 @@ def _stream_avatar_from_text_iter(
                 else 0
             )
 
-            lipsync_started = time.perf_counter()
-            if SILENCE_CULLING_ENABLED and rms < SILENCE_RMS_THRESHOLD and last_frame is not None:
-                frames = [last_frame.copy() for _ in range(frames_needed)]
-            else:
+            def _render_frames() -> list[np.ndarray]:
+                if SILENCE_CULLING_ENABLED and rms < SILENCE_RMS_THRESHOLD and last_frame is not None:
+                    return [last_frame.copy() for _ in range(frames_needed)]
                 if is_musetalk and lookahead_16k is not None and lookahead_16k.size > 0:
-                    frames = lipsync.sync_chunk(
+                    return lipsync.sync_chunk(
                         sub_audio_16k,
                         fps=fps,
                         lookahead_16k=lookahead_16k,
                     )
-                else:
-                    frames = lipsync.sync_chunk(sub_audio_16k, fps=fps)
-                if frames:
-                    if is_musetalk and musetalk_frame_crossfade > 0 and musetalk_prev_tail_frames:
-                        n = min(
-                            musetalk_frame_crossfade,
-                            len(musetalk_prev_tail_frames),
-                            len(frames),
+                return lipsync.sync_chunk(sub_audio_16k, fps=fps)
+
+            def _render_gpu_stage() -> tuple[list[np.ndarray], float, float]:
+                lipsync_wait_started = time.perf_counter()
+                with _avatar_gpu_lock:
+                    gpu_wait_ms = (time.perf_counter() - lipsync_wait_started) * 1000.0
+                    lipsync_started = time.perf_counter()
+                    frames = _render_frames()
+                    # Make the lock reflect completed GPU work, not merely
+                    # queued kernels. This prevents a following TTS chunk
+                    # from contending with an unfinished render.
+                    torch.cuda.synchronize()
+                return frames, gpu_wait_ms, (time.perf_counter() - lipsync_started) * 1000.0
+
+            if serialize_avatar_gpu:
+                render_loop = asyncio.get_running_loop()
+                frames, gpu_wait_ms, lipsync_elapsed_ms = await render_loop.run_in_executor(
+                    _AVATAR_RENDER_EXECUTOR,
+                    _render_gpu_stage,
+                )
+            else:
+                lipsync_started = time.perf_counter()
+                frames = _render_frames()
+                gpu_wait_ms = 0.0
+                lipsync_elapsed_ms = (time.perf_counter() - lipsync_started) * 1000.0
+            if SILENCE_CULLING_ENABLED and rms < SILENCE_RMS_THRESHOLD and last_frame is not None:
+                # A silent run intentionally uses the final generated/source
+                # frame.  Do not reset it here, otherwise a quiet pause can
+                # introduce a visible lower-face jump.
+                pass
+            elif frames:
+                if is_musetalk and musetalk_frame_crossfade > 0 and musetalk_prev_tail_frames:
+                    n = min(
+                        musetalk_frame_crossfade,
+                        len(musetalk_prev_tail_frames),
+                        len(frames),
+                    )
+                    # Whole-frame crossfades are opt-in only. They blur teeth
+                    # and the jaw at window boundaries, so the production
+                    # default remains zero.
+                    for i in range(n):
+                        alpha_new = float(i + 1) / float(n + 1)
+                        alpha_old = 1.0 - alpha_new
+                        frames[i] = cv2.addWeighted(
+                            musetalk_prev_tail_frames[-n + i],
+                            alpha_old,
+                            frames[i],
+                            alpha_new,
+                            0.0,
                         )
-                        # Blend boundary frames to hide diffusion chunk-edge jitter.
-                        for i in range(n):
-                            alpha_new = float(i + 1) / float(n + 1)
-                            alpha_old = 1.0 - alpha_new
-                            frames[i] = cv2.addWeighted(
-                                musetalk_prev_tail_frames[-n + i],
-                                alpha_old,
-                                frames[i],
-                                alpha_new,
-                                0.0,
-                            )
-                        musetalk_prev_tail_frames = [
-                            f.copy() for f in frames[-musetalk_frame_crossfade:]
-                        ]
-                    elif is_musetalk and musetalk_frame_crossfade > 0:
-                        musetalk_prev_tail_frames = [
-                            f.copy() for f in frames[-musetalk_frame_crossfade:]
-                        ]
-                    last_frame = frames[-1].copy()
-            lipsync_elapsed_ms = (time.perf_counter() - lipsync_started) * 1000.0
+                    musetalk_prev_tail_frames = [
+                        f.copy() for f in frames[-musetalk_frame_crossfade:]
+                    ]
+                elif is_musetalk and musetalk_frame_crossfade > 0:
+                    musetalk_prev_tail_frames = [
+                        f.copy() for f in frames[-musetalk_frame_crossfade:]
+                    ]
+                last_frame = frames[-1].copy()
             frame_payloads: list[str] = []
             frame_blobs: list[bytes] = []
             for frame in frames:
@@ -2092,14 +2223,36 @@ def _stream_avatar_from_text_iter(
 
             wav_bytes = _audio_to_wav_bytes(sub_audio, engine.sample_rate)
             duration_sec = float(len(sub_audio) / engine.sample_rate) if sub_audio.size else 0.0
+            built_at = time.perf_counter()
+            previous_media_gap_ms = (
+                (built_at - last_media_built_at) * 1000.0
+                if last_media_built_at is not None
+                else 0.0
+            )
+            last_media_built_at = built_at
             if emit_index == 0:
                 logger.info(
-                    "component=stream op=first_media_chunk profile=%s backend=%s elapsed_ms=%.2f lipsync_ms=%.2f frames=%d duration_sec=%.3f",
+                    "component=stream op=first_media_chunk profile=%s backend=%s elapsed_ms=%.2f gpu_wait_ms=%.2f lipsync_ms=%.2f frames=%d duration_sec=%.3f",
                     profile,
                     req.lipsync_backend or "default",
                     (time.perf_counter() - start_time) * 1000.0,
+                    gpu_wait_ms,
                     lipsync_elapsed_ms,
                     len(frames),
+                    duration_sec,
+                )
+            if emit_index > 0 and (
+                gpu_wait_ms >= 250.0
+                or previous_media_gap_ms > max(1500.0, duration_sec * 1250.0)
+            ):
+                logger.warning(
+                    "component=stream op=media_window_delay profile=%s backend=%s chunk=%d gpu_wait_ms=%.2f lipsync_ms=%.2f build_gap_ms=%.2f audio_sec=%.3f",
+                    profile,
+                    req.lipsync_backend or "default",
+                    emit_index,
+                    gpu_wait_ms,
+                    lipsync_elapsed_ms,
+                    previous_media_gap_ms,
                     duration_sec,
                 )
             if binary_transport:
@@ -2113,20 +2266,24 @@ def _stream_avatar_from_text_iter(
                     "frame_lengths": [len(blob) for blob in frame_blobs],
                 }
                 payload = wav_bytes + b"".join(frame_blobs)
-                yield _pack_binary_stream_packet(metadata, payload)
+                packets: list[str | bytes] = [_pack_binary_stream_packet(metadata, payload)]
             else:
                 payload = base64.b64encode(wav_bytes).decode("ascii")
-                yield json.dumps(
-                    {
-                        "chunk_index": emit_index,
-                        "audio_base64": payload,
-                        "sample_rate": engine.sample_rate,
-                        "fps": fps,
-                        "frames_base64": frame_payloads,
-                        "duration_sec": round(duration_sec, 6),
-                    }
-                ) + "\n"
+                packets = [
+                    json.dumps(
+                        {
+                            "chunk_index": emit_index,
+                            "audio_base64": payload,
+                            "sample_rate": engine.sample_rate,
+                            "fps": fps,
+                            "frames_base64": frame_payloads,
+                            "duration_sec": round(duration_sec, 6),
+                        }
+                    )
+                    + "\n"
+                ]
             emit_index += 1
+            return packets
 
         try:
             engine = engine_cm.__enter__()
@@ -2145,11 +2302,15 @@ def _stream_avatar_from_text_iter(
             sentence_reader_thread.start()
             audio_worker_thread.start()
             while True:
+                if await _client_disconnected():
+                    return
                 try:
-                    kind, idx, audio, audio_16k = result_queue.get(timeout=0.2)
+                    kind, idx, audio, audio_16k = await asyncio.to_thread(
+                        result_queue.get,
+                        True,
+                        0.2,
+                    )
                 except queue.Empty:
-                    if stop_event.is_set():
-                        break
                     continue
                 if kind == "error":
                     detail = "Audio worker failed."
@@ -2159,12 +2320,13 @@ def _stream_avatar_from_text_iter(
                         yield _pack_binary_stream_packet({"event": "error", "detail": detail})
                     else:
                         yield json.dumps({"event": "error", "detail": detail}) + "\n"
-                    break
+                    return
                 if kind == "done":
                     if stream_window_sec > 0 and pending_audio.size and pending_audio_16k.size:
-                        yield from _emit_one(pending_audio, pending_audio_16k)
-                        if serialize_wav2lip_gpu:
-                            tts_gpu_gate.set()
+                        for packet in await _emit_one(pending_audio, pending_audio_16k):
+                            if await _client_disconnected():
+                                return
+                            yield packet
                     break
 
                 if audio is None or audio_16k is None:
@@ -2175,16 +2337,20 @@ def _stream_avatar_from_text_iter(
                     pending_audio_16k = np.concatenate(
                         [pending_audio_16k, audio_16k.astype(np.float32, copy=False)]
                     )
-                    # A very short TTS fragment cannot be rendered yet. Allow
-                    # the worker to produce just enough additional audio, but
-                    # pause it again before the first Wav2Lip batch starts.
-                    if (
-                        serialize_wav2lip_gpu
-                        and (
-                            pending_audio.size < window_src_samples
-                            or pending_audio_16k.size < window_tgt_samples
+                    has_window = (
+                        pending_audio.size >= window_src_samples
+                        and pending_audio_16k.size >= window_tgt_samples
+                    )
+                    has_lookahead = (
+                        lookahead_tgt_samples <= 0
+                        or (
+                            pending_audio.size >= (window_src_samples + lookahead_src_samples)
+                            and pending_audio_16k.size >= (window_tgt_samples + lookahead_tgt_samples)
                         )
-                    ):
+                    )
+                    if serialize_avatar_gpu and (not has_window or not has_lookahead):
+                        # The renderer cannot begin yet. Let TTS supply just
+                        # enough audio to complete the first production window.
                         tts_gpu_gate.set()
                     while (
                         pending_audio.size >= window_src_samples
@@ -2204,12 +2370,28 @@ def _stream_avatar_from_text_iter(
                         sub_audio_16k = pending_audio_16k[:window_tgt_samples]
                         pending_audio = pending_audio[window_src_samples:]
                         pending_audio_16k = pending_audio_16k[window_tgt_samples:]
-                        yield from _emit_one(sub_audio, sub_audio_16k, lookahead_16k=lookahead_16k)
-                        if serialize_wav2lip_gpu:
-                            tts_gpu_gate.set()
+                        for packet in await _emit_one(
+                            sub_audio,
+                            sub_audio_16k,
+                            lookahead_16k=lookahead_16k,
+                        ):
+                            if await _client_disconnected():
+                                return
+                            yield packet
+                    if serialize_avatar_gpu:
+                        # A single Chatterbox result normally contains several
+                        # 1.2-second render windows. Render all of that queued
+                        # audio before giving CUDA back to TTS. Alternating
+                        # after every window made the renderer wait behind an
+                        # unnecessary next-sentence generation and caused the
+                        # visible mid-answer freeze.
+                        tts_gpu_gate.set()
                 else:
-                    yield from _emit_one(audio, audio_16k)
-                    if serialize_wav2lip_gpu:
+                    for packet in await _emit_one(audio, audio_16k):
+                        if await _client_disconnected():
+                            return
+                        yield packet
+                    if serialize_avatar_gpu:
                         tts_gpu_gate.set()
         except Exception:
             logger.exception("Avatar stream failed")
@@ -2218,6 +2400,10 @@ def _stream_avatar_from_text_iter(
             else:
                 yield json.dumps({"event": "error", "detail": traceback.format_exc()}) + "\n"
         finally:
+            # Unblock an audio worker that is waiting for a renderer which is
+            # being cancelled or torn down.
+            stop_event.set()
+            tts_gpu_gate.set()
             with contextlib.suppress(Exception):
                 lipsync_cm.__exit__(None, None, None)
             if profile_lock_acquired:
@@ -2226,7 +2412,6 @@ def _stream_avatar_from_text_iter(
             if engine is not None:
                 with contextlib.suppress(Exception):
                     engine_cm.__exit__(None, None, None)
-            stop_event.set()
             with contextlib.suppress(Exception):
                 close_text_iter = getattr(text_iter, "close", None)
                 if callable(close_text_iter):
@@ -3460,6 +3645,80 @@ def _runtime_cleanup_loop() -> None:
             _evict_idle_lipsync_engines()
 
 
+def _gpu_keepalive_interval_seconds() -> float:
+    """Return the configured CUDA heartbeat interval, or zero when disabled.
+
+    The GPU otherwise down-clocks very quickly after a warm-up.  On the
+    deployment RTX 5090 that made the first MuseTalk batch after an idle pause
+    several seconds slower than the following batches.  The heartbeat is kept
+    deliberately tiny and never waits behind a real TTS or lip-sync stage.
+    """
+
+    try:
+        interval = float(os.getenv("PIXELHOLO_GPU_KEEPALIVE_INTERVAL_SEC", "0.5"))
+    except (TypeError, ValueError):
+        interval = 0.5
+    return max(0.0, min(interval, 10.0))
+
+
+def _start_gpu_keepalive_process() -> None:
+    """Keep the deployment GPU boosted without contending with model work.
+
+    CUDA's power state is managed per process context on the deployment GPU.
+    A heartbeat in the API worker's context was not sufficient to prevent the
+    model context from down-clocking.  This small isolated helper is therefore
+    intentional: it proved to keep the first MuseTalk batch at its warmed
+    speed while never acquiring the worker's inference lock.
+    """
+
+    global _gpu_keepalive_process
+    if _gpu_keepalive_process is not None and _gpu_keepalive_process.poll() is None:
+        return
+    if _gpu_keepalive_interval_seconds() <= 0 or not torch.cuda.is_available():
+        return
+    interval = _gpu_keepalive_interval_seconds()
+    helper_code = (
+        "import time, torch\n"
+        "torch.set_grad_enabled(False)\n"
+        "heartbeat = torch.zeros(4096, dtype=torch.float32, device='cuda')\n"
+        "while True:\n"
+        "    heartbeat.add_(1.0)\n"
+        "    torch.cuda.synchronize()\n"
+        f"    time.sleep({interval!r})\n"
+    )
+    try:
+        _gpu_keepalive_process = subprocess.Popen(
+            [sys.executable, "-u", "-c", helper_code],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        logger.info(
+            "component=gpu op=keepalive status=started mode=isolated_process interval_sec=%.3f pid=%s",
+            interval,
+            _gpu_keepalive_process.pid,
+        )
+    except Exception:
+        _gpu_keepalive_process = None
+        logger.exception("component=gpu op=keepalive status=initialization_error")
+
+
+def _stop_gpu_keepalive_process() -> None:
+    global _gpu_keepalive_process
+    process = _gpu_keepalive_process
+    _gpu_keepalive_process = None
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=3.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+    except Exception:
+        logger.exception("component=gpu op=keepalive status=shutdown_error")
+
+
 def _start_runtime_cleanup_thread() -> None:
     global _runtime_cleanup_thread_started
     if _runtime_cleanup_thread_started:
@@ -3581,19 +3840,44 @@ def _warmup_chatterbox(
         "This is a quick warmup for streaming speech.",
     )
     with _acquire_tts_engine(req, None, None) as engine:
-        audio = engine.generate(
+        # A profile warm-up can run while another visitor is streaming. Treat
+        # the TTS warm-up as a CUDA stage too, otherwise it can interrupt an
+        # already-buffered MuseTalk response and create an external-only stall.
+        # Keep this call on the same seeded, avatar-boundary path as the first
+        # user request. Calling ``engine.generate`` directly warmed a cheaper
+        # Chatterbox path, so readiness did not exercise the exact runtime
+        # boundary that the first real avatar request uses.
+        generation_args = (
+            engine,
+            1234,
             text,
-            ref_wav_path=ref_wav,
-            tts_exaggeration=req.tts_exaggeration,
-            tts_temperature=req.tts_temperature,
-            tts_cfg_weight=req.tts_cfg_weight,
-            tts_repetition_penalty=req.tts_repetition_penalty,
+            ref_wav,
+            DEFAULT_ALPHA,
+            DEFAULT_BETA,
+            DEFAULT_DIFFUSION_STEPS,
+            DEFAULT_EMBEDDING_SCALE,
+            DEFAULT_F0_SCALE,
+            None,
+            None,
+            profile_type == PROFILE_TYPE_AVATAR,
+            (0.35, 0.5, 0.8, 1.2),
         )
+        if torch.cuda.is_available():
+            with _avatar_gpu_lock:
+                audio = _generate_with_seed(*generation_args)
+                torch.cuda.synchronize()
+        else:
+            audio = _generate_with_seed(*generation_args)
         return True, audio, engine.sample_rate
 
 
 _warmed_tts_profiles: set[tuple[str, str, str, str]] = set()
 _warmed_tts_engine_keys: dict[tuple[str, str, str, str], tuple[str, str]] = {}
+# MuseTalk needs a non-silent waveform to allocate and execute the same audio
+# feature path that it will use for a real response. Retain the short, already
+# generated Chatterbox warm-up sample per isolated profile so a later profile
+# selection can do that without issuing another user-visible TTS request.
+_warmed_tts_audio_16k: dict[tuple[str, str, str, str], np.ndarray] = {}
 _warmed_lipsync_profiles: set[tuple[str, str, str, str]] = set()
 
 
@@ -3614,9 +3898,6 @@ def _warmup_lipsync(
                         preset=musetalk_preset,
                     )
                     lipsync.load_profile(profile, profile_type)
-                    audio_16k = warmup_audio_16k
-                    if audio_16k is None or audio_16k.size == 0:
-                        audio_16k = np.zeros(int(0.45 * 16000), dtype=np.float32)
                     warmup_started = time.perf_counter()
                     initial_warmup_args: dict[str, object] = {}
                     if backend == "musetalk":
@@ -3625,37 +3906,111 @@ def _warmup_lipsync(
                         # MuseTalk's GPU path.  Otherwise the first spoken
                         # request would pay the CUDA allocation cost.
                         initial_warmup_args["suppress_silence_motion"] = False
-                    lipsync.sync_chunk(
-                        audio_16k.astype(np.float32, copy=False),
-                        fps=lipsync.fps,
-                        **initial_warmup_args,
-                    )
 
-                    # A short warm-up waveform does not necessarily allocate
-                    # the same tensors as the first 1.2-second web stream.
-                    # Prime one window at the production shape so CUDA kernel
-                    # selection, batch buffers, and the compositor are all
-                    # ready before the UI enables the composer.  This costs
-                    # warm-up time, not user-visible first-response time.
+                    def _run_on_avatar_render_worker(work: Callable[[], None]) -> None:
+                        """Run CUDA preparation on the same thread as live avatar frames.
+
+                        FastAPI runs this synchronous warm-up handler in its
+                        thread pool.  MuseTalk's CUDA execution path is
+                        initialized per thread, so running it there does not
+                        prime the thread that later emits a streamed response.
+                        The dedicated executor is shared with `_emit_one`.
+                        """
+
+                        def _stage() -> None:
+                            if torch.cuda.is_available():
+                                with _avatar_gpu_lock:
+                                    work()
+                                    torch.cuda.synchronize()
+                            else:
+                                work()
+
+                        _AVATAR_RENDER_EXECUTOR.submit(_stage).result()
+
+                    def _sync_warmup(audio: np.ndarray) -> None:
+                        def _work() -> None:
+                            lipsync.sync_chunk(
+                                audio.astype(np.float32, copy=False),
+                                fps=lipsync.fps,
+                                **initial_warmup_args,
+                            )
+
+                        _run_on_avatar_render_worker(_work)
+
                     if backend == "musetalk":
+                        # Prime the exact *first streamed* shape, including
+                        # look-ahead audio.  A silent 0.45-second warm-up or a
+                        # long full-sentence warm-up leaves MuseTalk's first
+                        # 30-frame speech window on a different tensor path.
+                        # That mismatch was the source of the very slow first
+                        # real utterance after the UI had already said ready.
                         try:
-                            prime_seconds = float(
+                            window_seconds = float(
                                 os.getenv(
                                     "MUSE_TALK_WARMUP_WINDOW_SEC",
                                     os.getenv("MUSE_TALK_STREAM_WINDOW_SEC", "1.2"),
                                 )
                             )
                         except (TypeError, ValueError):
-                            prime_seconds = 1.2
-                        prime_samples = max(1, int(np.clip(prime_seconds, 0.5, 3.0) * 16000))
-                        prime_audio = np.zeros(prime_samples, dtype=np.float32)
-                        lipsync.sync_chunk(
-                            prime_audio,
-                            fps=lipsync.fps,
-                            suppress_silence_motion=False,
+                            window_seconds = 1.2
+                        try:
+                            lookahead_seconds = float(
+                                os.getenv("MUSE_TALK_WARMUP_LOOKAHEAD_SEC", "0.16")
+                            )
+                        except (TypeError, ValueError):
+                            lookahead_seconds = 0.16
+                        window_samples = max(
+                            1,
+                            int(np.clip(window_seconds, 0.5, 3.0) * 16000),
                         )
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
+                        lookahead_samples = max(
+                            0,
+                            int(np.clip(lookahead_seconds, 0.0, 0.8) * 16000),
+                        )
+                        required_samples = window_samples + lookahead_samples
+                        source_audio = np.asarray(
+                            warmup_audio_16k
+                            if warmup_audio_16k is not None and warmup_audio_16k.size
+                            else np.zeros(required_samples, dtype=np.float32),
+                            dtype=np.float32,
+                        ).reshape(-1)
+                        if source_audio.size < required_samples:
+                            repeats = int(np.ceil(required_samples / max(1, source_audio.size)))
+                            source_audio = np.tile(source_audio, repeats)
+                        source_audio = source_audio[:required_samples]
+
+                        def _sync_representative_warmup() -> None:
+                            sync_args = {
+                                "fps": lipsync.fps,
+                                "lookahead_16k": source_audio[window_samples:],
+                                "suppress_silence_motion": False,
+                            }
+
+                            def _work() -> None:
+                                lipsync.sync_chunk(source_audio[:window_samples], **sync_args)
+
+                            _run_on_avatar_render_worker(_work)
+
+                        # The first two executions of a freshly loaded
+                        # MuseTalk graph can each initialize CUDA execution
+                        # state.  Previously preparation paid for only the
+                        # first one and the user's first spoken request paid
+                        # for the second.  Run both here and reset the stream
+                        # cursor between them, so "ready" means a first
+                        # production window has already been exercised.
+                        for warmup_pass in range(2):
+                            if warmup_pass:
+                                lipsync.load_profile(profile, profile_type)
+                            _sync_representative_warmup()
+                        # Leave the cached profile in the same clean stream
+                        # state a new request receives.  This also avoids
+                        # inheriting warm-up audio history or a mouth frame.
+                        lipsync.load_profile(profile, profile_type)
+                    else:
+                        audio_16k = warmup_audio_16k
+                        if audio_16k is None or audio_16k.size == 0:
+                            audio_16k = np.zeros(int(0.45 * 16000), dtype=np.float32)
+                        _sync_warmup(audio_16k)
                     logger.info(
                         "component=backend op=warmup_lipsync status=ok profile=%s profile_type=%s backend=%s elapsed_ms=%.2f",
                         profile,
@@ -3681,7 +4036,10 @@ def _warmup_profile(
     with _warmup_profile_lock:
         resolved_tts_backend = _resolve_tts_backend(tts_backend)
         tts_key = (profile, profile_type, resolved_tts_backend, current_workspace_id())
-        warmup_audio_16k: np.ndarray | None = None
+        cached_warmup_audio = _warmed_tts_audio_16k.get(tts_key)
+        warmup_audio_16k: np.ndarray | None = (
+            cached_warmup_audio.copy() if cached_warmup_audio is not None else None
+        )
         warmed_tts = False
         tts_hot_before = False
         resolved_backend: str | None = None
@@ -3723,9 +4081,13 @@ def _warmup_profile(
                             ).astype(np.float32, copy=False)
                         else:
                             warmup_audio_16k = warmup_audio.astype(np.float32, copy=False)
+                        # A copy prevents the shared cache from being mutated by
+                        # resampling or downstream normalisation.
+                        _warmed_tts_audio_16k[tts_key] = warmup_audio_16k.copy()
                 else:
                     _warmed_tts_profiles.discard(tts_key)
                     _warmed_tts_engine_keys.pop(tts_key, None)
+                    _warmed_tts_audio_16k.pop(tts_key, None)
             else:
                 _warmed_tts_profiles.add(tts_key)
                 _warmed_tts_engine_keys[tts_key] = (
@@ -3789,6 +4151,7 @@ def _warmup_profile(
 @app.on_event("startup")
 def _startup() -> None:
     _start_runtime_cleanup_thread()
+    _start_gpu_keepalive_process()
     try:
         warmup_text_normalizer()
         print("Text normalizer warmup completed.")
@@ -3801,6 +4164,11 @@ def _startup() -> None:
         config_path = _resolve_config_path(model_path, os.getenv("STYLE_TTS2_CONFIG"))
         _get_engine(model_path, config_path)
         _warmup_engine(model_path, config_path)
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    _stop_gpu_keepalive_process()
 
 
 @app.get("/lipsync_backend")
@@ -4425,9 +4793,9 @@ def stream(req: GenerateRequest):
     return StreamingResponse(_generator(), media_type="application/x-ndjson")
 
 @app.post("/stream_avatar")
-def stream_avatar(req: GenerateRequest):
+def stream_avatar(req: GenerateRequest, request: Request):
     text_iter = iter([req.text])
-    return _stream_avatar_from_text_iter(req, text_iter)
+    return _stream_avatar_from_text_iter(req, text_iter, request=request)
 
 
 
@@ -4608,6 +4976,7 @@ def chat(req: GenerateRequest, request: Request):
             llm_stream,
             binary_transport=binary_transport,
             mobile_profile=mobile_profile,
+            request=request,
         )
     return _stream_voice_from_text_iter(
         req,
@@ -4630,6 +4999,7 @@ def speak(req: GenerateRequest, request: Request):
             iter([req.text]),
             binary_transport=binary_transport,
             mobile_profile=mobile_profile,
+            request=request,
         )
     return _stream_voice_from_text_iter(
         req,

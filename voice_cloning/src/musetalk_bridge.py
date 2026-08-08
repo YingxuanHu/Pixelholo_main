@@ -8,6 +8,7 @@ import math
 import os
 import pickle
 import sys
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -63,6 +64,13 @@ class MuseTalkBridge:
             torch.backends.cudnn.benchmark = True
 
         self.batch_size = int(batch_size or os.getenv("MUSE_TALK_BATCH_SIZE", "24"))
+        # CUDA selects and compiles kernels by tensor shape. A final short
+        # batch (for example 18 frames after several 24-frame batches) can
+        # therefore incur a multi-second first-use stall even though the
+        # renderer is otherwise warm. Pad only that final execution batch and
+        # discard its duplicated outputs so every live request uses the same
+        # shape as the prepared 24-frame path.
+        self.static_batch_padding = os.getenv("MUSE_TALK_STATIC_BATCH_PADDING", "1") != "0"
         # Keep the replacement mask to MuseTalk's native face/lip segmentation.
         # The custom `jaw` dilation can overwrite the chin with the model's
         # lower-resolution reconstruction, which reads as a blurry jawline.
@@ -120,7 +128,11 @@ class MuseTalkBridge:
         # replacing the source chin, where the reconstruction is most likely
         # to look soft or lose the natural jaw contour.
         self.mouth_mask_bottom_ratio = float(
-            os.getenv("MUSE_TALK_MOUTH_MASK_BOTTOM_RATIO", "0.84")
+            # Preserve the original chin and jawline. MuseTalk's generated
+            # 256px face is reliable around the lips, but blending deep into
+            # the lower face makes the chin alternate between the source and
+            # reconstructed geometry at streamed-window boundaries.
+            os.getenv("MUSE_TALK_MOUTH_MASK_BOTTOM_RATIO", "0.68")
         )
         self.mouth_mask_bottom_feather = float(
             os.getenv("MUSE_TALK_MOUTH_MASK_BOTTOM_FEATHER", "0.08")
@@ -1113,9 +1125,26 @@ class MuseTalkBridge:
             frame_w,
             frame_h,
         )
+        # The cached mask boxes were already stabilized, but the generated
+        # MuseTalk face was still placed using the raw detector coordinates
+        # below. That mismatch makes the lower-face patch shift its scale and
+        # position from frame to frame, which is most visible as a chin that
+        # flips between two shapes. Use the same short temporal track for the
+        # compositor's face placement while retaining the raw coordinates for
+        # cache validation and latent lookup above.
+        runtime_coords_xyxy = (
+            self._smooth_xyxy_boxes(
+                coords_xyxy,
+                frame_w,
+                frame_h,
+                self.mask_stabilize_window,
+            )
+            if self.mask_stabilize and len(coords_xyxy) >= 3
+            else coords_xyxy
+        )
 
         self.frames = frames
-        self.coords_xyxy = coords_xyxy
+        self.coords_xyxy = runtime_coords_xyxy
         self._latents = latents
         self._mask_arrays = mask_arrays
         self._mask_crop_boxes = mask_crop_boxes
@@ -1308,6 +1337,36 @@ class MuseTalkBridge:
             self.frame_idx += 1
             yield frame, coord, latent, mask, mask_crop, alpha
 
+    def _pad_runtime_batch(
+        self,
+        whisper_batch: torch.Tensor,
+        latent_batch: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Pad a short final model batch without changing visible frames.
+
+        MuseTalk's U-Net is sample-independent in evaluation mode. Repeating
+        the final sample only gives CUDA a stable execution shape. Callers use
+        the returned logical size to ignore the synthetic outputs.
+        """
+        logical_size = int(len(latent_batch))
+        target_size = int(self.batch_size)
+        if (
+            not self.static_batch_padding
+            or logical_size <= 0
+            or logical_size >= target_size
+            or target_size > 32
+        ):
+            return whisper_batch, latent_batch, logical_size
+
+        pad_size = target_size - logical_size
+        whisper_padding = whisper_batch[-1:].expand(pad_size, *whisper_batch.shape[1:])
+        latent_padding = latent_batch[-1:].expand(pad_size, *latent_batch.shape[1:])
+        return (
+            torch.cat((whisper_batch, whisper_padding), dim=0),
+            torch.cat((latent_batch, latent_padding), dim=0),
+            logical_size,
+        )
+
     def _blend_frame(
         self,
         frame: np.ndarray,
@@ -1408,6 +1467,15 @@ class MuseTalkBridge:
         *,
         suppress_silence_motion: bool = True,
     ) -> list[np.ndarray]:
+        timing_enabled = os.getenv("MUSE_TALK_PHASE_TIMING", "0") == "1"
+        started_at = time.perf_counter() if timing_enabled else 0.0
+        prepare_ms = 0.0
+        whisper_ms = 0.0
+        model_ms = 0.0
+        blend_ms = 0.0
+        model_batch_ms: list[float] = []
+        model_batch_sizes: list[int] = []
+        model_batch_shapes: list[tuple[int, ...]] = []
         if self.frames is None or self.coords_xyxy is None:
             raise RuntimeError("Avatar cache not loaded.")
         if audio_16k.size == 0:
@@ -1477,6 +1545,8 @@ class MuseTalkBridge:
             latents.append(latent)
             mask_crop_boxes.append(mask_crop)
             alphas.append(alpha)
+        if timing_enabled:
+            prepare_ms = (time.perf_counter() - started_at) * 1000.0
 
         output_frames: list[np.ndarray] = []
         if bool(np.all(silence_frames)):
@@ -1486,15 +1556,21 @@ class MuseTalkBridge:
             self._prev_generated_face = None
             output_frames = frames
         else:
+            whisper_started_at = time.perf_counter() if timing_enabled else 0.0
             whisper_chunks = self._extract_whisper_prompts(
                 audio_context,
                 infer_fps,
                 infer_target_frames,
                 start_frame_offset,
             )
+            if timing_enabled:
+                if self.device.startswith("cuda") and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                whisper_ms = (time.perf_counter() - whisper_started_at) * 1000.0
             if whisper_chunks.numel() == 0:
                 return []
             cursor = 0
+            model_started_at = time.perf_counter() if timing_enabled else 0.0
             with torch.inference_mode():
                 gen = self._datagen(
                     whisper_chunks,
@@ -1503,6 +1579,11 @@ class MuseTalkBridge:
                     device=self.device,
                 )
                 for whisper_batch, latent_batch in gen:
+                    batch_started_at = time.perf_counter() if timing_enabled else 0.0
+                    whisper_batch, latent_batch, batch_size = self._pad_runtime_batch(
+                        whisper_batch,
+                        latent_batch,
+                    )
                     whisper_batch = whisper_batch.to(self.device, dtype=self.weight_dtype)
                     audio_feature_batch = self.pe(whisper_batch)
                     latent_batch = latent_batch.to(device=self.device, dtype=self.unet.model.dtype)
@@ -1514,7 +1595,16 @@ class MuseTalkBridge:
                     pred_latents = pred_latents.to(device=self.device, dtype=self.vae.vae.dtype)
                     recon = self.vae.decode_latents(pred_latents)
 
-                    for res_frame in recon:
+                    if timing_enabled and self.device.startswith("cuda") and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    if timing_enabled:
+                        model_batch_ms.append((time.perf_counter() - batch_started_at) * 1000.0)
+                        model_batch_sizes.append(batch_size)
+                        model_batch_shapes.append(tuple(int(value) for value in whisper_batch.shape))
+                    if timing_enabled:
+                        batch_blend_started_at = time.perf_counter()
+
+                    for res_frame in recon[:batch_size]:
                         frame = frames[cursor]
                         if silence_frames[cursor]:
                             # Do not carry an open-mouth reconstruction through
@@ -1536,6 +1626,10 @@ class MuseTalkBridge:
                             )
                             output_frames.append(frame)
                         cursor += 1
+                    if timing_enabled:
+                        blend_ms += (time.perf_counter() - batch_blend_started_at) * 1000.0
+            if timing_enabled:
+                model_ms = max(0.0, (time.perf_counter() - model_started_at) * 1000.0 - blend_ms)
 
         # Never make a compositing failure look like a successful lip-sync
         # response.  Returning only untouched source frames is particularly
@@ -1556,6 +1650,22 @@ class MuseTalkBridge:
             idx = np.clip(np.round(idx).astype(np.int32), 0, len(output_frames) - 1)
             output_frames = [output_frames[i] for i in idx.tolist()]
 
+        if timing_enabled:
+            total_ms = (time.perf_counter() - started_at) * 1000.0
+            if total_ms >= 500.0:
+                logger.info(
+                    "component=musetalk op=sync_chunk_timing total_ms=%.2f prepare_ms=%.2f whisper_ms=%.2f model_ms=%.2f blend_ms=%.2f frames=%d audio_sec=%.3f batch_sizes=%s batch_shapes=%s batch_model_ms=%s",
+                    total_ms,
+                    prepare_ms,
+                    whisper_ms,
+                    model_ms,
+                    blend_ms,
+                    len(output_frames),
+                    len(audio_chunk) / 16000.0,
+                    model_batch_sizes,
+                    model_batch_shapes,
+                    [round(value, 2) for value in model_batch_ms],
+                )
         return output_frames
 
     def close(self) -> None:

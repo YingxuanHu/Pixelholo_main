@@ -72,7 +72,9 @@ type BinaryStreamPacket = {
 type VideoFrameSource = string | {
   url: string;
   bitmap?: ImageBitmap;
+  image?: HTMLImageElement;
   bitmapPromise?: Promise<ImageBitmap | null>;
+  imagePromise?: Promise<HTMLImageElement | null>;
   bitmapState?: 'pending' | 'ready' | 'failed';
   decodePaintAttached?: boolean;
   drawn?: boolean;
@@ -167,17 +169,23 @@ const BLUR_KERNEL_BY_LEVEL = { low: 60, medium: 75, high: 90 } as const;
 const DEFAULT_AVATAR_BLUR_LEVEL: keyof typeof BLUR_KERNEL_BY_LEVEL = 'medium';
 const DEFAULT_VIDEO_FPS = 25;
 const DEFAULT_WEB_AVATAR_MAX_FRAME_EDGE = Number(
-  // The web canvas is portrait and can display 1280px-tall source frames without
-  // scaling them up.  Keep the server-side cap aligned with that display so the
-  // mouth and teeth are not softened by an avoidable downscale.
-  (env.VITE_PIXELHOLO_AVATAR_MAX_FRAME_EDGE as string | undefined)?.trim() || '1280',
+  // MuseTalk's native generated face is 256px. Shipping a source-sized 1280px
+  // JPEG rendition does not add lip detail, but it can make every 1.2-second
+  // media packet several megabytes and starve a remote browser's decoder.
+  // 768px keeps the preview above the native face-rendering resolution while
+  // leaving enough bandwidth headroom for continuous public playback.
+  (env.VITE_PIXELHOLO_AVATAR_MAX_FRAME_EDGE as string | undefined)?.trim() || '768',
 );
-const BEST_WEB_MUSETALK_JPEG_QUALITY = 95;
+const BEST_WEB_MUSETALK_JPEG_QUALITY = 90;
 const FIREFOX_AVATAR_MAX_FRAME_EDGE = 768;
 const FIREFOX_AVATAR_FPS = 18;
 const FIREFOX_MUSETALK_JPEG_QUALITY = 88;
 const DEFAULT_AUDIO_START_DELAY_SEC = envNumber('VITE_PIXELHOLO_AUDIO_START_DELAY_SEC', 0.04, 0.02, 0.25);
-const AVATAR_AUDIO_START_DELAY_SEC = envNumber('VITE_PIXELHOLO_AVATAR_AUDIO_START_DELAY_SEC', 0.34, 0.12, 1.0);
+// The renderer sends 1.2-second audio/face windows. Starting audio after only
+// a few hundred milliseconds means a normal second-window delivery jitter can
+// drain the browser's frame queue while speech continues. A short initial
+// cushion makes the public stream resilient without altering model latency.
+const AVATAR_AUDIO_START_DELAY_SEC = envNumber('VITE_PIXELHOLO_AVATAR_AUDIO_START_DELAY_SEC', 1.35, 0.4, 2.5);
 const AVATAR_AUDIO_CHUNK_LEAD_SEC = envNumber('VITE_PIXELHOLO_AVATAR_AUDIO_CHUNK_LEAD_SEC', 0.08, 0.02, 0.5);
 const VIDEO_FRAME_DECODE_PREWAIT_MS = envNumber('VITE_PIXELHOLO_VIDEO_PREDECODE_PREWAIT_MS', 45, 0, 200);
 const WARMUP_CACHE_MAX_AGE_MS = 120_000;
@@ -458,6 +466,11 @@ const App: React.FC = () => {
   const audioContextRef = useRef<AudioContext | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const audioEndTimeRef = useRef<number>(0);
+  // The response can spend seconds in the assistant, TTS, and server before
+  // the first media packet arrives. Track the first *received* packet so the
+  // avatar playback cushion is not accidentally consumed while waiting for
+  // inference to begin.
+  const audioFirstChunkPendingRef = useRef(true);
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const audioUnlockedRef = useRef<boolean>(false);
   const streamAbortRef = useRef<AbortController | null>(null);
@@ -515,6 +528,7 @@ const App: React.FC = () => {
     source.drawn = true;
     source.bitmap?.close();
     source.bitmap = undefined;
+    source.image = undefined;
     if (source.url.startsWith('blob:')) {
       URL.revokeObjectURL(source.url);
     }
@@ -1834,6 +1848,7 @@ const App: React.FC = () => {
     activeSourcesRef.current.clear();
     nextStartTimeRef.current = 0;
     audioEndTimeRef.current = 0;
+    audioFirstChunkPendingRef.current = true;
   };
 
   const resetAudio = async () => {
@@ -1911,11 +1926,11 @@ const App: React.FC = () => {
     const pending = (frames ?? [])
       .filter((frame): frame is Exclude<VideoFrameSource, string> => (
         typeof frame !== 'string'
-        && !!frame.bitmapPromise
+        && !!(frame.bitmapPromise || frame.imagePromise)
         && frame.bitmapState === 'pending'
       ))
       .slice(0, 4)
-      .map(frame => frame.bitmapPromise!);
+      .map(frame => frame.bitmapPromise || frame.imagePromise!);
     if (!pending.length) return;
     await Promise.race([
       Promise.allSettled(pending),
@@ -1940,6 +1955,7 @@ const App: React.FC = () => {
     const playbackGeneration = videoDrawSerialRef.current;
     const sourceUrl = typeof frameSource === 'string' ? frameSource : frameSource.url;
     const bitmap = typeof frameSource === 'string' ? undefined : frameSource.bitmap;
+    const image = typeof frameSource === 'string' ? undefined : frameSource.image;
     const cleanup = () => {
       releaseFrameSource(frameSource);
     };
@@ -1994,16 +2010,30 @@ const App: React.FC = () => {
       cleanup();
       return;
     }
+    if (image) {
+      paint(image, image.naturalWidth || image.width, image.naturalHeight || image.height);
+      cleanup();
+      return;
+    }
     if (
       typeof frameSource !== 'string'
-      && frameSource.bitmapPromise
+      && (frameSource.bitmapPromise || frameSource.imagePromise)
       && frameSource.bitmapState === 'pending'
     ) {
       if (!frameSource.decodePaintAttached) {
         frameSource.decodePaintAttached = true;
-        void frameSource.bitmapPromise.then((decodedBitmap) => {
-          if (decodedBitmap) {
-            paint(decodedBitmap, decodedBitmap.width, decodedBitmap.height);
+        const decodePromise = frameSource.bitmapPromise || frameSource.imagePromise!;
+        void decodePromise.then((decodedFrame) => {
+          if (decodedFrame) {
+            const decodedImage = decodedFrame as ImageBitmap | HTMLImageElement;
+            const isHtmlImage = 'naturalWidth' in decodedImage;
+            const width = isHtmlImage
+              ? decodedImage.naturalWidth || decodedImage.width
+              : decodedImage.width;
+            const height = isHtmlImage
+              ? decodedImage.naturalHeight || decodedImage.height
+              : decodedImage.height;
+            paint(decodedImage, width, height);
             cleanup();
             return;
           }
@@ -2025,18 +2055,43 @@ const App: React.FC = () => {
       }
       const startAt = videoStartTimeRef.current;
       if (startAt !== null) {
-        const fps = Math.max(5, videoFpsRef.current || 25);
         if (videoNextFrameTimeRef.current === null) {
           videoNextFrameTimeRef.current = startAt;
         }
         const now = ctx.currentTime;
-        let frameToDraw: QueuedVideoFrame | null = null;
-        while (frameQueueRef.current.length > 0 && frameQueueRef.current[0].t <= now) {
-          const shifted = frameQueueRef.current.shift() || null;
-          if (frameToDraw) {
-            releaseFrameSource(frameToDraw.frame);
+        // Audio is scheduled against AudioContext time, so video must present
+        // against that same clock.  Drawing only one overdue frame per RAF
+        // makes the mouth permanently trail audio after a short paint delay.
+        // Conversely, dropping every overdue frame can discard JPEGs that are
+        // still decoding.  Select the newest *decoded* due frame, discard only
+        // older frames that can no longer be presented, and leave pending work
+        // queued until it is ready.  This keeps the visible jaw on the current
+        // phoneme and prevents a late, older decode from repainting the face.
+        const queue = frameQueueRef.current;
+        let presentationIndex = -1;
+        let failedIndex = -1;
+        for (let index = 0; index < queue.length && queue[index].t <= now; index += 1) {
+          const source = queue[index].frame;
+          if (typeof source === 'string') {
+            presentationIndex = index;
+            break;
           }
-          frameToDraw = shifted;
+          if (source.bitmapState === 'ready') {
+            presentationIndex = index;
+          } else if (source.bitmapState === 'failed' && failedIndex < 0) {
+            failedIndex = index;
+          }
+        }
+        if (presentationIndex < 0 && failedIndex >= 0) {
+          presentationIndex = failedIndex;
+        }
+        let frameToDraw: QueuedVideoFrame | null = null;
+        if (presentationIndex >= 0) {
+          const expired = queue.splice(0, presentationIndex + 1);
+          frameToDraw = expired.pop() || null;
+          for (const staleFrame of expired) {
+            releaseFrameSource(staleFrame.frame);
+          }
         }
         if (frameToDraw) {
           drawFrame(frameToDraw.frame, frameToDraw.t);
@@ -2085,12 +2140,16 @@ const App: React.FC = () => {
 
     // Backend already handles chunk-boundary stitching/crossfades.
     // Frontend should focus on stable scheduling with enough lead time.
-    const desiredStart = nextStartTimeRef.current;
+    const isFirstBuffer = audioFirstChunkPendingRef.current;
+    const desiredStart = isFirstBuffer
+      ? ctx.currentTime + audioStartDelayRef.current
+      : nextStartTimeRef.current;
     const minLead = outputMode === 'avatar' ? AVATAR_AUDIO_CHUNK_LEAD_SEC : 0.03;
     const startAt = Math.max(ctx.currentTime + minLead, desiredStart);
     const endAt = startAt + buffer.duration;
 
     source.start(startAt);
+    audioFirstChunkPendingRef.current = false;
     nextStartTimeRef.current = endAt;
     audioEndTimeRef.current = Math.max(audioEndTimeRef.current, endAt);
     return { startAt, endAt };
@@ -2165,12 +2224,16 @@ const App: React.FC = () => {
     setInferenceChunks([]);
     setLatency(null);
     setInferenceStageIndex(inferenceSteps.length > 0 ? 0 : null);
-    // Set lead first, then schedule against it.
+    // The initial playback lead starts when the first media packet reaches the
+    // browser, not when this request is submitted. Otherwise model and network
+    // latency silently consume the cushion and a normal later packet can cause
+    // a mid-sentence under-run.
     audioStartDelayRef.current = outputMode === 'avatar'
       ? AVATAR_AUDIO_START_DELAY_SEC
       : DEFAULT_AUDIO_START_DELAY_SEC;
-    nextStartTimeRef.current = (audioContextRef.current?.currentTime || 0) + audioStartDelayRef.current;
-    audioEndTimeRef.current = nextStartTimeRef.current;
+    audioFirstChunkPendingRef.current = true;
+    nextStartTimeRef.current = 0;
+    audioEndTimeRef.current = 0;
     let sawError = false;
 
     if (streamAbortRef.current && streamRunningRef.current) {
@@ -2430,6 +2493,41 @@ const App: React.FC = () => {
                   frameSource.bitmapState = 'failed';
                   return null;
                 });
+            } else {
+              // Firefox decodes JPEG ImageBitmaps asynchronously enough to
+              // miss a 25 FPS deadline. Preload a normal image instead, then
+              // let the shared presentation loop select it only after decode.
+              // This is deliberately performed before the audio clock starts.
+              frameSource.bitmapState = 'pending';
+              frameSource.imagePromise = new Promise<HTMLImageElement | null>((resolve) => {
+                const image = new Image();
+                image.decoding = 'async';
+                image.onload = () => {
+                  const completeDecode = () => {
+                    if (frameSource.drawn) {
+                      frameSource.bitmapState = 'failed';
+                      resolve(null);
+                      return;
+                    }
+                    frameSource.image = image;
+                    frameSource.bitmapState = 'ready';
+                    resolve(image);
+                  };
+                  // onload usually implies a usable image, but decode() makes
+                  // that guarantee explicit before this frame is eligible for
+                  // the audio-clock presentation queue.
+                  if (typeof image.decode === 'function') {
+                    void image.decode().then(completeDecode, completeDecode);
+                  } else {
+                    completeDecode();
+                  }
+                };
+                image.onerror = () => {
+                  frameSource.bitmapState = 'failed';
+                  resolve(null);
+                };
+                image.src = frameSource.url;
+              });
             }
             frameSources.push(frameSource);
           }
@@ -3370,7 +3468,7 @@ const App: React.FC = () => {
             <section className="ph-studio-view">
               <div className="ph-studio-heading">
                 <div><span className="ph-kicker">Avatar studio</span><h1>{profile.name}</h1><p>Speak naturally. PixelHolo handles the voice and face in one stream.</p></div>
-                <div className="ph-studio-heading-actions"><span className="ph-live-pill"><span className="ph-status-dot online" /> {isWarmingUp ? `Warming ${warmupTargetName || 'avatar'}…` : 'Ready'}</span><button type="button" className="ph-secondary-button" onClick={() => setActiveStep(1)}>Change avatar</button></div>
+                <div className="ph-studio-heading-actions"><span className="ph-live-pill"><span className={`ph-status-dot ${profileCanGenerate ? 'online' : profileWarmupState === 'error' ? 'offline' : ''}`} /> {isWarmingUp || profileWarmupState === 'warming' ? `Warming ${warmupTargetName || 'avatar'}…` : profileCanGenerate ? 'Ready' : profileWarmupState === 'error' ? 'Warm-up failed' : 'Preparing avatar'}</span><button type="button" className="ph-secondary-button" onClick={() => setActiveStep(1)}>Change avatar</button></div>
               </div>
 
               <div className="ph-studio-grid">
@@ -3393,9 +3491,10 @@ const App: React.FC = () => {
                     onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendComposerText(); } }}
                     placeholder={composerMode === 'say' ? 'Type something for your avatar to say…' : 'Ask your avatar anything…'}
                     rows={5}
+                    disabled={isComposerLocked}
                   />
                   <div className="ph-composer-meta"><span>{inferenceText.length} characters</span><span>Enter to generate · Shift + Enter for a new line</span></div>
-                  <button type="button" className="ph-primary-button ph-generate-button" onClick={() => void sendComposerText()} disabled={!inferenceText.trim() || stepStatuses.inference === 'running' || isWarmingUp}>{stepStatuses.inference === 'running' ? 'Generating…' : composerMode === 'say' ? 'Generate voice + lip sync' : 'Ask and animate'}<span>↗</span></button>
+                  <button type="button" className="ph-primary-button ph-generate-button" onClick={() => void sendComposerText()} disabled={!inferenceText.trim() || isComposerLocked}>{stepStatuses.inference === 'running' ? 'Generating…' : isWarmingUp || profileWarmupState === 'warming' ? 'Warming avatar…' : composerMode === 'say' ? 'Generate voice + lip sync' : 'Ask and animate'}<span>↗</span></button>
 
                   <div className="ph-emotion-row"><div><span className="ph-control-label">Emotion</span><small>Chatterbox expression</small></div><select value={voiceControlValues?.emotion || 'neutral'} onChange={(event) => handleVoiceControlsChange({ emotion: event.target.value as VoiceEmotion })}>{(['neutral', 'happy', 'sad', 'angry', 'scared', 'disgust'] as VoiceEmotion[]).map((emotion) => <option key={emotion} value={emotion}>{emotion[0].toUpperCase() + emotion.slice(1)}</option>)}</select></div>
 

@@ -7,6 +7,7 @@ avatar frames or NDJSON events, which keeps the UI's low-latency behavior.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -47,14 +48,44 @@ async def api_proxy(request: web.Request) -> web.StreamResponse:
     except aiohttp.ClientError as exc:
         raise web.HTTPBadGateway(text=f"Inference backend unavailable: {exc}") from exc
 
-    response = web.StreamResponse(status=upstream.status, headers=_forward_headers(upstream.headers))
+    response_headers = _forward_headers(upstream.headers)
+    # Cloudflare should forward this response as a live media stream.  These
+    # headers also prevent intermediary transformations from accumulating
+    # binary PHS1 packets before the browser receives them.
+    response_headers.update(
+        {
+            "Cache-Control": "no-store, no-transform",
+            "X-Accel-Buffering": "no",
+        }
+    )
+    response = web.StreamResponse(status=upstream.status, headers=response_headers)
     await response.prepare(request)
+    client_closed = False
     try:
-        async for chunk in upstream.content.iter_chunked(64 * 1024):
+        # 64 KiB made the public path wait for several media frames before
+        # forwarding.  Smaller writes preserve the backend's packet cadence
+        # without changing the binary protocol.
+        async for chunk in upstream.content.iter_chunked(16 * 1024):
+            if request.transport is None or request.transport.is_closing():
+                client_closed = True
+                break
             await response.write(chunk)
+    except (ConnectionResetError, aiohttp.ClientConnectionError):
+        # A browser AbortController or page navigation is normal for an
+        # interruptible avatar stream.  Closing the upstream response here
+        # propagates the cancellation to FastAPI instead of leaving a stale
+        # renderer holding the shared profile lock until a socket timeout.
+        client_closed = True
+    except asyncio.CancelledError:
+        client_closed = True
+        raise
     finally:
         upstream.close()
-    await response.write_eof()
+    if not client_closed:
+        try:
+            await response.write_eof()
+        except (ConnectionResetError, aiohttp.ClientConnectionError):
+            pass
     return response
 
 
@@ -74,7 +105,9 @@ async def static_or_spa(request: web.Request) -> web.StreamResponse:
 
 
 async def on_startup(app: web.Application) -> None:
-    app["http_session"] = aiohttp.ClientSession()
+    app["http_session"] = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=None)
+    )
 
 
 async def on_cleanup(app: web.Application) -> None:
