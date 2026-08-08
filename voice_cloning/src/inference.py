@@ -300,9 +300,11 @@ def _configure_musetalk_for_request(
     lipsync: _LipSyncEngineProtocol,
     *,
     preset: str | None = None,
+    coord_source: str | None = None,
     face_scale: float | None = None,
     temporal_smooth: float | None = None,
     detail_sharpen: float | None = None,
+    mouth_mask_bottom_ratio: float | None = None,
     infer_fps: float | None = None,
     audio_history_sec: float | None = None,
 ) -> None:
@@ -317,9 +319,11 @@ def _configure_musetalk_for_request(
     if callable(configure):
         configure(
             preset=preset,
+            coord_source=coord_source,
             face_scale=face_scale,
             temporal_smooth=temporal_smooth,
             detail_sharpen=detail_sharpen,
+            mouth_mask_bottom_ratio=mouth_mask_bottom_ratio,
             infer_fps=infer_fps,
             audio_history_sec=audio_history_sec,
         )
@@ -1578,9 +1582,11 @@ def _stream_avatar_from_text_iter(
             _configure_musetalk_for_request(
                 lipsync,
                 preset=req.musetalk_preset,
+                coord_source=req.musetalk_coord_source,
                 face_scale=req.musetalk_face_scale,
                 temporal_smooth=req.musetalk_temporal_smooth,
                 detail_sharpen=req.musetalk_detail_sharpen,
+                mouth_mask_bottom_ratio=req.musetalk_mouth_mask_bottom_ratio,
                 infer_fps=req.musetalk_infer_fps,
                 audio_history_sec=req.musetalk_audio_history_sec,
             )
@@ -2714,10 +2720,12 @@ class GenerateRequest(BaseModel):
     avatar_fps: float | None = None
     avatar_max_frame_edge: int | None = None
     musetalk_preset: str | None = None
+    musetalk_coord_source: str | None = None
     musetalk_batch_size: int | None = None
     musetalk_infer_fps: float | None = None
     musetalk_temporal_smooth: float | None = None
     musetalk_detail_sharpen: float | None = None
+    musetalk_mouth_mask_bottom_ratio: float | None = None
     musetalk_stream_window_sec: float | None = None
     musetalk_lookahead_sec: float | None = None
     musetalk_jpeg_quality: int | None = None

@@ -128,7 +128,7 @@ class WorkspaceConversationSafetyTests(unittest.TestCase):
         # boundary that prevents a low-resolution generated face from replacing
         # the source chin and changing its geometry between stream windows.
         bridge = object.__new__(MuseTalkBridge)
-        bridge.mouth_mask_bottom_ratio = 0.68
+        bridge.mouth_mask_bottom_ratio = 0.65
         bridge.mouth_mask_bottom_feather = 0.08
         alpha = np.ones((100, 80), dtype=np.float32)
 
@@ -142,6 +142,22 @@ class WorkspaceConversationSafetyTests(unittest.TestCase):
         self.assertGreater(float(protected[57, 40]), 0.0)
         self.assertLess(float(protected[57, 40]), 1.0)
         self.assertEqual(float(protected[66, 40]), 0.0)
+
+    def test_musetalk_holds_the_last_rendered_portrait_during_a_pause(self):
+        # The original reference clip keeps moving.  A sustained TTS pause
+        # must not switch back to that clip, otherwise its mouth and chin can
+        # visibly jump as the generated stream becomes quiet.
+        bridge = object.__new__(MuseTalkBridge)
+        source = np.zeros((3, 4, 3), dtype=np.uint8)
+        rendered = np.full((3, 4, 3), 127, dtype=np.uint8)
+        bridge._last_rendered_frame = rendered
+
+        held = bridge._pause_frame(source)
+        self.assertTrue(np.array_equal(held, rendered))
+        self.assertIsNot(held, rendered)
+
+        bridge._last_rendered_frame = None
+        self.assertTrue(np.array_equal(bridge._pause_frame(source), source))
 
     def test_musetalk_uses_a_stable_face_track_for_runtime_compositing(self):
         # A face detector can vary by a few pixels between adjacent source
@@ -161,6 +177,31 @@ class WorkspaceConversationSafetyTests(unittest.TestCase):
         raw_center_x = (raw[:, 0] + raw[:, 2]) / 2.0
         stable_center_x = (stable[:, 0] + stable[:, 2]) / 2.0
         self.assertLess(float(np.ptp(stable_center_x)), float(np.ptp(raw_center_x)))
+
+    def test_musetalk_request_coordinate_source_overrides_the_preset(self):
+        # Production keeps MuseTalk's full-face conditioning. Keep an explicit
+        # baked-track override for controlled A/B evaluations without allowing
+        # a previous request's mutable renderer state to leak into the next one.
+        bridge = object.__new__(MuseTalkBridge)
+        bridge.default_temporal_smooth = 0.025
+        bridge.default_face_scale = 0.96
+        bridge.default_detail_sharpen = 0.70
+        bridge.default_mouth_mask_bottom_ratio = 0.65
+        bridge.default_infer_fps = 25.0
+        bridge.default_audio_history_sec = 2.0
+
+        with patch.dict("os.environ", {"MUSE_TALK_COORD_SOURCE": "legacy"}):
+            bridge.configure_for_request(preset="realistic")
+            self.assertEqual(bridge.coord_source, "legacy")
+
+            bridge.configure_for_request(preset="realistic", coord_source="baked")
+            self.assertEqual(bridge.coord_source, "baked")
+
+            bridge.configure_for_request(preset="realistic", mouth_mask_bottom_ratio=0.72)
+            self.assertEqual(bridge.mouth_mask_bottom_ratio, 0.72)
+
+            bridge.configure_for_request(preset="realistic")
+            self.assertEqual(bridge.mouth_mask_bottom_ratio, 0.65)
 
     def test_musetalk_pads_only_the_invisible_tail_batch(self):
         # The final short model batch used to create a new CUDA execution

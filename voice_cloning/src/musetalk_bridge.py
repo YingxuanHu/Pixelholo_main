@@ -93,12 +93,10 @@ class MuseTalkBridge:
         # (low infer fps + frame upsampling reduces base-frame progression speed).
         self.default_infer_fps = float(os.getenv("MUSE_TALK_INFER_FPS", "25.0"))
         self.infer_fps = self.default_infer_fps
-        # MuseTalk was trained with a full-face crop.  A lower-face-only crop
-        # can look superficially sharper, but it removes the face context the
-        # diffusion model needs and can reduce a generated response to what
-        # appears to be the unmodified source clip.  Keep the detector's full
-        # face box as the default; the landmark crop remains available only as
-        # an explicit diagnostic/experimental override.
+        # MuseTalk conditions on a full-face crop.  The baked lower-face track
+        # is useful for controlled diagnostics, but it can reduce the amount
+        # of generated mouth motion.  Keep full-face conditioning as the
+        # public default and address chin stability at compositing time.
         self.default_coord_source = self._normalize_coord_source(
             os.getenv("MUSE_TALK_COORD_SOURCE", "legacy")
         )
@@ -127,13 +125,14 @@ class MuseTalkBridge:
         # MuseTalk's generated face is 256px.  Keep its lower edge from
         # replacing the source chin, where the reconstruction is most likely
         # to look soft or lose the natural jaw contour.
-        self.mouth_mask_bottom_ratio = float(
+        self.default_mouth_mask_bottom_ratio = float(
             # Preserve the original chin and jawline. MuseTalk's generated
             # 256px face is reliable around the lips, but blending deep into
             # the lower face makes the chin alternate between the source and
             # reconstructed geometry at streamed-window boundaries.
-            os.getenv("MUSE_TALK_MOUTH_MASK_BOTTOM_RATIO", "0.68")
+            os.getenv("MUSE_TALK_MOUTH_MASK_BOTTOM_RATIO", "0.65")
         )
+        self.mouth_mask_bottom_ratio = self.default_mouth_mask_bottom_ratio
         self.mouth_mask_bottom_feather = float(
             os.getenv("MUSE_TALK_MOUTH_MASK_BOTTOM_FEATHER", "0.08")
         )
@@ -149,8 +148,8 @@ class MuseTalkBridge:
         self.default_temporal_smooth = float(os.getenv("MUSE_TALK_TEMPORAL_SMOOTH", "0.025"))
         self.temporal_smooth = self.default_temporal_smooth
         # MuseTalk uses a sliding audio window, which can turn quiet audio into
-        # tiny lip movement.  Preserve source frames for sustained silence so
-        # natural conversational pauses are genuinely still.
+        # tiny lip movement. Hold the last rendered portrait for sustained
+        # silence so natural conversational pauses are genuinely still.
         self.silence_rms_threshold = float(
             np.clip(float(os.getenv("MUSE_TALK_SILENCE_RMS_THRESHOLD", "0.006")), 0.0005, 0.05)
         )
@@ -178,6 +177,11 @@ class MuseTalkBridge:
         self._coord_sha1: str | None = None
         self._vignette_cache: dict[tuple[int, int, int, int], np.ndarray] = {}
         self._prev_generated_face: np.ndarray | None = None
+        # The source clip is naturally moving.  Re-inserting a source frame
+        # during a quiet region can therefore make the jaw jump between the
+        # generated and source geometry.  Keep the last composited portrait
+        # so a genuine conversational pause is visually still.
+        self._last_rendered_frame: np.ndarray | None = None
 
         self.musetalk_dir = LIP_SYNCING_DIR / "lib" / "MuseTalk"
         if not self.musetalk_dir.exists():
@@ -290,9 +294,11 @@ class MuseTalkBridge:
         self,
         *,
         preset: str | None = None,
+        coord_source: str | None = None,
         face_scale: float | None = None,
         temporal_smooth: float | None = None,
         detail_sharpen: float | None = None,
+        mouth_mask_bottom_ratio: float | None = None,
         infer_fps: float | None = None,
         audio_history_sec: float | None = None,
     ) -> None:
@@ -305,24 +311,24 @@ class MuseTalkBridge:
         """
         preset_name = (preset or "realistic").strip().lower().replace("-", "_")
         preset_defaults = {
-            # All supported presentation presets retain MuseTalk's required
-            # full-face context.  A lower-face landmark crop is still
-            # selectable through MUSE_TALK_COORD_SOURCE=baked for controlled
-            # experiments, never as the user-facing default.
             "realistic": ("legacy", 0.025, 0.96, 0.70),
             "balanced": ("legacy", 0.045, 0.97, 0.64),
             "low_latency": ("legacy", 0.0, 0.98, 0.60),
             "stable": ("legacy", 0.09, 0.96, 0.62),
         }
-        coord_source, default_smooth, default_scale, default_sharpen = preset_defaults.get(
+        preset_coord_source, default_smooth, default_scale, default_sharpen = preset_defaults.get(
             preset_name,
             preset_defaults["realistic"],
         )
-        # An explicit server setting remains an intentional override for
-        # controlled deployments and benchmark runs.
-        self.coord_source = self._normalize_coord_source(
-            os.getenv("MUSE_TALK_COORD_SOURCE", coord_source)
+        # A request-level source is intentionally supported for controlled
+        # quality evaluation.  It lets the evaluator compare the same profile,
+        # prompt, and checkpoint with the only variable being the face track.
+        # The server setting remains the production-wide override.
+        requested_coord_source = coord_source or os.getenv(
+            "MUSE_TALK_COORD_SOURCE",
+            preset_coord_source,
         )
+        self.coord_source = self._normalize_coord_source(requested_coord_source)
         self.temporal_smooth = float(
             np.clip(
                 self.default_temporal_smooth if preset_name == "realistic" else default_smooth,
@@ -344,6 +350,7 @@ class MuseTalkBridge:
                 0.95,
             )
         )
+        self.mouth_mask_bottom_ratio = self.default_mouth_mask_bottom_ratio
         self.infer_fps = self.default_infer_fps
         self.audio_history_sec = self.default_audio_history_sec
 
@@ -353,6 +360,10 @@ class MuseTalkBridge:
             self.temporal_smooth = float(np.clip(float(temporal_smooth), 0.0, 0.35))
         if detail_sharpen is not None:
             self.detail_sharpen = float(np.clip(float(detail_sharpen), 0.0, 0.95))
+        if mouth_mask_bottom_ratio is not None:
+            self.mouth_mask_bottom_ratio = float(
+                np.clip(float(mouth_mask_bottom_ratio), 0.45, 0.85)
+            )
         if infer_fps is not None:
             self.infer_fps = float(np.clip(float(infer_fps), 6.0, 30.0))
         if audio_history_sec is not None:
@@ -947,6 +958,7 @@ class MuseTalkBridge:
         self._loaded_cache_signature = None
         self._coord_sha1 = None
         self._prev_generated_face = None
+        self._last_rendered_frame = None
         self.frame_idx = 0
         self.frame_accumulator = 0.0
         self.infer_frame_accumulator = 0.0
@@ -1158,6 +1170,20 @@ class MuseTalkBridge:
         self.infer_frame_accumulator = 0.0
         self.audio_history = np.array([], dtype=np.float32)
         self._prev_generated_face = None
+        self._last_rendered_frame = None
+
+    def _pause_frame(self, source_frame: np.ndarray) -> np.ndarray:
+        """Return a stable portrait for a sustained silent audio frame.
+
+        MuseTalk's source video continues to move independently of the new
+        TTS audio.  Holding the most recently rendered result prevents that
+        original motion from leaking back into the jaw during a pause.  A
+        source frame is used only before the first successful composition.
+        """
+        previous = self._last_rendered_frame
+        if previous is not None and previous.shape == source_frame.shape:
+            return previous.copy()
+        return source_frame
 
     def _smooth_generated_face(self, generated_face: np.ndarray) -> np.ndarray:
         strength = float(np.clip(self.temporal_smooth, 0.0, 0.35))
@@ -1213,7 +1239,8 @@ class MuseTalkBridge:
 
         Short low-energy gaps are normal articulation and should remain under
         MuseTalk control. A longer quiet run is a conversational pause, where
-        a source-frame hold is more natural than a hallucinated mouth shape.
+        holding the stable rendered portrait is more natural than a
+        hallucinated mouth shape.
         """
         count = max(0, int(frame_count))
         if count == 0:
@@ -1551,10 +1578,11 @@ class MuseTalkBridge:
         output_frames: list[np.ndarray] = []
         if bool(np.all(silence_frames)):
             # A silent request is used during warm-up and can also occur at the
-            # end of a spoken answer. Returning source frames is intentional
-            # here, not a failed lip-sync result.
+            # end of a spoken answer. Before any composition this falls back to
+            # the source frame. Otherwise it holds the prior portrait rather
+            # than reintroducing source-video mouth motion.
             self._prev_generated_face = None
-            output_frames = frames
+            output_frames = [self._pause_frame(frame) for frame in frames]
         else:
             whisper_started_at = time.perf_counter() if timing_enabled else 0.0
             whisper_chunks = self._extract_whisper_prompts(
@@ -1607,10 +1635,11 @@ class MuseTalkBridge:
                     for res_frame in recon[:batch_size]:
                         frame = frames[cursor]
                         if silence_frames[cursor]:
-                            # Do not carry an open-mouth reconstruction through
-                            # a pause. Speech resumes with a sharp current frame.
+                            # Do not re-introduce the moving source clip through
+                            # a pause.  Hold the prior composite instead, so the
+                            # mouth and jaw do not twitch while the audio is quiet.
                             self._prev_generated_face = None
-                            output_frames.append(frame)
+                            output_frames.append(self._pause_frame(frame))
                             cursor += 1
                             continue
                         coord = coords[cursor]
@@ -1619,6 +1648,7 @@ class MuseTalkBridge:
                         try:
                             blended = self._blend_frame(frame, res_frame, coord, crop_box, alpha)
                             output_frames.append(blended)
+                            self._last_rendered_frame = blended.copy()
                         except Exception:
                             logger.exception(
                                 "component=musetalk op=blend_frame status=error idx=%s",

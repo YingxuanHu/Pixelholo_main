@@ -264,11 +264,16 @@ def _run_case(
     *,
     api_base: str,
     profile: str,
+    workspace_id: str | None,
     text: str,
     preset: str,
     coord_source: str,
     seed: int,
     avatar_max_frame_edge: int,
+    face_scale: float | None,
+    temporal_smooth: float | None,
+    lookahead_sec: float | None,
+    mouth_mask_bottom_ratio: float | None,
     timeout: float,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -283,12 +288,22 @@ def _run_case(
     }
     if avatar_max_frame_edge > 0:
         payload["avatar_max_frame_edge"] = avatar_max_frame_edge
+    if face_scale is not None:
+        payload["musetalk_face_scale"] = face_scale
+    if temporal_smooth is not None:
+        payload["musetalk_temporal_smooth"] = temporal_smooth
+    if lookahead_sec is not None:
+        payload["musetalk_lookahead_sec"] = lookahead_sec
+    if mouth_mask_bottom_ratio is not None:
+        payload["musetalk_mouth_mask_bottom_ratio"] = mouth_mask_bottom_ratio
     headers = {
         "Content-Type": "application/json",
         "Accept": PIXELHOLO_BINARY_STREAM_MEDIA_TYPE,
         "X-PixelHolo-Transport": "binary",
         "X-PixelHolo-Client": "web",
     }
+    if workspace_id:
+        headers["X-PixelHolo-Workspace"] = workspace_id
     started = time.perf_counter()
     with requests.post(
         f"{api_base.rstrip('/')}/speak",
@@ -317,6 +332,10 @@ def _run_case(
         "profile": profile,
         "preset": preset,
         "coord_source": coord_source,
+        "face_scale": face_scale,
+        "temporal_smooth": temporal_smooth,
+        "lookahead_sec": lookahead_sec,
+        "mouth_mask_bottom_ratio": mouth_mask_bottom_ratio,
         "text": text,
         "total_ms": round(total_ms, 1),
         "server_inference_ms": done_events[-1].get("inference_ms") if done_events else None,
@@ -337,11 +356,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Compare MuseTalk latency, jitter, and sync proxy metrics.")
     parser.add_argument("--api-base", default="http://127.0.0.1:8000")
     parser.add_argument("--profile", default="alvin1_video")
+    parser.add_argument(
+        "--workspace-id",
+        help="Workspace that owns the explicitly selected test profile.",
+    )
     parser.add_argument("--presets", default="low_latency,balanced,stable")
     parser.add_argument("--coord-sources", default="legacy")
     parser.add_argument("--text", action="append", dest="texts")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--avatar-max-frame-edge", type=int, default=512)
+    parser.add_argument("--face-scale", type=float)
+    parser.add_argument("--temporal-smooth", type=float)
+    parser.add_argument("--lookahead-sec", type=float)
+    parser.add_argument("--mouth-mask-bottom-ratio", type=float)
     parser.add_argument("--timeout", type=float, default=240.0)
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--no-save-media", action="store_true")
@@ -370,6 +397,11 @@ def main() -> None:
                 response = requests.post(
                     f"{args.api_base.rstrip('/')}/warmup",
                     json=payload,
+                    headers=(
+                        {"X-PixelHolo-Workspace": args.workspace_id}
+                        if args.workspace_id
+                        else None
+                    ),
                     timeout=(10, args.timeout),
                 )
                 response.raise_for_status()
@@ -381,11 +413,16 @@ def main() -> None:
                 case = _run_case(
                     api_base=args.api_base,
                     profile=args.profile,
+                    workspace_id=args.workspace_id,
                     text=text,
                     preset=preset,
                     coord_source=coord_source,
                     seed=args.seed,
                     avatar_max_frame_edge=args.avatar_max_frame_edge,
+                    face_scale=args.face_scale,
+                    temporal_smooth=args.temporal_smooth,
+                    lookahead_sec=args.lookahead_sec,
+                    mouth_mask_bottom_ratio=args.mouth_mask_bottom_ratio,
                     timeout=args.timeout,
                 )
                 stem = f"{args.profile}_{preset}_{coord_source}_{idx}"
