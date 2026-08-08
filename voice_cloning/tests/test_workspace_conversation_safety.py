@@ -11,6 +11,7 @@ import shutil
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 from src.inference import (
     ProfileRuntimeSettingsRequest,
@@ -59,7 +60,46 @@ class _NoProviderLLM(LLMService):
         return _stream()
 
 
+class _OpenAIResponseRecorder:
+    """Captures a Responses request without contacting OpenAI."""
+
+    def __init__(self):
+        self.params = None
+
+    def create(self, **params):
+        self.params = params
+        return iter([SimpleNamespace(type="response.output_text.delta", delta="Hello there.")])
+
+
+class _OpenAIResponseLLM(LLMService):
+    """Minimal service instance for exercising the OpenAI request contract."""
+
+    def __init__(self, recorder: _OpenAIResponseRecorder):
+        self.openai_client = SimpleNamespace(responses=recorder)
+        self.openai_realtime_max_output_tokens = 512
+        self.openai_reasoning_effort = "none"
+
+
 class WorkspaceConversationSafetyTests(unittest.TestCase):
+    def test_live_gpt_keeps_search_available_without_forcing_it(self):
+        recorder = _OpenAIResponseRecorder()
+        llm = _OpenAIResponseLLM(recorder)
+
+        response = list(
+            llm._stream_openai_responses_tokens(
+                [
+                    {"role": "system", "content": "Reply concisely."},
+                    {"role": "user", "content": "Say hello."},
+                ],
+                "gpt-4o-mini",
+            )
+        )
+
+        self.assertEqual(response, ["Hello there."])
+        self.assertIsNotNone(recorder.params)
+        self.assertEqual(recorder.params["tool_choice"], "auto")
+        self.assertEqual(recorder.params["tools"], [{"type": "web_search", "search_context_size": "low"}])
+
     def test_conversation_history_and_persona_are_keyed_per_profile(self):
         llm = _NoProviderLLM()
         list(llm.stream_response("first visitor", conversation_key="workspace-a:avatar:alvin", system_prompt="You are Alvin."))

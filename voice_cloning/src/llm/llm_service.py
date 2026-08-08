@@ -1005,7 +1005,11 @@ class LLMService:
             "stream": True,
             "max_output_tokens": self.openai_realtime_max_output_tokens,
             "tools": [{"type": "web_search", "search_context_size": "low"}],
-            "tool_choice": "required",
+            # Keep live search available, but do not make an external search a
+            # mandatory first step for every answer.  A routine prompt can then
+            # begin streaming as soon as GPT responds, while current-information
+            # prompts still allow the model to invoke the search tool.
+            "tool_choice": "auto",
             "max_tool_calls": 1,
             "truncation": "auto",
             "store": False,
@@ -1017,15 +1021,22 @@ class LLMService:
         if reasoning_effort:
             create_params["reasoning"] = {"effort": reasoning_effort}
 
+        provider_started = time.perf_counter()
+        first_text_ms: float | None = None
+        used_web_search = False
         stream = self.openai_client.responses.create(**create_params)
         try:
             for event in stream:
                 if self._is_cancelled(cancel_event):
                     raise LLMStreamCancelled()
                 event_type = getattr(event, "type", "")
+                if event_type.startswith("response.web_search_call."):
+                    used_web_search = True
                 if event_type == "response.output_text.delta":
                     delta = getattr(event, "delta", "")
                     if delta:
+                        if first_text_ms is None:
+                            first_text_ms = (time.perf_counter() - provider_started) * 1000.0
                         yield delta
                     continue
                 if event_type == "error":
@@ -1034,6 +1045,14 @@ class LLMService:
                 if event_type == "response.failed":
                     raise RuntimeError(self._openai_response_failure_message(event))
         finally:
+            logger.info(
+                "component=llm op=openai_response_stream model=%s tool_choice=%s web_search_used=%s first_text_ms=%s elapsed_ms=%.2f",
+                model_name,
+                create_params["tool_choice"],
+                used_web_search,
+                round(first_text_ms, 2) if first_text_ms is not None else None,
+                (time.perf_counter() - provider_started) * 1000.0,
+            )
             if self._is_cancelled(cancel_event):
                 close_stream = getattr(stream, "close", None)
                 if callable(close_stream):

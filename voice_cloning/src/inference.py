@@ -1516,6 +1516,8 @@ def _stream_avatar_from_text_iter(
     _register_stream_stop_event(stop_event, workspace_id)
     profile_lock_acquired = False
     profile_load_started = time.perf_counter()
+    profile_lock_wait_ms = 0.0
+    profile_asset_load_ms = 0.0
     try:
         while not stop_event.is_set():
             if _lipsync_profile_lock.acquire(timeout=0.2):
@@ -1523,6 +1525,7 @@ def _stream_avatar_from_text_iter(
                 break
         if not profile_lock_acquired:
             raise HTTPException(status_code=499, detail="Generation interrupted before profile load.")
+        profile_lock_wait_ms = (time.perf_counter() - profile_load_started) * 1000.0
         lipsync = lipsync_cm.__enter__()
         with _lipsync_lock:
             _configure_musetalk_for_request(
@@ -1534,7 +1537,9 @@ def _stream_avatar_from_text_iter(
                 infer_fps=req.musetalk_infer_fps,
                 audio_history_sec=req.musetalk_audio_history_sec,
             )
+            profile_asset_load_started = time.perf_counter()
             lipsync.load_profile(profile, profile_type)
+            profile_asset_load_ms = (time.perf_counter() - profile_asset_load_started) * 1000.0
     except FileNotFoundError as exc:
         with contextlib.suppress(Exception):
             lipsync_cm.__exit__(None, None, None)
@@ -1552,10 +1557,12 @@ def _stream_avatar_from_text_iter(
     is_musetalk = lipsync.__class__.__name__ == "MuseTalkBridge"
     is_wav2lip = lipsync.__class__.__name__ == "LipSyncBridge"
     logger.info(
-        "component=stream op=profile_ready profile=%s profile_type=%s backend=%s load_ms=%.2f",
+        "component=stream op=profile_ready profile=%s profile_type=%s backend=%s lock_wait_ms=%.2f asset_load_ms=%.2f load_ms=%.2f",
         profile,
         profile_type,
         req.lipsync_backend or "default",
+        profile_lock_wait_ms,
+        profile_asset_load_ms,
         (time.perf_counter() - profile_load_started) * 1000.0,
     )
     fps = req.avatar_fps or lipsync.fps
