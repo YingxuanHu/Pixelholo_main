@@ -144,7 +144,12 @@ class WorkspaceConversationSafetyTests(unittest.TestCase):
         # fade back to the source frame.
         bridge = object.__new__(MuseTalkBridge)
         bridge.mouth_mask_bottom_ratio = 0.84
-        bridge.mouth_mask_bottom_feather = 0.08
+        bridge.mouth_mask_bottom_feather = 0.05
+        bridge.chin_mask_bottom_ratio = 0.66
+        bridge.mouth_core_center_y_ratio = 0.68
+        bridge.mouth_core_half_width_ratio = 0.30
+        bridge.mouth_core_half_height_ratio = 0.16
+        bridge.mouth_core_feather = 0.25
         alpha = np.ones((100, 80), dtype=np.float32)
 
         protected = bridge._restrict_chin_blend(
@@ -153,10 +158,45 @@ class WorkspaceConversationSafetyTests(unittest.TestCase):
             crop_box=(0, 0, 80, 100),
         )
 
-        self.assertEqual(float(protected[65, 40]), 1.0)
-        self.assertGreater(float(protected[72, 40]), 0.0)
-        self.assertLess(float(protected[72, 40]), 1.0)
+        # The center of the generated mouth remains opaque through the lower
+        # lip, while the same row at the side has already returned to source.
+        self.assertEqual(float(protected[61, 40]), 1.0)
+        self.assertGreater(float(protected[67, 40]), 0.0)
+        self.assertEqual(float(protected[67, 8]), 0.0)
+        # The bottom of the chin is always the original portrait.
         self.assertEqual(float(protected[76, 40]), 0.0)
+
+    def test_musetalk_resizes_the_generated_face_only_once(self):
+        # Multiple resize passes soften the already 256px MuseTalk output.
+        # The compositor must calculate the final placement first, then resize
+        # the generated face directly to that size.
+        bridge = object.__new__(MuseTalkBridge)
+        bridge.face_scale = 0.96
+        bridge.detail_sharpen = 0.0
+        bridge.color_match_strength = 0.0
+        bridge.temporal_smooth = 0.0
+        bridge._prev_generated_face = None
+        bridge.mouth_mask_bottom_ratio = 0.84
+        bridge.mouth_mask_bottom_feather = 0.05
+        bridge.chin_mask_bottom_ratio = 0.66
+        bridge.mouth_core_center_y_ratio = 0.68
+        bridge.mouth_core_half_width_ratio = 0.30
+        bridge.mouth_core_half_height_ratio = 0.16
+        bridge.mouth_core_feather = 0.25
+
+        frame = np.zeros((100, 80, 3), dtype=np.uint8)
+        generated = np.full((256, 256, 3), 127, dtype=np.uint8)
+        alpha = np.ones((100, 80), dtype=np.float32)
+        with patch("src.musetalk_bridge.cv2.resize", wraps=__import__("cv2").resize) as resize:
+            bridge._blend_frame(
+                frame,
+                generated,
+                face_box=[10, 20, 70, 80],
+                crop_box=[0, 0, 80, 100],
+                alpha=alpha,
+            )
+
+        self.assertEqual(resize.call_count, 1)
 
     def test_musetalk_holds_the_last_rendered_portrait_during_a_pause(self):
         # The original reference clip keeps moving.  A sustained TTS pause

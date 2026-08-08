@@ -135,7 +135,27 @@ class MuseTalkBridge:
         )
         self.mouth_mask_bottom_ratio = self.default_mouth_mask_bottom_ratio
         self.mouth_mask_bottom_feather = float(
-            os.getenv("MUSE_TALK_MOUTH_MASK_BOTTOM_FEATHER", "0.08")
+            os.getenv("MUSE_TALK_MOUTH_MASK_BOTTOM_FEATHER", "0.05")
+        )
+        # Outside the mouth, return to the original high-resolution portrait
+        # much earlier. The generated lower lip remains fully visible through
+        # a feathered mouth-shaped core, while the source supplies the jaw and
+        # chin texture that MuseTalk's native 256px reconstruction cannot
+        # reproduce sharply.
+        self.chin_mask_bottom_ratio = float(
+            os.getenv("MUSE_TALK_CHIN_MASK_BOTTOM_RATIO", "0.66")
+        )
+        self.mouth_core_center_y_ratio = float(
+            os.getenv("MUSE_TALK_MOUTH_CORE_CENTER_Y_RATIO", "0.68")
+        )
+        self.mouth_core_half_width_ratio = float(
+            os.getenv("MUSE_TALK_MOUTH_CORE_HALF_WIDTH_RATIO", "0.30")
+        )
+        self.mouth_core_half_height_ratio = float(
+            os.getenv("MUSE_TALK_MOUTH_CORE_HALF_HEIGHT_RATIO", "0.16")
+        )
+        self.mouth_core_feather = float(
+            os.getenv("MUSE_TALK_MOUTH_CORE_FEATHER", "0.25")
         )
         self.color_match_strength = float(os.getenv("MUSE_TALK_COLOR_MATCH_STRENGTH", "0.65"))
         # Version 10 is the cache contract shared with avatar_bake.py.  Earlier
@@ -685,24 +705,67 @@ class MuseTalkBridge:
         face_box: tuple[int, int, int, int],
         crop_box: tuple[int, int, int, int],
     ) -> np.ndarray:
-        """Fade the generated face before it reaches the source chin."""
+        """Keep generated visemes while restoring the source jaw and chin.
+
+        A single horizontal cutoff cannot satisfy both requirements. A high
+        cutoff preserves MuseTalk's complete lower lip but replaces the chin
+        with its softer 256px reconstruction. A low cutoff keeps a sharp chin
+        but exposes the reference video's lower lip and breaks synchronization.
+        The broad gate below protects the source lower face, while a feathered
+        ellipse keeps the complete generated mouth and teeth.
+        """
         if alpha.size == 0:
             return alpha
-        _x1, y1, _x2, y2 = face_box
-        _cx1, cy1, _cx2, _cy2 = crop_box
+        x1, y1, x2, y2 = face_box
+        cx1, cy1, _cx2, _cy2 = crop_box
+        face_width = max(1, int(x2 - x1))
         face_height = max(1, int(y2 - y1))
         bottom_ratio = float(np.clip(self.mouth_mask_bottom_ratio, 0.65, 1.05))
+        chin_ratio = float(np.clip(self.chin_mask_bottom_ratio, 0.55, bottom_ratio))
         feather_ratio = float(np.clip(self.mouth_mask_bottom_feather, 0.01, 0.25))
-        bottom = float(y1 - cy1) + face_height * bottom_ratio
         feather = max(2.0, face_height * feather_ratio)
+
         rows = np.arange(alpha.shape[0], dtype=np.float32)
-        gate = np.ones_like(rows)
-        fade_start = bottom - feather
-        fade_end = bottom + feather
-        gate[rows >= fade_end] = 0.0
-        fading = (rows > fade_start) & (rows < fade_end)
-        gate[fading] = (fade_end - rows[fading]) / max(1.0, fade_end - fade_start)
-        return np.clip(alpha * gate[:, None], 0.0, 1.0)
+        cols = np.arange(alpha.shape[1], dtype=np.float32)
+
+        def vertical_gate(ratio: float) -> np.ndarray:
+            bottom = float(y1 - cy1) + face_height * ratio
+            fade_start = bottom - feather
+            fade_end = bottom + feather
+            gate = np.ones_like(rows)
+            gate[rows >= fade_end] = 0.0
+            fading = (rows > fade_start) & (rows < fade_end)
+            gate[fading] = (fade_end - rows[fading]) / max(1.0, fade_end - fade_start)
+            return gate
+
+        chin_gate = vertical_gate(chin_ratio)[:, None]
+        full_mouth_bottom_gate = vertical_gate(bottom_ratio)[:, None]
+
+        mouth_center_x = float(x1 - cx1) + face_width * 0.5
+        mouth_center_y = float(y1 - cy1) + face_height * float(
+            np.clip(self.mouth_core_center_y_ratio, 0.55, 0.82)
+        )
+        mouth_radius_x = max(
+            2.0,
+            face_width * float(np.clip(self.mouth_core_half_width_ratio, 0.18, 0.42)),
+        )
+        mouth_radius_y = max(
+            2.0,
+            face_height * float(np.clip(self.mouth_core_half_height_ratio, 0.10, 0.24)),
+        )
+        norm_x = (cols[None, :] - mouth_center_x) / mouth_radius_x
+        norm_y = (rows[:, None] - mouth_center_y) / mouth_radius_y
+        distance = np.sqrt(np.square(norm_x) + np.square(norm_y))
+        radial_feather = float(np.clip(self.mouth_core_feather, 0.05, 0.60))
+        mouth_gate = np.clip(
+            (1.0 + radial_feather - distance) / (2.0 * radial_feather),
+            0.0,
+            1.0,
+        )
+        mouth_gate *= full_mouth_bottom_gate
+
+        gate = np.maximum(chin_gate, mouth_gate)
+        return np.clip(alpha * gate, 0.0, 1.0)
 
     def _cache_manifest(
         self,
@@ -1448,20 +1511,6 @@ class MuseTalkBridge:
         if local_x2 <= local_x1 or local_y2 <= local_y1:
             return frame
 
-        generated_face = self._smooth_generated_face(generated_face)
-        resized = cv2.resize(
-            generated_face,
-            (local_x2 - local_x1, local_y2 - local_y1),
-            interpolation=cv2.INTER_LANCZOS4,
-        )
-        if self.detail_sharpen > 1e-4:
-            # Apply stronger sharpening only when 256px output is upscaled substantially.
-            scale_x = float(local_x2 - local_x1) / 256.0
-            scale_y = float(local_y2 - local_y1) / 256.0
-            upscale = max(scale_x, scale_y)
-            extra = max(0.0, upscale - 1.0) * 0.22
-            amount = float(np.clip(self.detail_sharpen + extra, 0.0, 0.8))
-            resized = self._adaptive_unsharp_luma(resized, amount)
         place_x1, place_y1 = local_x1, local_y1
         place_x2, place_y2 = local_x2, local_y2
 
@@ -1472,17 +1521,32 @@ class MuseTalkBridge:
             scaled_w = max(1, int(round(curr_w * face_scale)))
             scaled_h = max(1, int(round(curr_h * face_scale)))
             if scaled_w < curr_w or scaled_h < curr_h:
-                resized = cv2.resize(
-                    resized,
-                    (scaled_w, scaled_h),
-                    interpolation=cv2.INTER_LANCZOS4,
-                )
                 off_x = max(0, (curr_w - scaled_w) // 2)
                 off_y = max(0, (curr_h - scaled_h) // 2)
                 place_x1 = local_x1 + off_x
                 place_y1 = local_y1 + off_y
                 place_x2 = place_x1 + scaled_w
                 place_y2 = place_y1 + scaled_h
+
+        # Resize exactly once to the final placement dimensions. The previous
+        # full-size resize followed by a second 0.96x resize softened lip and
+        # tooth edges before the frame was even JPEG encoded.
+        generated_face = self._smooth_generated_face(generated_face)
+        final_width = place_x2 - place_x1
+        final_height = place_y2 - place_y1
+        resized = cv2.resize(
+            generated_face,
+            (final_width, final_height),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+        if self.detail_sharpen > 1e-4:
+            # Apply stronger sharpening only when 256px output is upscaled substantially.
+            scale_x = float(final_width) / 256.0
+            scale_y = float(final_height) / 256.0
+            upscale = max(scale_x, scale_y)
+            extra = max(0.0, upscale - 1.0) * 0.22
+            amount = float(np.clip(self.detail_sharpen + extra, 0.0, 0.8))
+            resized = self._adaptive_unsharp_luma(resized, amount)
 
         gx1, gy1 = cx1 + place_x1, cy1 + place_y1
         gx2, gy2 = cx1 + place_x2, cy1 + place_y2
