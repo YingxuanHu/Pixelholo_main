@@ -400,6 +400,7 @@ button:disabled { cursor: not-allowed; }
 .ph-minimal-progress-track { display: block; height: 5px; overflow: hidden; border-radius: 99px; background: #dceeea; }
 .ph-minimal-progress-track i { display: block; height: 100%; border-radius: inherit; background: #087f72; transition: width .3s ease; }
 .ph-minimal-error { margin: 10px 0; padding: 9px 11px; border-radius: 7px; color: #a85147; background: #fff0ed; font-size: 11px; line-height: 1.4; }
+.ph-minimal-error button { margin-left: 8px; padding: 0; border: 0; color: #8f423b; background: transparent; font: 700 10px 'DM Sans', sans-serif; text-decoration: underline; text-underline-offset: 2px; }
 .ph-minimal-help { margin-top: 17px; color: #92958d; font-size: 11px; }
 .ph-minimal-help summary { cursor: pointer; color: #7d8179; font-weight: 600; list-style: none; }
 .ph-minimal-help summary::-webkit-details-marker { display: none; }

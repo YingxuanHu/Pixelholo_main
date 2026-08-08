@@ -275,7 +275,12 @@ class _LipSyncEngineProtocol(Protocol):
     fps: float
 
     def load_profile(self, profile: str, profile_type: str = PROFILE_TYPE_AVATAR) -> None: ...
-    def sync_chunk(self, audio_16k: np.ndarray, fps: float | None = None) -> list[np.ndarray]: ...
+    def sync_chunk(
+        self,
+        audio_16k: np.ndarray,
+        fps: float | None = None,
+        **kwargs: object,
+    ) -> list[np.ndarray]: ...
 
 
 def _configure_musetalk_for_request(
@@ -1989,13 +1994,17 @@ def _stream_avatar_from_text_iter(
                         int(
                             profile_defaults.get(
                                 "musetalk_frame_crossfade",
-                                os.getenv("MUSE_TALK_FRAME_CROSSFADE", "2"),
+                                # Whole-frame crossfades soften lips and teeth
+                                # at every streamed-window boundary. Per-frame
+                                # stabilization remains available without the
+                                # default detail loss.
+                                os.getenv("MUSE_TALK_FRAME_CROSSFADE", "0"),
                             )
                         ),
                     ),
                 )
             except (TypeError, ValueError):
-                musetalk_frame_crossfade = 2
+                musetalk_frame_crossfade = 0
         emit_index = 0
         window_src_samples = 0
         window_tgt_samples = 0
@@ -3609,7 +3618,18 @@ def _warmup_lipsync(
                     if audio_16k is None or audio_16k.size == 0:
                         audio_16k = np.zeros(int(0.45 * 16000), dtype=np.float32)
                     warmup_started = time.perf_counter()
-                    lipsync.sync_chunk(audio_16k.astype(np.float32, copy=False), fps=lipsync.fps)
+                    initial_warmup_args: dict[str, object] = {}
+                    if backend == "musetalk":
+                        # Silent source frames should be held during a real
+                        # response, but this preparation call must still run
+                        # MuseTalk's GPU path.  Otherwise the first spoken
+                        # request would pay the CUDA allocation cost.
+                        initial_warmup_args["suppress_silence_motion"] = False
+                    lipsync.sync_chunk(
+                        audio_16k.astype(np.float32, copy=False),
+                        fps=lipsync.fps,
+                        **initial_warmup_args,
+                    )
 
                     # A short warm-up waveform does not necessarily allocate
                     # the same tensors as the first 1.2-second web stream.
@@ -3629,7 +3649,11 @@ def _warmup_lipsync(
                             prime_seconds = 1.2
                         prime_samples = max(1, int(np.clip(prime_seconds, 0.5, 3.0) * 16000))
                         prime_audio = np.zeros(prime_samples, dtype=np.float32)
-                        lipsync.sync_chunk(prime_audio, fps=lipsync.fps)
+                        lipsync.sync_chunk(
+                            prime_audio,
+                            fps=lipsync.fps,
+                            suppress_silence_motion=False,
+                        )
                         if torch.cuda.is_available():
                             torch.cuda.synchronize()
                     logger.info(
@@ -3819,6 +3843,17 @@ def warmup(req: WarmupRequest):
                 profile_type,
             )
     elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
+    tts_ready = bool(warmup_state.get("tts_hot_before") or warmup_state.get("tts_warmed"))
+    lipsync_ready = bool(
+        profile_type != PROFILE_TYPE_AVATAR
+        or warmup_state.get("lipsync_hot_before")
+        or warmup_state.get("lipsync_warmed")
+    )
+    llm_ready = bool(
+        not req.include_llm
+        or llm_hot_before
+        or llm_warmed
+    )
     logger.info(
         "component=backend op=warmup status=ok profile=%s profile_type=%s runtime=%s tts_hot_before=%s tts_warmed=%s lipsync_hot_before=%s lipsync_warmed=%s llm_hot_before=%s llm_warmed=%s elapsed_ms=%s",
         profile,
@@ -3841,10 +3876,13 @@ def warmup(req: WarmupRequest):
         "runtime_instance_id": warmup_state.get("runtime_instance_id"),
         "tts_hot_before": warmup_state.get("tts_hot_before"),
         "tts_warmed": warmup_state.get("tts_warmed"),
+        "tts_ready": tts_ready,
         "lipsync_hot_before": warmup_state.get("lipsync_hot_before"),
         "lipsync_warmed": warmup_state.get("lipsync_warmed"),
+        "lipsync_ready": lipsync_ready,
         "llm_hot_before": llm_hot_before,
         "llm_warmed": llm_warmed,
+        "llm_ready": llm_ready,
         "elapsed_ms": elapsed_ms,
     }
 

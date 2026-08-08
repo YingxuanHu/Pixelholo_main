@@ -377,6 +377,11 @@ const App: React.FC = () => {
   const [profileMenuKey, setProfileMenuKey] = useState<string | null>(null);
   const [isWarmingUp, setIsWarmingUp] = useState(false);
   const [warmupTargetName, setWarmupTargetName] = useState<string | null>(null);
+  // A processed source clip is not yet ready to generate. The shared worker
+  // must select this profile's voice and avatar assets before the composer can
+  // accept input.
+  const [profileWarmupState, setProfileWarmupState] = useState<'idle' | 'warming' | 'ready' | 'error'>('idle');
+  const [profileWarmupError, setProfileWarmupError] = useState<string | null>(null);
   const [uiNotice, setUiNotice] = useState<string | null>(null);
   const [stepStatuses, setStepStatuses] = useState<Record<string, StepStatus>>(DEFAULT_STEP_STATUSES);
   const [preprocessLogs, setPreprocessLogs] = useState<LogEntry[]>([]);
@@ -672,6 +677,8 @@ const App: React.FC = () => {
         }
         if (profile.name === item.name && profileType === currentType) {
           setProfile(prev => ({ ...prev, name: nextName }));
+          setProfileWarmupState('idle');
+          setProfileWarmupError(null);
         }
         invalidateWarmupEntriesForProfile(item.name);
         invalidateWarmupEntriesForProfile(nextName);
@@ -710,6 +717,8 @@ const App: React.FC = () => {
         }
         if (profile.name === item.name && profileType === currentType) {
           setProfile(prev => ({ ...prev, name: '', lastUploadedFile: null, fileSize: null }));
+          setProfileWarmupState('idle');
+          setProfileWarmupError(null);
           setIsCreatingProfile(true);
           setLastUploadedFilename(null);
           setLastUploadedAudioFilename(null);
@@ -760,13 +769,26 @@ const App: React.FC = () => {
     return ttsReady && lipsyncReady && llmReady;
   }, []);
 
-  const warmupProfile = useCallback(async (profileName: string, type: ProfileType) => {
+  const warmupProfile = useCallback(async (
+    profileName: string,
+    type: ProfileType,
+    options: { verify?: boolean } = {},
+  ) => {
     if (!profileName) return;
     const selectionId = profileSelectionRef.current;
     const isCurrentSelection = () => selectionId === profileSelectionRef.current;
     const runtimeId = backendRuntimeIdRef.current;
     const key = warmupKeyFor(profileName, type, avatarBackend, ttsBackend, llmMode, museTalkPreset, runtimeId);
-    if (hasFreshWarmup(key)) return;
+    // The worker is shared by visitors. A fresh timestamp in this browser does
+    // not prove another profile has not since replaced the worker's mutable
+    // MuseTalk state. Profile switches therefore verify server-side readiness.
+    if (!options.verify && hasFreshWarmup(key)) {
+      if (isCurrentSelection()) {
+        setProfileWarmupState('ready');
+        setProfileWarmupError(null);
+      }
+      return;
+    }
 
     const inFlight = warmupInFlightRef.current.get(key);
     if (inFlight) {
@@ -779,6 +801,8 @@ const App: React.FC = () => {
         activeWarmupKeyRef.current = key;
         setIsWarmingUp(true);
         setWarmupTargetName(profileName);
+        setProfileWarmupState('warming');
+        setProfileWarmupError(null);
       }
       try {
         const res = await apiFetch(`${apiBase}/warmup`, {
@@ -815,7 +839,19 @@ const App: React.FC = () => {
             warmupKeyFor(profileName, type, resolvedBackend, ttsBackend, llmMode, museTalkPreset, resolvedRuntimeId ?? backendRuntimeIdRef.current),
             Date.now(),
           );
+          if (isCurrentSelection()) {
+            setProfileWarmupState('ready');
+            setProfileWarmupError(null);
+          }
+        } else {
+          throw new Error('The selected profile did not finish warming up.');
         }
+      } catch (error) {
+        if (isCurrentSelection()) {
+          setProfileWarmupState('error');
+          setProfileWarmupError(error instanceof Error ? error.message : String(error));
+        }
+        throw error;
       } finally {
         warmupInFlightRef.current.delete(key);
         if (isCurrentSelection() && activeWarmupKeyRef.current === key) {
@@ -1146,7 +1182,12 @@ const App: React.FC = () => {
     if (apiStatus !== 'online') return;
     if (!hasInferenceProfile) return;
     if (!profile.name) return;
-    void warmupProfile(profile.name, profileType);
+    // This covers the initial profile and runtime-option changes. A profile
+    // selection starts the same request first, so the in-flight map joins it
+    // rather than performing duplicate work.
+    void warmupProfile(profile.name, profileType, { verify: true }).catch(() => {
+      // The studio shows the warm-up failure and keeps generation disabled.
+    });
   }, [apiStatus, hasInferenceProfile, profile.name, profileType, warmupProfile]);
 
   const streamResponseLines = async (
@@ -2084,7 +2125,7 @@ const App: React.FC = () => {
     // where a very fast first Enter could start inference while the cache is
     // still being built.  The first *stream* therefore takes the same hot path
     // as every later stream.
-    if (isWarmingUp || !hasFreshWarmup(warmupKey)) {
+    if (isWarmingUp || profileWarmupState !== 'ready' || !hasFreshWarmup(warmupKey)) {
       try {
         await warmupProfile(requestProfileName, requestProfileType);
       } catch (error) {
@@ -2429,6 +2470,7 @@ const App: React.FC = () => {
     enqueueFrames,
     interruptBackend,
     isWarmingUp,
+    profileWarmupState,
     hasFreshWarmup,
     llmMode,
     museTalkPreset,
@@ -2629,8 +2671,11 @@ const App: React.FC = () => {
       && profile.name
       && (currentProfileInfo?.has_data || profile.lastUploadedFile || lastUploadedFilename),
   );
-  const isComposerLocked = isInferenceActive || isStoppingInference || isWarmingUp || isProfileSwitching;
-  const isProfileLoading = isWarmingUp || isProfileSwitching;
+  const profileCanGenerate = apiStatus === 'online' && profileWarmupState === 'ready';
+  const isComposerLocked = apiStatus !== 'online' || isInferenceActive || isStoppingInference || isWarmingUp || isProfileSwitching || !profileCanGenerate;
+  const isProfileLoading = isWarmingUp || isProfileSwitching || (
+    publicProfileReady && !profileCanGenerate && profileWarmupState !== 'error'
+  );
   const isSourceActionLocked = isBusy
     || autoPrepareAfterUpload
     || uploadPhaseVideo === 'uploading'
@@ -2684,6 +2729,8 @@ const App: React.FC = () => {
     setInferenceChunks([]);
     setLatency(null);
     setUiNotice(null);
+    setProfileWarmupState(ready ? 'warming' : 'idle');
+    setProfileWarmupError(null);
     setStepStatuses(prev => ({
       ...prev,
       upload: 'idle',
@@ -2702,7 +2749,9 @@ const App: React.FC = () => {
       if (selectionId !== profileSelectionRef.current) return;
       if (ready) {
         try {
-          await warmupProfile(item.name, selectedProfileType);
+          // Always verify on selection. Another visitor may have selected a
+          // different profile after this browser's previous warm-up.
+          await warmupProfile(item.name, selectedProfileType, { verify: true });
           if (selectionId === profileSelectionRef.current) {
             setUiNotice(null);
           }
@@ -2750,6 +2799,8 @@ const App: React.FC = () => {
     setCameraElapsed(0);
     setCapturedCameraFile(null);
     setProfileNameRequired(false);
+    setProfileWarmupState('idle');
+    setProfileWarmupError(null);
     setProfile({ name: '', lastUploadedFile: null, fileSize: null });
     setLastUploadedFilename(null);
     setLastUploadedAudioFilename(null);
@@ -3090,6 +3141,12 @@ const App: React.FC = () => {
                 <div className="ph-minimal-composer-heading">
                   <div><span className="ph-minimal-eyebrow">Ask your avatar</span><small>Type a question or use your voice.</small></div>
                 </div>
+                {profileWarmupState === 'error' && (
+                  <div className="ph-minimal-error" role="alert">
+                    This profile is not ready yet. {profileWarmupError || 'Warm-up failed.'}
+                    <button type="button" onClick={() => void warmupProfile(profile.name, profileType, { verify: true })}>Try again</button>
+                  </div>
+                )}
                 <div className="ph-minimal-input-shell">
                   <textarea
                     className="ph-minimal-composer-input"
@@ -3109,8 +3166,8 @@ const App: React.FC = () => {
                 <div className="ph-minimal-composer-row"><span>{inferenceText.length} characters</span><span>{isListening ? (speechTranscript ? 'Listening…' : 'Start speaking…') : 'Enter to send · voice sends automatically'}</span></div>
 
                 <div className="ph-minimal-model-grid">
-                  <label><span>Lip sync</span><select value={avatarBackend} disabled={isComposerLocked} onChange={event => setAvatarBackend(event.target.value as 'musetalk' | 'wav2lip')}><option value="musetalk">MuseTalk</option><option value="wav2lip">Wav2Lip</option></select></label>
-                  <label><span>Assistant</span><select value={llmMode} disabled={isComposerLocked} onChange={event => setLlmMode(event.target.value as LLMMode)}>{LLM_MODE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                  <label><span>Lip sync</span><select value={avatarBackend} disabled={isComposerLocked} onChange={event => { setProfileWarmupState('idle'); setProfileWarmupError(null); setAvatarBackend(event.target.value as 'musetalk' | 'wav2lip'); }}><option value="musetalk">MuseTalk</option><option value="wav2lip">Wav2Lip</option></select></label>
+                  <label><span>Assistant</span><select value={llmMode} disabled={isComposerLocked} onChange={event => { setProfileWarmupState('idle'); setProfileWarmupError(null); setLlmMode(event.target.value as LLMMode); }}>{LLM_MODE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
                 </div>
 
                 <div className="ph-minimal-control-row"><label>Emotion<select value={voiceControlValues?.emotion || 'neutral'} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ emotion: event.target.value as VoiceEmotion })}>{(['neutral', 'happy', 'sad', 'angry', 'scared', 'disgust'] as VoiceEmotion[]).map(emotion => <option key={emotion} value={emotion}>{emotion[0].toUpperCase() + emotion.slice(1)}</option>)}</select></label><button type="button" className="ph-minimal-advanced-button" disabled={isComposerLocked} onClick={() => setShowVoiceSettings(prev => !prev)}>{showVoiceSettings ? 'Hide options' : 'More options'}</button></div>

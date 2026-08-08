@@ -13,6 +13,8 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+
 from src.inference import (
     ProfileRuntimeSettingsRequest,
     _profile_system_prompt,
@@ -20,6 +22,7 @@ from src.inference import (
     update_profile_runtime_settings,
 )
 from src.llm.llm_service import LEGACY_FAST_MODEL, LLMRoute, LLMService
+from src.musetalk_bridge import MuseTalkBridge
 from config import PROFILE_TYPE_AVATAR, reset_workspace_id, set_workspace_id, workspace_data_root
 
 
@@ -76,11 +79,46 @@ class _OpenAIResponseLLM(LLMService):
 
     def __init__(self, recorder: _OpenAIResponseRecorder):
         self.openai_client = SimpleNamespace(responses=recorder)
+        self.system_prompt = "Reply concisely."
         self.openai_realtime_max_output_tokens = 512
         self.openai_reasoning_effort = "none"
+        self._warmed_routes = set()
+
+    def _warmup_routes(self, _mode, _model):
+        return [LLMRoute("live_search", "live_search", "gpt-4o-mini")]
 
 
 class WorkspaceConversationSafetyTests(unittest.TestCase):
+    def test_musetalk_holds_only_sustained_silence(self):
+        fps = 25
+        audio = np.full(16000, 0.08, dtype=np.float32)
+        # A 240 ms quiet region is a real conversational pause and should not
+        # be rendered as a moving mouth.
+        audio[int(0.32 * 16000):int(0.56 * 16000)] = 0.0
+        mask = MuseTalkBridge._stable_silence_mask(
+            audio,
+            frame_count=25,
+            fps=fps,
+            rms_threshold=0.006,
+            min_duration_ms=120,
+        )
+        self.assertTrue(mask[8:14].all())
+        self.assertFalse(mask[:7].any())
+        self.assertFalse(mask[15:].any())
+
+        # An 80 ms gap is normal articulation and should preserve MuseTalk's
+        # generated motion around the consonant boundary.
+        short_gap = np.full(16000, 0.08, dtype=np.float32)
+        short_gap[int(0.32 * 16000):int(0.40 * 16000)] = 0.0
+        short_mask = MuseTalkBridge._stable_silence_mask(
+            short_gap,
+            frame_count=25,
+            fps=fps,
+            rms_threshold=0.006,
+            min_duration_ms=120,
+        )
+        self.assertFalse(short_mask.any())
+
     def test_live_gpt_keeps_search_available_without_forcing_it(self):
         recorder = _OpenAIResponseRecorder()
         llm = _OpenAIResponseLLM(recorder)
@@ -99,6 +137,15 @@ class WorkspaceConversationSafetyTests(unittest.TestCase):
         self.assertIsNotNone(recorder.params)
         self.assertEqual(recorder.params["tool_choice"], "auto")
         self.assertEqual(recorder.params["tools"], [{"type": "web_search", "search_context_size": "low"}])
+
+    def test_live_gpt_warmup_opens_a_real_provider_stream(self):
+        recorder = _OpenAIResponseRecorder()
+        llm = _OpenAIResponseLLM(recorder)
+
+        self.assertTrue(llm.warmup(mode="live_search"))
+        self.assertEqual(recorder.params["model"], "gpt-4o-mini")
+        self.assertEqual(recorder.params["tool_choice"], "auto")
+        self.assertTrue(llm.is_warmed(mode="live_search"))
 
     def test_conversation_history_and_persona_are_keyed_per_profile(self):
         llm = _NoProviderLLM()

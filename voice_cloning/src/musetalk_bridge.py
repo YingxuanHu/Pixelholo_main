@@ -136,6 +136,15 @@ class MuseTalkBridge:
         # amount removes flicker without turning moving mouths into a blur.
         self.default_temporal_smooth = float(os.getenv("MUSE_TALK_TEMPORAL_SMOOTH", "0.025"))
         self.temporal_smooth = self.default_temporal_smooth
+        # MuseTalk uses a sliding audio window, which can turn quiet audio into
+        # tiny lip movement.  Preserve source frames for sustained silence so
+        # natural conversational pauses are genuinely still.
+        self.silence_rms_threshold = float(
+            np.clip(float(os.getenv("MUSE_TALK_SILENCE_RMS_THRESHOLD", "0.006")), 0.0005, 0.05)
+        )
+        self.silence_min_duration_ms = int(
+            np.clip(int(os.getenv("MUSE_TALK_SILENCE_MIN_DURATION_MS", "120")), 40, 800)
+        )
         self.default_runtime_max_frame_edge = _env_int(
             "MUSE_TALK_RUNTIME_MAX_FRAME_EDGE",
             0,
@@ -1162,6 +1171,59 @@ class MuseTalkBridge:
             audio = audio / 32768.0
         return np.clip(audio, -1.0, 1.0)
 
+    @staticmethod
+    def _stable_silence_mask(
+        audio_16k: np.ndarray,
+        frame_count: int,
+        fps: float,
+        *,
+        rms_threshold: float,
+        min_duration_ms: int,
+    ) -> np.ndarray:
+        """Return one ``True`` value for every sustained silent video frame.
+
+        Short low-energy gaps are normal articulation and should remain under
+        MuseTalk control. A longer quiet run is a conversational pause, where
+        a source-frame hold is more natural than a hallucinated mouth shape.
+        """
+        count = max(0, int(frame_count))
+        if count == 0:
+            return np.zeros(0, dtype=bool)
+        audio = np.asarray(audio_16k, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            return np.ones(count, dtype=bool)
+
+        frame_samples = max(1.0, 16000.0 / max(1.0, float(fps)))
+        threshold = max(1e-6, float(rms_threshold))
+        quiet = np.zeros(count, dtype=bool)
+        for index in range(count):
+            start = min(audio.size, int(math.floor(index * frame_samples)))
+            end = min(audio.size, max(start + 1, int(math.ceil((index + 1) * frame_samples))))
+            if start >= audio.size:
+                quiet[index] = True
+                continue
+            window = audio[start:end]
+            rms = float(np.sqrt(np.mean(np.square(window)))) if window.size else 0.0
+            quiet[index] = rms < threshold
+
+        min_frames = max(
+            1,
+            int(math.ceil((max(1, int(min_duration_ms)) / 1000.0) * max(1.0, float(fps)))),
+        )
+        stable = np.zeros(count, dtype=bool)
+        run_start = 0
+        while run_start < count:
+            if not quiet[run_start]:
+                run_start += 1
+                continue
+            run_end = run_start + 1
+            while run_end < count and quiet[run_end]:
+                run_end += 1
+            if run_end - run_start >= min_frames:
+                stable[run_start:run_end] = True
+            run_start = run_end
+        return stable
+
     def _extract_whisper_prompts(
         self,
         audio_buffer: np.ndarray,
@@ -1343,6 +1405,8 @@ class MuseTalkBridge:
         audio_16k: np.ndarray,
         fps: float | None = None,
         lookahead_16k: np.ndarray | None = None,
+        *,
+        suppress_silence_motion: bool = True,
     ) -> list[np.ndarray]:
         if self.frames is None or self.coords_xyxy is None:
             raise RuntimeError("Avatar cache not loaded.")
@@ -1366,6 +1430,17 @@ class MuseTalkBridge:
         infer_target_frames = self._compute_infer_target_frames(audio_chunk, infer_fps)
         if infer_target_frames <= 0:
             infer_target_frames = 1
+        silence_frames = (
+            self._stable_silence_mask(
+                audio_chunk,
+                infer_target_frames,
+                infer_fps,
+                rms_threshold=self.silence_rms_threshold,
+                min_duration_ms=self.silence_min_duration_ms,
+            )
+            if suppress_silence_motion
+            else np.zeros(infer_target_frames, dtype=bool)
+        )
 
         history_append = audio_chunk
         lookahead_infer_frames = 0.0
@@ -1391,15 +1466,6 @@ class MuseTalkBridge:
             0,
             int(math.floor(total_buffer_frames - lookahead_infer_frames - infer_target_frames)),
         )
-        whisper_chunks = self._extract_whisper_prompts(
-            audio_context,
-            infer_fps,
-            infer_target_frames,
-            start_frame_offset,
-        )
-        if whisper_chunks.numel() == 0:
-            return []
-
         frames: list[np.ndarray] = []
         coords: list[list[int]] = []
         latents: list[torch.Tensor] = []
@@ -1413,41 +1479,63 @@ class MuseTalkBridge:
             alphas.append(alpha)
 
         output_frames: list[np.ndarray] = []
-        cursor = 0
-        with torch.inference_mode():
-            gen = self._datagen(
-                whisper_chunks,
-                latents,
-                batch_size=self.batch_size,
-                device=self.device,
+        if bool(np.all(silence_frames)):
+            # A silent request is used during warm-up and can also occur at the
+            # end of a spoken answer. Returning source frames is intentional
+            # here, not a failed lip-sync result.
+            self._prev_generated_face = None
+            output_frames = frames
+        else:
+            whisper_chunks = self._extract_whisper_prompts(
+                audio_context,
+                infer_fps,
+                infer_target_frames,
+                start_frame_offset,
             )
-            for whisper_batch, latent_batch in gen:
-                whisper_batch = whisper_batch.to(self.device, dtype=self.weight_dtype)
-                audio_feature_batch = self.pe(whisper_batch)
-                latent_batch = latent_batch.to(device=self.device, dtype=self.unet.model.dtype)
-                pred_latents = self.unet.model(
-                    latent_batch,
-                    self.timesteps,
-                    encoder_hidden_states=audio_feature_batch,
-                ).sample
-                pred_latents = pred_latents.to(device=self.device, dtype=self.vae.vae.dtype)
-                recon = self.vae.decode_latents(pred_latents)
+            if whisper_chunks.numel() == 0:
+                return []
+            cursor = 0
+            with torch.inference_mode():
+                gen = self._datagen(
+                    whisper_chunks,
+                    latents,
+                    batch_size=self.batch_size,
+                    device=self.device,
+                )
+                for whisper_batch, latent_batch in gen:
+                    whisper_batch = whisper_batch.to(self.device, dtype=self.weight_dtype)
+                    audio_feature_batch = self.pe(whisper_batch)
+                    latent_batch = latent_batch.to(device=self.device, dtype=self.unet.model.dtype)
+                    pred_latents = self.unet.model(
+                        latent_batch,
+                        self.timesteps,
+                        encoder_hidden_states=audio_feature_batch,
+                    ).sample
+                    pred_latents = pred_latents.to(device=self.device, dtype=self.vae.vae.dtype)
+                    recon = self.vae.decode_latents(pred_latents)
 
-                for res_frame in recon:
-                    frame = frames[cursor]
-                    coord = coords[cursor]
-                    crop_box = mask_crop_boxes[cursor]
-                    alpha = alphas[cursor]
-                    try:
-                        blended = self._blend_frame(frame, res_frame, coord, crop_box, alpha)
-                        output_frames.append(blended)
-                    except Exception:
-                        logger.exception(
-                            "component=musetalk op=blend_frame status=error idx=%s",
-                            cursor,
-                        )
-                        output_frames.append(frame)
-                    cursor += 1
+                    for res_frame in recon:
+                        frame = frames[cursor]
+                        if silence_frames[cursor]:
+                            # Do not carry an open-mouth reconstruction through
+                            # a pause. Speech resumes with a sharp current frame.
+                            self._prev_generated_face = None
+                            output_frames.append(frame)
+                            cursor += 1
+                            continue
+                        coord = coords[cursor]
+                        crop_box = mask_crop_boxes[cursor]
+                        alpha = alphas[cursor]
+                        try:
+                            blended = self._blend_frame(frame, res_frame, coord, crop_box, alpha)
+                            output_frames.append(blended)
+                        except Exception:
+                            logger.exception(
+                                "component=musetalk op=blend_frame status=error idx=%s",
+                                cursor,
+                            )
+                            output_frames.append(frame)
+                        cursor += 1
 
         # Never make a compositing failure look like a successful lip-sync
         # response.  Returning only untouched source frames is particularly
@@ -1458,7 +1546,7 @@ class MuseTalkBridge:
                 int(np.array_equal(output, source))
                 for output, source in zip(output_frames, frames)
             )
-            if untouched == len(frames):
+            if untouched == len(frames) and not bool(np.all(silence_frames)):
                 raise RuntimeError(
                     "MuseTalk could not composite generated face frames; refusing to stream the source video as lip-sync output."
                 )

@@ -578,15 +578,54 @@ class LLMService:
             if route.cache_key in self._warmed_routes:
                 continue
             if route.model in OPENAI_MODELS:
-                self._warmed_routes.add(route.cache_key)
-                warmed_any = True
-                logger.info(
-                    "component=llm op=warmup status=ok mode=%s resolved_mode=%s model=%s",
-                    route.requested_mode,
-                    route.resolved_mode,
-                    route.model,
-                )
-                continue
+                # Marking an OpenAI route as warm without opening a stream left
+                # its first real request to pay the DNS, TLS, and provider
+                # connection setup.  Use the same provider route as production
+                # with a minimal response so the composer unlocks only after
+                # that one-time cost has been paid.
+                try:
+                    warmup_messages = [
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": "Reply with exactly one short word."},
+                    ]
+                    if route.uses_openai_responses_search:
+                        for token in self._stream_openai_responses_tokens(
+                            warmup_messages,
+                            route.model,
+                        ):
+                            if token:
+                                break
+                    else:
+                        if self.openai_client is None:
+                            raise RuntimeError("OPENAI_API_KEY not set — cannot use OpenAI model")
+                        stream = self.openai_client.chat.completions.create(
+                            model=route.model,
+                            messages=self._messages_for_route(route, warmup_messages),
+                            stream=True,
+                            temperature=0.7,
+                            max_completion_tokens=WARMUP_MAX_COMPLETION_TOKENS,
+                        )
+                        for chunk in stream:
+                            token = chunk.choices[0].delta.content
+                            if token:
+                                break
+                    self._warmed_routes.add(route.cache_key)
+                    warmed_any = True
+                    logger.info(
+                        "component=llm op=warmup status=ok mode=%s resolved_mode=%s model=%s",
+                        route.requested_mode,
+                        route.resolved_mode,
+                        route.model,
+                    )
+                    continue
+                except Exception:
+                    logger.exception(
+                        "component=llm op=warmup status=error mode=%s resolved_mode=%s model=%s",
+                        route.requested_mode,
+                        route.resolved_mode,
+                        route.model,
+                    )
+                    raise
             if route.uses_gemini:
                 try:
                     for token in self._stream_gemini_tokens(
