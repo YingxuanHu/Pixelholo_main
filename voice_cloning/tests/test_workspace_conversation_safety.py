@@ -136,12 +136,14 @@ class WorkspaceConversationSafetyTests(unittest.TestCase):
         )
         self.assertFalse(short_mask.any())
 
-    def test_musetalk_preserves_the_source_chin_below_the_mouth_region(self):
-        # This is intentionally model-free.  It verifies the compositor mask
-        # boundary that prevents a low-resolution generated face from replacing
-        # the source chin and changing its geometry between stream windows.
+    def test_musetalk_preserves_the_full_mouth_and_source_chin(self):
+        # This is intentionally model-free. The complete generated mouth must
+        # survive compositing. Cutting the mask near 0.65 leaves the source
+        # lower lip in the output, which visibly follows the reference video
+        # instead of the generated speech. Only the bottom of the chin should
+        # fade back to the source frame.
         bridge = object.__new__(MuseTalkBridge)
-        bridge.mouth_mask_bottom_ratio = 0.65
+        bridge.mouth_mask_bottom_ratio = 0.84
         bridge.mouth_mask_bottom_feather = 0.08
         alpha = np.ones((100, 80), dtype=np.float32)
 
@@ -151,10 +153,10 @@ class WorkspaceConversationSafetyTests(unittest.TestCase):
             crop_box=(0, 0, 80, 100),
         )
 
-        self.assertEqual(float(protected[45, 40]), 1.0)
-        self.assertGreater(float(protected[57, 40]), 0.0)
-        self.assertLess(float(protected[57, 40]), 1.0)
-        self.assertEqual(float(protected[66, 40]), 0.0)
+        self.assertEqual(float(protected[65, 40]), 1.0)
+        self.assertGreater(float(protected[72, 40]), 0.0)
+        self.assertLess(float(protected[72, 40]), 1.0)
+        self.assertEqual(float(protected[76, 40]), 0.0)
 
     def test_musetalk_holds_the_last_rendered_portrait_during_a_pause(self):
         # The original reference clip keeps moving.  A sustained TTS pause
@@ -199,7 +201,7 @@ class WorkspaceConversationSafetyTests(unittest.TestCase):
         bridge.default_temporal_smooth = 0.025
         bridge.default_face_scale = 0.96
         bridge.default_detail_sharpen = 0.70
-        bridge.default_mouth_mask_bottom_ratio = 0.65
+        bridge.default_mouth_mask_bottom_ratio = 0.84
         bridge.default_infer_fps = 25.0
         bridge.default_audio_history_sec = 2.0
 
@@ -214,7 +216,7 @@ class WorkspaceConversationSafetyTests(unittest.TestCase):
             self.assertEqual(bridge.mouth_mask_bottom_ratio, 0.72)
 
             bridge.configure_for_request(preset="realistic")
-            self.assertEqual(bridge.mouth_mask_bottom_ratio, 0.65)
+            self.assertEqual(bridge.mouth_mask_bottom_ratio, 0.84)
 
     def test_musetalk_pads_only_the_invisible_tail_batch(self):
         # The final short model batch used to create a new CUDA execution

@@ -122,15 +122,16 @@ class MuseTalkBridge:
         # lip/teeth edge definition without introducing ringing around the mouth.
         self.default_detail_sharpen = float(os.getenv("MUSE_TALK_DETAIL_SHARPEN", "0.70"))
         self.detail_sharpen = self.default_detail_sharpen
-        # MuseTalk's generated face is 256px.  Keep its lower edge from
-        # replacing the source chin, where the reconstruction is most likely
-        # to look soft or lose the natural jaw contour.
+        # Preserve the complete generated mouth, including the lower lip,
+        # while fading back to the source before the bottom of the chin.  A
+        # boundary near 0.65 crosses the mouth on normal full-face crops.  It
+        # leaves the source lower lip visible underneath MuseTalk's upper lip,
+        # so the displayed articulation follows the reference recording
+        # instead of the generated audio.  The stable runtime coordinate track
+        # below prevents the old stream-window chin jump without cutting the
+        # generated viseme in half.
         self.default_mouth_mask_bottom_ratio = float(
-            # Preserve the original chin and jawline. MuseTalk's generated
-            # 256px face is reliable around the lips, but blending deep into
-            # the lower face makes the chin alternate between the source and
-            # reconstructed geometry at streamed-window boundaries.
-            os.getenv("MUSE_TALK_MOUTH_MASK_BOTTOM_RATIO", "0.65")
+            os.getenv("MUSE_TALK_MOUTH_MASK_BOTTOM_RATIO", "0.84")
         )
         self.mouth_mask_bottom_ratio = self.default_mouth_mask_bottom_ratio
         self.mouth_mask_bottom_feather = float(
