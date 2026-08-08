@@ -187,8 +187,34 @@ const DEFAULT_AUDIO_START_DELAY_SEC = envNumber('VITE_PIXELHOLO_AUDIO_START_DELA
 // cushion makes the public stream resilient without altering model latency.
 const AVATAR_AUDIO_START_DELAY_SEC = envNumber('VITE_PIXELHOLO_AVATAR_AUDIO_START_DELAY_SEC', 1.35, 0.4, 2.5);
 const AVATAR_AUDIO_CHUNK_LEAD_SEC = envNumber('VITE_PIXELHOLO_AVATAR_AUDIO_CHUNK_LEAD_SEC', 0.08, 0.02, 0.5);
-const VIDEO_FRAME_DECODE_PREWAIT_MS = envNumber('VITE_PIXELHOLO_VIDEO_PREDECODE_PREWAIT_MS', 45, 0, 200);
 const WARMUP_CACHE_MAX_AGE_MS = 120_000;
+
+const audibleAudioContextTime = (context: AudioContext): number => {
+  // `currentTime` is the Web Audio rendering clock, not necessarily the sound
+  // currently leaving the user's speakers. Hardware, OS, and browser output
+  // buffers can put audible audio tens or hundreds of milliseconds behind it.
+  // getOutputTimestamp maps the device's presented audio back onto the same
+  // context timeline used by BufferSource.start(), which gives the canvas the
+  // correct word/viseme clock on remote devices as well as on the local host.
+  if (typeof context.getOutputTimestamp === 'function') {
+    const timestamp = context.getOutputTimestamp();
+    if (
+      Number.isFinite(timestamp.contextTime)
+      && Number.isFinite(timestamp.performanceTime)
+      && timestamp.performanceTime > 0
+    ) {
+      const wallClockAdvance = Math.max(0, (performance.now() - timestamp.performanceTime) / 1000);
+      return Math.min(context.currentTime, timestamp.contextTime + wallClockAdvance);
+    }
+  }
+
+  // Older browsers do not expose the timestamp mapping. Their reported output
+  // latency is still a better approximation than drawing against currentTime.
+  const outputLatency = Number.isFinite(context.outputLatency) ? context.outputLatency : 0;
+  const baseLatency = Number.isFinite(context.baseLatency) ? context.baseLatency : 0;
+  const estimatedLatency = Math.max(0, outputLatency || baseLatency);
+  return Math.max(0, context.currentTime - estimatedLatency);
+};
 const normalizeTtsBackend = (_value: unknown): TTSBackend => 'chatterbox';
 const normalizeVoiceEmotion = (value: unknown): VoiceEmotion => {
   if (value === 'happy' || value === 'sad' || value === 'angry' || value === 'scared' || value === 'disgust') {
@@ -1929,13 +1955,14 @@ const App: React.FC = () => {
         && !!(frame.bitmapPromise || frame.imagePromise)
         && frame.bitmapState === 'pending'
       ))
-      .slice(0, 4)
       .map(frame => frame.bitmapPromise || frame.imagePromise!);
     if (!pending.length) return;
-    await Promise.race([
-      Promise.allSettled(pending),
-      new Promise(resolve => window.setTimeout(resolve, VIDEO_FRAME_DECODE_PREWAIT_MS)),
-    ]);
+    // Audio and video share one AudioContext presentation clock.  Do not start
+    // that clock until every frame paired with this audio packet is decoded.
+    // The former 45 ms / four-frame best-effort wait let public-network audio
+    // advance while the canvas retained an older mouth shape.  Fast local
+    // decoding hid the bug, which is why local playback appeared synchronized.
+    await Promise.allSettled(pending);
   }, []);
 
   const drawFrame = useCallback((frameSource: VideoFrameSource, presentationTime: number) => {
@@ -2058,7 +2085,9 @@ const App: React.FC = () => {
         if (videoNextFrameTimeRef.current === null) {
           videoNextFrameTimeRef.current = startAt;
         }
-        const now = ctx.currentTime;
+        // Present the matching mouth frame when the scheduled audio is
+        // actually audible, not when it enters the browser's output buffer.
+        const now = audibleAudioContextTime(ctx);
         // Audio is scheduled against AudioContext time, so video must present
         // against that same clock.  Drawing only one overdue frame per RAF
         // makes the mouth permanently trail audio after a short paint delay.
@@ -2420,6 +2449,16 @@ const App: React.FC = () => {
           return;
         }
         const frameSources = frames ?? data.frames_base64;
+        if (outputMode === 'avatar' && Array.isArray(frameSources)) {
+          // Binary JPEG decoding begins as soon as the packet is parsed. Wait
+          // for the complete matching frame set before scheduling its audio so
+          // a slow browser cannot present a previous viseme under a new word.
+          await waitForFramePredecode(frameSources);
+          if (!isSessionActive()) {
+            revokeFrameSources(frameSources);
+            return;
+          }
+        }
         const schedule = scheduleBuffer(buffer);
         if (outputMode === 'avatar' && schedule && videoStartTimeRef.current === null) {
           videoStartTimeRef.current = schedule.startAt;
@@ -2428,7 +2467,6 @@ const App: React.FC = () => {
         if (outputMode === 'avatar' && schedule && Array.isArray(frameSources)) {
           const duration = typeof data.duration_sec === 'number' ? data.duration_sec : buffer.duration;
           enqueueFrames(frameSources, schedule.startAt, duration, data.fps);
-          void waitForFramePredecode(frameSources);
           setInferenceStageIndex(Math.min(3, inferenceSteps.length - 1));
         }
         if (outputMode === 'voice') {
