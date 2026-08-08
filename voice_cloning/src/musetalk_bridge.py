@@ -151,10 +151,14 @@ class MuseTalkBridge:
         # tiny lip movement. Hold the last rendered portrait for sustained
         # silence so natural conversational pauses are genuinely still.
         self.silence_rms_threshold = float(
-            np.clip(float(os.getenv("MUSE_TALK_SILENCE_RMS_THRESHOLD", "0.006")), 0.0005, 0.05)
+            # Keep this deliberately conservative.  A short low-energy
+            # consonant or word boundary is still speech and needs MuseTalk's
+            # viseme.  The earlier 120 ms / 0.006 rule held regular speech
+            # frames, which made the displayed mouth fall behind the audio.
+            np.clip(float(os.getenv("MUSE_TALK_SILENCE_RMS_THRESHOLD", "0.004")), 0.0005, 0.05)
         )
         self.silence_min_duration_ms = int(
-            np.clip(int(os.getenv("MUSE_TALK_SILENCE_MIN_DURATION_MS", "120")), 40, 800)
+            np.clip(int(os.getenv("MUSE_TALK_SILENCE_MIN_DURATION_MS", "280")), 40, 800)
         )
         self.default_runtime_max_frame_edge = _env_int(
             "MUSE_TALK_RUNTIME_MAX_FRAME_EDGE",

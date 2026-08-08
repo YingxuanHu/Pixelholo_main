@@ -96,30 +96,32 @@ class WorkspaceConversationSafetyTests(unittest.TestCase):
     def test_musetalk_holds_only_sustained_silence(self):
         fps = 25
         audio = np.full(16000, 0.08, dtype=np.float32)
-        # A 240 ms quiet region is a real conversational pause and should not
-        # be rendered as a moving mouth.
-        audio[int(0.32 * 16000):int(0.56 * 16000)] = 0.0
+        # A 440 ms quiet region is a real conversational pause and should not
+        # be rendered as a moving mouth.  The threshold must be long enough
+        # that quiet consonants and ordinary word boundaries keep their
+        # model-generated visemes.
+        audio[int(0.28 * 16000):int(0.72 * 16000)] = 0.0
         mask = MuseTalkBridge._stable_silence_mask(
             audio,
             frame_count=25,
             fps=fps,
-            rms_threshold=0.006,
-            min_duration_ms=120,
+            rms_threshold=0.004,
+            min_duration_ms=280,
         )
-        self.assertTrue(mask[8:14].all())
-        self.assertFalse(mask[:7].any())
-        self.assertFalse(mask[15:].any())
+        self.assertTrue(mask[7:18].all())
+        self.assertFalse(mask[:6].any())
+        self.assertFalse(mask[19:].any())
 
-        # An 80 ms gap is normal articulation and should preserve MuseTalk's
-        # generated motion around the consonant boundary.
+        # A 240 ms gap can occur between normally spoken words.  It must
+        # preserve MuseTalk's generated motion around that boundary.
         short_gap = np.full(16000, 0.08, dtype=np.float32)
-        short_gap[int(0.32 * 16000):int(0.40 * 16000)] = 0.0
+        short_gap[int(0.32 * 16000):int(0.56 * 16000)] = 0.0
         short_mask = MuseTalkBridge._stable_silence_mask(
             short_gap,
             frame_count=25,
             fps=fps,
-            rms_threshold=0.006,
-            min_duration_ms=120,
+            rms_threshold=0.004,
+            min_duration_ms=280,
         )
         self.assertFalse(short_mask.any())
 
