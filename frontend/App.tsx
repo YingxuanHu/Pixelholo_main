@@ -3301,25 +3301,32 @@ const App: React.FC = () => {
                 </div>
                 <div className="ph-minimal-composer-row"><span>{inferenceText.length} characters</span><span>{isListening ? (speechTranscript ? 'Listening…' : 'Start speaking…') : 'Enter to send · voice sends automatically'}</span></div>
 
-                <div className="ph-minimal-model-grid">
-                  <label><span>Lip sync</span><select value={avatarBackend} disabled={isComposerLocked} onChange={event => { setProfileWarmupState('idle'); setProfileWarmupError(null); setAvatarBackend(event.target.value as 'musetalk' | 'wav2lip'); }}><option value="musetalk">MuseTalk</option><option value="wav2lip">Wav2Lip</option></select></label>
-                  <label><span>Assistant</span><select value={llmMode} disabled={isComposerLocked} onChange={event => { setProfileWarmupState('idle'); setProfileWarmupError(null); setLlmMode(event.target.value as LLMMode); }}>{LLM_MODE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
-                </div>
+                <details className="ph-minimal-settings">
+                  <summary>
+                    <span>Conversation settings</span>
+                    <small>{avatarBackend === 'wav2lip' ? 'Wav2Lip' : 'MuseTalk'} · {LLM_MODE_OPTIONS.find(option => option.value === llmMode)?.label || 'Assistant'} · {voiceControlValues?.emotion || 'neutral'}</small>
+                  </summary>
+                  <div className="ph-minimal-settings-content">
+                    <div className="ph-minimal-model-grid">
+                      <label><span>Lip sync</span><select value={avatarBackend} disabled={isComposerLocked} onChange={event => { setProfileWarmupState('idle'); setProfileWarmupError(null); setAvatarBackend(event.target.value as 'musetalk' | 'wav2lip'); }}><option value="musetalk">MuseTalk</option><option value="wav2lip">Wav2Lip</option></select></label>
+                      <label><span>Assistant</span><select value={llmMode} disabled={isComposerLocked} onChange={event => { setProfileWarmupState('idle'); setProfileWarmupError(null); setLlmMode(event.target.value as LLMMode); }}>{LLM_MODE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                    </div>
+                    <div className="ph-minimal-control-row"><label>Emotion<select value={voiceControlValues?.emotion || 'neutral'} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ emotion: event.target.value as VoiceEmotion })}>{(['neutral', 'happy', 'sad', 'angry', 'scared', 'disgust'] as VoiceEmotion[]).map(emotion => <option key={emotion} value={emotion}>{emotion[0].toUpperCase() + emotion.slice(1)}</option>)}</select></label><button type="button" className="ph-minimal-advanced-button" disabled={isComposerLocked} onClick={() => setShowVoiceSettings(prev => !prev)}>{showVoiceSettings ? 'Hide voice controls' : 'Voice controls'}</button></div>
 
-                <div className="ph-minimal-control-row"><label>Emotion<select value={voiceControlValues?.emotion || 'neutral'} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ emotion: event.target.value as VoiceEmotion })}>{(['neutral', 'happy', 'sad', 'angry', 'scared', 'disgust'] as VoiceEmotion[]).map(emotion => <option key={emotion} value={emotion}>{emotion[0].toUpperCase() + emotion.slice(1)}</option>)}</select></label><button type="button" className="ph-minimal-advanced-button" disabled={isComposerLocked} onClick={() => setShowVoiceSettings(prev => !prev)}>{showVoiceSettings ? 'Hide options' : 'More options'}</button></div>
-
-                {showVoiceSettings && (
-                  <div className="ph-minimal-advanced-panel">
-                    <label className="ph-minimal-system-prompt"><span>Avatar instructions <b>Optional</b></span><textarea value={avatarInstructions} maxLength={1200} disabled={isComposerLocked} onChange={event => { setAvatarInstructions(event.target.value); setRuntimeSettingsStatus('idle'); setRuntimeSettingsError(null); }} placeholder="e.g. You are Maya, a warm and curious travel guide. Introduce yourself as Maya." /></label>
-                    <label><span>Expressiveness <b>{Math.round((voiceControlValues?.expressiveness ?? 0.5) * 100)}%</b></span><input type="range" min="0.25" max="1" step="0.01" value={voiceControlValues?.expressiveness ?? 0.5} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ expressiveness: Number(event.target.value) })} /></label>
-                    <label><span>Variation / temperature <b>{(voiceControlValues?.variation ?? 0.8).toFixed(2)}</b></span><input type="range" min="0.1" max="1.2" step="0.01" value={voiceControlValues?.variation ?? 0.8} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ variation: Number(event.target.value) })} /></label>
-                    <label><span>Voice match / CFG <b>{Math.round((voiceControlValues?.guidance ?? 0.5) * 100)}%</b></span><input type="range" min="0" max="1" step="0.01" value={voiceControlValues?.guidance ?? 0.5} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ guidance: Number(event.target.value) })} /></label>
-                    <label><span>Repetition penalty <b>{(voiceControlValues?.repetition ?? 1.2).toFixed(2)}</b></span><input type="range" min="0.9" max="2" step="0.01" value={voiceControlValues?.repetition ?? 1.2} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ repetition: Number(event.target.value) })} /></label>
-                    <label><span>Emotion intensity <b>{Math.round((voiceControlValues?.emotionIntensity ?? 0.5) * 100)}%</b></span><input type="range" min="0" max="1" step="0.05" value={voiceControlValues?.emotionIntensity ?? 0.5} disabled={isComposerLocked || voiceControlValues?.emotion === 'neutral'} onChange={event => handleVoiceControlsChange({ emotionIntensity: Number(event.target.value) })} /></label>
-                    {runtimeSettingsError && <p className="ph-minimal-settings-error" role="alert">{runtimeSettingsError}</p>}
-                    <div className="ph-minimal-advanced-actions"><button type="button" onClick={resetVoiceControls} disabled={isComposerLocked}>Reset voice</button><button type="button" className="is-accent" onClick={() => void saveRuntimeSettings()} disabled={isComposerLocked || runtimeSettingsStatus === 'saving'}>{runtimeSettingsStatus === 'saved' ? 'Saved' : runtimeSettingsStatus === 'saving' ? 'Saving…' : 'Save profile settings'}</button></div>
+                    {showVoiceSettings && (
+                      <div className="ph-minimal-advanced-panel">
+                        <label className="ph-minimal-system-prompt"><span>Avatar instructions <b>Optional</b></span><textarea value={avatarInstructions} maxLength={1200} disabled={isComposerLocked} onChange={event => { setAvatarInstructions(event.target.value); setRuntimeSettingsStatus('idle'); setRuntimeSettingsError(null); }} placeholder="e.g. You are Maya, a warm and curious travel guide. Introduce yourself as Maya." /></label>
+                        <label><span>Expressiveness <b>{Math.round((voiceControlValues?.expressiveness ?? 0.5) * 100)}%</b></span><input type="range" min="0.25" max="1" step="0.01" value={voiceControlValues?.expressiveness ?? 0.5} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ expressiveness: Number(event.target.value) })} /></label>
+                        <label><span>Variation / temperature <b>{(voiceControlValues?.variation ?? 0.8).toFixed(2)}</b></span><input type="range" min="0.1" max="1.2" step="0.01" value={voiceControlValues?.variation ?? 0.8} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ variation: Number(event.target.value) })} /></label>
+                        <label><span>Voice match / CFG <b>{Math.round((voiceControlValues?.guidance ?? 0.5) * 100)}%</b></span><input type="range" min="0" max="1" step="0.01" value={voiceControlValues?.guidance ?? 0.5} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ guidance: Number(event.target.value) })} /></label>
+                        <label><span>Repetition penalty <b>{(voiceControlValues?.repetition ?? 1.2).toFixed(2)}</b></span><input type="range" min="0.9" max="2" step="0.01" value={voiceControlValues?.repetition ?? 1.2} disabled={isComposerLocked} onChange={event => handleVoiceControlsChange({ repetition: Number(event.target.value) })} /></label>
+                        <label><span>Emotion intensity <b>{Math.round((voiceControlValues?.emotionIntensity ?? 0.5) * 100)}%</b></span><input type="range" min="0" max="1" step="0.05" value={voiceControlValues?.emotionIntensity ?? 0.5} disabled={isComposerLocked || voiceControlValues?.emotion === 'neutral'} onChange={event => handleVoiceControlsChange({ emotionIntensity: Number(event.target.value) })} /></label>
+                        {runtimeSettingsError && <p className="ph-minimal-settings-error" role="alert">{runtimeSettingsError}</p>}
+                        <div className="ph-minimal-advanced-actions"><button type="button" onClick={resetVoiceControls} disabled={isComposerLocked}>Reset voice</button><button type="button" className="is-accent" onClick={() => void saveRuntimeSettings()} disabled={isComposerLocked || runtimeSettingsStatus === 'saving'}>{runtimeSettingsStatus === 'saved' ? 'Saved' : runtimeSettingsStatus === 'saving' ? 'Saving…' : 'Save profile settings'}</button></div>
+                      </div>
+                    )}
                   </div>
-                )}
+                </details>
 
                 {uiNotice && <div className="ph-minimal-error">{uiNotice}</div>}
                 <div className="ph-minimal-composer-footer">
