@@ -440,7 +440,13 @@ button:disabled { cursor: not-allowed; }
 .ph-minimal-input-shell { position: relative; margin-top: 13px; }
 .ph-minimal-composer-input { width: 100%; min-height: 156px; margin-top: 0; padding: 13px 13px 54px; resize: vertical; border: 1px solid #e1e1db; border-radius: 8px; outline: 0; color: #282a27; background: #fcfcfa; font-size: 14px; line-height: 1.55; }
 .ph-minimal-composer-input:focus { border-color: #8ccdc3; box-shadow: 0 0 0 3px rgba(8,127,114,.08); }
-.ph-minimal-voice-button { position: absolute; right: 10px; bottom: 10px; display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid #c7e2dc; border-radius: 999px; color: #087f72; background: #eff9f6; font: 700 10px 'DM Sans', sans-serif; transition: .18s ease; }
+.ph-minimal-input-actions { position: absolute; right: 10px; bottom: 10px; display: inline-flex; align-items: center; gap: 6px; }
+.ph-minimal-send-button, .ph-minimal-voice-button { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 999px; font: 700 10px 'DM Sans', sans-serif; transition: .18s ease; }
+.ph-minimal-send-button { border: 1px solid #087f72; color: #fff; background: #087f72; }
+.ph-minimal-send-button svg { width: 14px; height: 14px; fill: currentColor; }
+.ph-minimal-send-button:hover:not(:disabled) { border-color: #05695f; background: #05695f; }
+.ph-minimal-send-button:disabled { cursor: not-allowed; opacity: .4; }
+.ph-minimal-voice-button { border: 1px solid #c7e2dc; color: #087f72; background: #eff9f6; }
 .ph-minimal-voice-button svg { width: 14px; height: 14px; fill: currentColor; }
 .ph-minimal-voice-button:hover:not(:disabled) { color: #fff; background: #087f72; border-color: #087f72; }
 .ph-minimal-voice-button.is-listening { color: #fff; background: #c96358; border-color: #c96358; box-shadow: 0 0 0 4px rgba(201,99,88,.12); }

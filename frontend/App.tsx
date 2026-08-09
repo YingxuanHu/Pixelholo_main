@@ -3294,10 +3294,16 @@ const App: React.FC = () => {
                     readOnly={isComposerLocked}
                     aria-busy={isComposerLocked}
                   />
-                  <button type="button" className={`ph-minimal-voice-button ${isListening ? 'is-listening' : ''}`} onClick={() => (isListening ? stopListening() : startListening())} disabled={!hasSpeechSupport || isComposerLocked} title={hasSpeechSupport ? 'Speak; it will send automatically when you stop' : 'Voice input is not supported by this browser'} aria-label={hasSpeechSupport ? (isListening ? 'Stop listening' : 'Voice input') : 'Voice input unavailable'} aria-pressed={isListening}>
-                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm6-3a1 1 0 0 0-2 0 4 4 0 0 1-8 0 1 1 0 0 0-2 0 6 6 0 0 0 5 5.91V19H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-2.09A6 6 0 0 0 18 11Z" /></svg>
-                    <span>{isListening ? 'Stop listening' : 'Voice'}</span>
-                  </button>
+                  <div className="ph-minimal-input-actions">
+                    <button type="button" className="ph-minimal-send-button" onClick={() => void sendComposerText()} disabled={!inferenceText.trim() || isComposerLocked} title="Send prompt" aria-label="Send prompt">
+                      <span>Send</span>
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h12.17l-4.59 4.59L14 18l7-7-7-7-1.42 1.41L17.17 10H5v2Z" /></svg>
+                    </button>
+                    <button type="button" className={`ph-minimal-voice-button ${isListening ? 'is-listening' : ''}`} onClick={() => (isListening ? stopListening() : startListening())} disabled={!hasSpeechSupport || isComposerLocked} title={hasSpeechSupport ? 'Speak; it will send automatically when you stop' : 'Voice input is not supported by this browser'} aria-label={hasSpeechSupport ? (isListening ? 'Stop listening' : 'Voice input') : 'Voice input unavailable'} aria-pressed={isListening}>
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm6-3a1 1 0 0 0-2 0 4 4 0 0 1-8 0 1 1 0 0 0-2 0 6 6 0 0 0 5 5.91V19H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-2.09A6 6 0 0 0 18 11Z" /></svg>
+                      <span>{isListening ? 'Stop listening' : 'Voice'}</span>
+                    </button>
+                  </div>
                 </div>
                 <div className="ph-minimal-composer-row"><span>{inferenceText.length} characters</span><span>{isListening ? (speechTranscript ? 'Listening…' : 'Start speaking…') : 'Enter to send · voice sends automatically'}</span></div>
 
