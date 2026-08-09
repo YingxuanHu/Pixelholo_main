@@ -7,7 +7,9 @@ backend process.
 
 from __future__ import annotations
 
+import json
 import shutil
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
@@ -242,6 +244,11 @@ class WorkspaceConversationSafetyTests(unittest.TestCase):
         bridge.default_face_scale = 0.96
         bridge.default_detail_sharpen = 0.70
         bridge.default_mouth_mask_bottom_ratio = 0.84
+        bridge.default_chin_mask_bottom_ratio = 0.66
+        bridge.default_mouth_core_center_y_ratio = 0.68
+        bridge.default_mouth_core_half_width_ratio = 0.30
+        bridge.default_mouth_core_half_height_ratio = 0.16
+        bridge.default_mouth_core_feather = 0.25
         bridge.default_infer_fps = 25.0
         bridge.default_audio_history_sec = 2.0
 
@@ -255,8 +262,89 @@ class WorkspaceConversationSafetyTests(unittest.TestCase):
             bridge.configure_for_request(preset="realistic", mouth_mask_bottom_ratio=0.72)
             self.assertEqual(bridge.mouth_mask_bottom_ratio, 0.72)
 
+            # A profile-specific calibration is mutable renderer state. A
+            # different profile must never inherit its mouth/chin boundary.
+            bridge.chin_mask_bottom_ratio = 0.70
+            bridge.mouth_core_center_y_ratio = 0.74
+            bridge.mouth_core_half_width_ratio = 0.25
+            bridge.mouth_core_half_height_ratio = 0.13
+            bridge.mouth_core_feather = 0.16
+            bridge._profile_calibration = {"landmark_samples": 24}
             bridge.configure_for_request(preset="realistic")
             self.assertEqual(bridge.mouth_mask_bottom_ratio, 0.84)
+            self.assertEqual(bridge.chin_mask_bottom_ratio, 0.66)
+            self.assertEqual(bridge.mouth_core_center_y_ratio, 0.68)
+            self.assertEqual(bridge.mouth_core_half_width_ratio, 0.30)
+            self.assertEqual(bridge.mouth_core_half_height_ratio, 0.16)
+            self.assertEqual(bridge.mouth_core_feather, 0.25)
+            self.assertIsNone(bridge._profile_calibration)
+
+    def test_musetalk_applies_profile_calibrated_mouth_geometry(self):
+        bridge = object.__new__(MuseTalkBridge)
+        bridge._request_mouth_mask_bottom_ratio = None
+        bridge._profile_calibration = None
+        bridge.mouth_core_center_y_ratio = 0.68
+        bridge.mouth_core_half_width_ratio = 0.30
+        bridge.mouth_core_half_height_ratio = 0.16
+        bridge.mouth_core_feather = 0.25
+        bridge.chin_mask_bottom_ratio = 0.66
+        bridge.mouth_mask_bottom_ratio = 0.84
+
+        with tempfile.TemporaryDirectory() as tmp:
+            calibration_path = Path(tmp) / "musetalk_profile_calibration.json"
+            calibration_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "landmark_samples": 24,
+                        "mouth_core_center_y_ratio": 0.71,
+                        "mouth_core_half_width_ratio": 0.27,
+                        "mouth_core_half_height_ratio": 0.15,
+                        "mouth_core_feather": 0.20,
+                        "mouth_mask_bottom_ratio": 0.86,
+                        "chin_mask_bottom_ratio": 0.69,
+                    }
+                )
+            )
+            bridge._apply_profile_calibration(Path(tmp))
+
+        self.assertEqual(bridge.mouth_core_center_y_ratio, 0.71)
+        self.assertEqual(bridge.mouth_core_half_width_ratio, 0.27)
+        self.assertEqual(bridge.mouth_core_half_height_ratio, 0.15)
+        self.assertEqual(bridge.mouth_core_feather, 0.20)
+        self.assertEqual(bridge.mouth_mask_bottom_ratio, 0.86)
+        self.assertEqual(bridge.chin_mask_bottom_ratio, 0.69)
+
+    def test_musetalk_request_override_beats_profile_calibration(self):
+        bridge = object.__new__(MuseTalkBridge)
+        bridge._request_mouth_mask_bottom_ratio = 0.82
+        bridge._profile_calibration = None
+        bridge.mouth_core_center_y_ratio = 0.68
+        bridge.mouth_core_half_width_ratio = 0.30
+        bridge.mouth_core_half_height_ratio = 0.16
+        bridge.mouth_core_feather = 0.25
+        bridge.chin_mask_bottom_ratio = 0.66
+        bridge.mouth_mask_bottom_ratio = 0.82
+
+        with tempfile.TemporaryDirectory() as tmp:
+            calibration_path = Path(tmp) / "musetalk_profile_calibration.json"
+            calibration_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "landmark_samples": 24,
+                        "mouth_core_center_y_ratio": 0.71,
+                        "mouth_core_half_width_ratio": 0.27,
+                        "mouth_core_half_height_ratio": 0.15,
+                        "mouth_core_feather": 0.20,
+                        "mouth_mask_bottom_ratio": 0.86,
+                        "chin_mask_bottom_ratio": 0.69,
+                    }
+                )
+            )
+            bridge._apply_profile_calibration(Path(tmp))
+
+        self.assertEqual(bridge.mouth_mask_bottom_ratio, 0.82)
 
     def test_musetalk_pads_only_the_invisible_tail_batch(self):
         # The final short model batch used to create a new CUDA execution

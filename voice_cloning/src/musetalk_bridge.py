@@ -21,6 +21,8 @@ from transformers import AutoFeatureExtractor, WhisperModel
 from config import LIP_SYNCING_DIR, PROFILE_TYPE_AVATAR, avatar_cache_dir
 
 logger = logging.getLogger("pixelholo.musetalk")
+PROFILE_CALIBRATION_FILENAME = "musetalk_profile_calibration.json"
+PROFILE_CALIBRATION_VERSION = 1
 
 
 def _odd_kernel(size: int) -> int:
@@ -142,21 +144,28 @@ class MuseTalkBridge:
         # a feathered mouth-shaped core, while the source supplies the jaw and
         # chin texture that MuseTalk's native 256px reconstruction cannot
         # reproduce sharply.
-        self.chin_mask_bottom_ratio = float(
+        self.default_chin_mask_bottom_ratio = float(
             os.getenv("MUSE_TALK_CHIN_MASK_BOTTOM_RATIO", "0.66")
         )
-        self.mouth_core_center_y_ratio = float(
+        self.chin_mask_bottom_ratio = self.default_chin_mask_bottom_ratio
+        self.default_mouth_core_center_y_ratio = float(
             os.getenv("MUSE_TALK_MOUTH_CORE_CENTER_Y_RATIO", "0.68")
         )
-        self.mouth_core_half_width_ratio = float(
+        self.mouth_core_center_y_ratio = self.default_mouth_core_center_y_ratio
+        self.default_mouth_core_half_width_ratio = float(
             os.getenv("MUSE_TALK_MOUTH_CORE_HALF_WIDTH_RATIO", "0.30")
         )
-        self.mouth_core_half_height_ratio = float(
+        self.mouth_core_half_width_ratio = self.default_mouth_core_half_width_ratio
+        self.default_mouth_core_half_height_ratio = float(
             os.getenv("MUSE_TALK_MOUTH_CORE_HALF_HEIGHT_RATIO", "0.16")
         )
-        self.mouth_core_feather = float(
+        self.mouth_core_half_height_ratio = self.default_mouth_core_half_height_ratio
+        self.default_mouth_core_feather = float(
             os.getenv("MUSE_TALK_MOUTH_CORE_FEATHER", "0.25")
         )
+        self.mouth_core_feather = self.default_mouth_core_feather
+        self._request_mouth_mask_bottom_ratio: float | None = None
+        self._profile_calibration: dict[str, float | int] | None = None
         self.color_match_strength = float(os.getenv("MUSE_TALK_COLOR_MATCH_STRENGTH", "0.65"))
         # Version 10 is the cache contract shared with avatar_bake.py.  Earlier
         # prepared assets did not have the runtime manifest, so the first
@@ -384,6 +393,13 @@ class MuseTalkBridge:
             )
         )
         self.mouth_mask_bottom_ratio = self.default_mouth_mask_bottom_ratio
+        self.chin_mask_bottom_ratio = self.default_chin_mask_bottom_ratio
+        self.mouth_core_center_y_ratio = self.default_mouth_core_center_y_ratio
+        self.mouth_core_half_width_ratio = self.default_mouth_core_half_width_ratio
+        self.mouth_core_half_height_ratio = self.default_mouth_core_half_height_ratio
+        self.mouth_core_feather = self.default_mouth_core_feather
+        self._request_mouth_mask_bottom_ratio = None
+        self._profile_calibration = None
         self.infer_fps = self.default_infer_fps
         self.audio_history_sec = self.default_audio_history_sec
 
@@ -397,6 +413,7 @@ class MuseTalkBridge:
             self.mouth_mask_bottom_ratio = float(
                 np.clip(float(mouth_mask_bottom_ratio), 0.45, 0.85)
             )
+            self._request_mouth_mask_bottom_ratio = self.mouth_mask_bottom_ratio
         if infer_fps is not None:
             self.infer_fps = float(np.clip(float(infer_fps), 6.0, 30.0))
         if audio_history_sec is not None:
@@ -1041,6 +1058,102 @@ class MuseTalkBridge:
         self._vignette_cache.clear()
         gc.collect()
 
+    @staticmethod
+    def _calibration_float(
+        payload: dict[str, object],
+        key: str,
+        minimum: float,
+        maximum: float,
+    ) -> float | None:
+        value = payload.get(key)
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(parsed):
+            return None
+        return float(np.clip(parsed, minimum, maximum))
+
+    def _apply_profile_calibration(self, cache_dir: Path) -> None:
+        """Apply optional preparation-time mouth geometry for one avatar.
+
+        The calibration only constrains the compositor's source/generated
+        boundary.  It neither changes MuseTalk's checkpoint nor causes a
+        cache rebuild, so it cannot increase live inference latency.  Invalid
+        or partial files always fall back to the safe global geometry.
+        """
+        calibration_path = cache_dir / PROFILE_CALIBRATION_FILENAME
+        self._profile_calibration = None
+        if not calibration_path.exists():
+            return
+        try:
+            payload = json.loads(calibration_path.read_text())
+        except Exception:
+            logger.warning(
+                "component=musetalk op=profile_calibration status=invalid path=%s",
+                calibration_path,
+            )
+            return
+        if not isinstance(payload, dict):
+            return
+        try:
+            version = int(payload.get("version", 0))
+        except (TypeError, ValueError):
+            return
+        if version != PROFILE_CALIBRATION_VERSION:
+            return
+        try:
+            landmark_samples = int(payload.get("landmark_samples", 0))
+        except (TypeError, ValueError):
+            landmark_samples = 0
+        if landmark_samples < 6:
+            return
+
+        center_y = self._calibration_float(payload, "mouth_core_center_y_ratio", 0.58, 0.78)
+        half_width = self._calibration_float(payload, "mouth_core_half_width_ratio", 0.24, 0.36)
+        half_height = self._calibration_float(payload, "mouth_core_half_height_ratio", 0.13, 0.17)
+        feather = self._calibration_float(payload, "mouth_core_feather", 0.12, 0.36)
+        chin_bottom = self._calibration_float(payload, "chin_mask_bottom_ratio", 0.63, 0.70)
+        mouth_bottom = self._calibration_float(payload, "mouth_mask_bottom_ratio", 0.81, 0.87)
+        if any(
+            value is None
+            for value in (center_y, half_width, half_height, feather, chin_bottom, mouth_bottom)
+        ):
+            return
+        assert center_y is not None
+        assert half_width is not None
+        assert half_height is not None
+        assert feather is not None
+        assert chin_bottom is not None
+        assert mouth_bottom is not None
+
+        self.mouth_core_center_y_ratio = center_y
+        self.mouth_core_half_width_ratio = half_width
+        self.mouth_core_half_height_ratio = half_height
+        self.mouth_core_feather = feather
+        self.chin_mask_bottom_ratio = min(chin_bottom, mouth_bottom)
+        # An explicit API diagnostic setting remains the strongest override.
+        self.mouth_mask_bottom_ratio = (
+            self._request_mouth_mask_bottom_ratio
+            if self._request_mouth_mask_bottom_ratio is not None
+            else mouth_bottom
+        )
+        self._profile_calibration = {
+            "landmark_samples": landmark_samples,
+            "mouth_core_center_y_ratio": center_y,
+            "mouth_core_half_width_ratio": half_width,
+            "mouth_core_half_height_ratio": half_height,
+            "mouth_mask_bottom_ratio": self.mouth_mask_bottom_ratio,
+            "chin_mask_bottom_ratio": self.chin_mask_bottom_ratio,
+        }
+        logger.info(
+            "component=musetalk op=profile_calibration status=applied path=%s samples=%d center_y=%.3f half_width=%.3f",
+            calibration_path,
+            landmark_samples,
+            center_y,
+            half_width,
+        )
+
     def load_profile(self, profile: str, profile_type: str = PROFILE_TYPE_AVATAR) -> None:
         cache_dir = avatar_cache_dir(profile, profile_type)
         frames_path = cache_dir / "frames.npy"
@@ -1063,6 +1176,8 @@ class MuseTalkBridge:
                 f"Avatar cache missing for {profile}. Run preprocess with avatar baking."
             )
 
+        self._apply_profile_calibration(cache_dir)
+
         cache_signature = tuple(
             (
                 str(path.name),
@@ -1075,6 +1190,7 @@ class MuseTalkBridge:
                 frames_path,
                 coords_path,
                 meta_path,
+                cache_dir / PROFILE_CALIBRATION_FILENAME,
                 cache_dir / "musetalk_runtime_meta.json",
                 cache_dir / "musetalk_runtime_meta_baked.json",
             )
@@ -1194,6 +1310,7 @@ class MuseTalkBridge:
                     frames_path,
                     coords_path,
                     meta_path,
+                    cache_dir / PROFILE_CALIBRATION_FILENAME,
                     cache_dir / "musetalk_runtime_meta.json",
                     cache_dir / "musetalk_runtime_meta_baked.json",
                 )

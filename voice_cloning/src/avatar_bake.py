@@ -39,6 +39,8 @@ except ImportError:
 
 
 ProgressReporter = Callable[[float, str], None]
+MUSE_TALK_PROFILE_CALIBRATION_FILENAME = "musetalk_profile_calibration.json"
+MUSE_TALK_PROFILE_CALIBRATION_VERSION = 1
 
 
 def _report_progress(progress: ProgressReporter | None, fraction: float, activity: str) -> None:
@@ -443,6 +445,131 @@ def _expand_musetalk_coord(
     )
 
 
+def _median(values: list[float]) -> float | None:
+    """Return a finite median without letting one failed frame poison a profile."""
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite:
+        return None
+    return float(np.median(np.asarray(finite, dtype=np.float32)))
+
+
+def _calibrate_musetalk_composite(
+    frames: np.ndarray,
+    base_coords_y1y2x1x2: np.ndarray,
+    settings: dict[str, float | int | str],
+) -> dict[str, float | int | str] | None:
+    """Derive a stable, profile-specific mouth blend region from landmarks.
+
+    MuseTalk reconstructs a 256px face patch, while the rest of the portrait
+    is still the higher-resolution source clip.  A fixed generic mouth oval
+    can be slightly off for a particular face, exposing source lips on one
+    side or replacing more of the chin than necessary.  This calibration runs
+    once while a profile is prepared and stores only median geometry, never a
+    frame-specific expression.  Runtime inference therefore stays unchanged.
+    """
+    if frames.ndim != 4 or len(frames) == 0 or len(frames) != len(base_coords_y1y2x1x2):
+        return None
+    try:
+        import mediapipe as mp
+    except Exception:
+        return None
+
+    frame_h, frame_w = frames.shape[1:3]
+    primary_coords = _legacy_coords_to_xyxy(base_coords_y1y2x1x2, frame_w, frame_h)
+    # A representative sample is enough because the final values are medians.
+    # It keeps the preparation-time cost bounded for long uploaded clips.
+    sample_count = min(48, len(frames))
+    sample_indices = np.unique(np.linspace(0, len(frames) - 1, sample_count, dtype=np.int32))
+    center_y_ratios: list[float] = []
+    half_width_ratios: list[float] = []
+    face_coverage_ratios: list[float] = []
+
+    mesh = mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+    )
+    try:
+        for index in sample_indices.tolist():
+            frame = frames[index]
+            result = mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            if not result.multi_face_landmarks:
+                continue
+
+            face_box = _expand_musetalk_coord(
+                _sanitize_xyxy(tuple(int(value) for value in primary_coords[index]), frame_w, frame_h),
+                frame_w,
+                frame_h,
+                settings,
+            )
+            x1, y1, x2, y2 = face_box
+            face_w = max(1.0, float(x2 - x1))
+            face_h = max(1.0, float(y2 - y1))
+            landmarks = result.multi_face_landmarks[0].landmark
+            mouth_left = landmarks[61]
+            mouth_right = landmarks[291]
+            upper_lip = landmarks[13]
+            lower_lip = landmarks[14]
+
+            mouth_center_y = ((upper_lip.y + lower_lip.y) * 0.5) * frame_h
+            mouth_width = abs(mouth_right.x - mouth_left.x) * frame_w
+            center_y_ratios.append((mouth_center_y - y1) / face_h)
+            # The core needs margin for phonemes that open wider than the
+            # reference frame.  The value is a half-width relative to the
+            # MuseTalk conditioning box, not a literal mouth measurement.
+            half_width_ratios.append((mouth_width * 0.78) / face_w)
+            face_coverage_ratios.append(face_h / max(1.0, float(frame_h)))
+    finally:
+        mesh.close()
+
+    center_y = _median(center_y_ratios)
+    half_width = _median(half_width_ratios)
+    coverage = _median(face_coverage_ratios)
+    if center_y is None or half_width is None or coverage is None:
+        return None
+
+    center_y = float(np.clip(center_y, 0.58, 0.78))
+    half_width = float(np.clip(half_width, 0.24, 0.36))
+    # A mouth must remain large enough to preserve the complete generated
+    # lower lip.  Height is intentionally conservative because a wide mask
+    # below the lips is what makes MuseTalk's 256px chin look soft.
+    half_height = float(np.clip(0.145 + (0.69 - center_y) * 0.12, 0.13, 0.17))
+    mouth_bottom = float(np.clip(center_y + half_height + 0.035, 0.81, 0.87))
+    chin_bottom = float(np.clip(center_y - 0.02, 0.63, 0.70))
+
+    return {
+        "version": MUSE_TALK_PROFILE_CALIBRATION_VERSION,
+        "landmark_samples": int(len(center_y_ratios)),
+        "face_coverage_ratio": round(coverage, 5),
+        "mouth_core_center_y_ratio": round(center_y, 5),
+        "mouth_core_half_width_ratio": round(half_width, 5),
+        "mouth_core_half_height_ratio": round(half_height, 5),
+        "mouth_core_feather": 0.22,
+        "mouth_mask_bottom_ratio": round(mouth_bottom, 5),
+        "chin_mask_bottom_ratio": round(chin_bottom, 5),
+    }
+
+
+def _write_musetalk_profile_calibration(
+    cache_dir: Path,
+    frames: np.ndarray,
+    base_coords_y1y2x1x2: np.ndarray,
+) -> dict[str, float | int | str] | None:
+    """Persist a calibration when landmarks are available, otherwise remove stale data."""
+    calibration_path = cache_dir / MUSE_TALK_PROFILE_CALIBRATION_FILENAME
+    calibration = _calibrate_musetalk_composite(
+        frames,
+        base_coords_y1y2x1x2,
+        _musetalk_runtime_cache_settings(),
+    )
+    if calibration is None:
+        calibration_path.unlink(missing_ok=True)
+        return None
+    calibration_path.write_text(json.dumps(calibration, indent=2))
+    return calibration
+
+
 def bake_musetalk_assets(
     cache_dir: Path,
     frames: np.ndarray,
@@ -767,6 +894,19 @@ def bake_avatar(
         "height": int(frames[0].shape[0]),
     }
     (cache_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
+    # Calibrate the geometry of the high-resolution source / generated-mouth
+    # boundary once for this specific person.  The renderer reads this tiny
+    # JSON file on profile load, so this improves compositing without adding
+    # any work to a live request.
+    _report_progress(progress, 0.60, "Calibrating mouth placement")
+    calibration = _write_musetalk_profile_calibration(
+        cache_dir,
+        np.array(frames, dtype=np.uint8),
+        coords_arr,
+    )
+    if calibration is None:
+        print("   [WARN] MuseTalk profile calibration unavailable; using safe default blend.")
 
     # Build MuseTalk assets offline to keep runtime inference deterministic.
     try:
