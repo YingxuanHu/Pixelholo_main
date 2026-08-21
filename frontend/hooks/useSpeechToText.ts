@@ -6,6 +6,7 @@ export const useSpeechToText = (onFinalText: SpeechResultHandler) => {
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [hasSupport, setHasSupport] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const recognitionRef = useRef<any>(null);
   const onFinalTextRef = useRef(onFinalText);
   const committedTextRef = useRef('');
@@ -58,8 +59,13 @@ export const useSpeechToText = (onFinalText: SpeechResultHandler) => {
       }
     };
 
-    recognition.onerror = () => {
+    recognition.onerror = (event: any) => {
       suppressFinalRef.current = false;
+      if (event?.error === 'not-allowed' || event?.error === 'service-not-allowed') {
+        setError('Microphone access was not allowed. Enable it in your browser settings and try again.');
+      } else if (event?.error && event.error !== 'no-speech' && event.error !== 'aborted') {
+        setError('Voice input could not start. Please try again.');
+      }
       setIsListening(false);
     };
     recognition.onend = () => {
@@ -89,17 +95,24 @@ export const useSpeechToText = (onFinalText: SpeechResultHandler) => {
   }, []);
 
   const startListening = () => {
-    if (!recognitionRef.current || isListening) return;
+    if (!recognitionRef.current) {
+      setError('Voice input is not supported by this browser.');
+      return false;
+    }
+    if (isListening) return true;
     try {
       committedTextRef.current = '';
       lastEmittedTextRef.current = '';
       latestTranscriptRef.current = '';
       suppressFinalRef.current = false;
       setTranscript('');
+      setError(null);
       recognitionRef.current.start();
       setIsListening(true);
+      return true;
     } catch {
-      // ignore duplicate starts
+      setError('Voice input could not start. Please try again.');
+      return false;
     }
   };
 
@@ -119,5 +132,6 @@ export const useSpeechToText = (onFinalText: SpeechResultHandler) => {
     startListening,
     stopListening,
     hasSupport,
+    error,
   };
 };

@@ -488,6 +488,7 @@ const App: React.FC = () => {
   const [isProfileMutationPending, setIsProfileMutationPending] = useState(false);
   const [videoFps, setVideoFps] = useState(DEFAULT_VIDEO_FPS);
   const [videoQueue, setVideoQueue] = useState(0);
+  const [isAvatarFullscreen, setIsAvatarFullscreen] = useState(false);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const nextStartTimeRef = useRef<number>(0);
@@ -505,6 +506,7 @@ const App: React.FC = () => {
   // prompt is submitted through the end of playback so repeated Enter presses
   // cannot queue several copies while profile warm-up is still pending.
   const inferenceSubmissionRef = useRef(false);
+  const pendingVoiceSubmissionRef = useRef<string | null>(null);
   const inferenceRequestRef = useRef(0);
   const stopInferenceRef = useRef(false);
   const streamSessionRef = useRef<number>(0);
@@ -528,6 +530,7 @@ const App: React.FC = () => {
   const backendRuntimeIdRef = useRef<string | null>(null);
   const activeWarmupKeyRef = useRef<string | null>(null);
   const videoCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const avatarFullscreenRef = useRef<HTMLElement | null>(null);
   const videoTimerRef = useRef<number | null>(null);
   const videoRafRef = useRef<number | null>(null);
   const videoStartTimeRef = useRef<number | null>(null);
@@ -2635,7 +2638,7 @@ const App: React.FC = () => {
     await runInference(inferenceText, '/speak');
   }, [inferenceText, runInference]);
 
-  const stopInference = async () => {
+  const stopInference = async ({ preserveVoiceInput = false }: { preserveVoiceInput?: boolean } = {}) => {
     if (stopInferenceRef.current) return;
     stopInferenceRef.current = true;
     // Invalidate both a stream and a request that is still warming up before
@@ -2644,8 +2647,11 @@ const App: React.FC = () => {
     const stopRequestId = ++inferenceRequestRef.current;
     inferenceSubmissionRef.current = true;
     setIsStoppingInference(true);
-    stopListeningRef.current?.();
-    stopListening();
+    if (!preserveVoiceInput) {
+      pendingVoiceSubmissionRef.current = null;
+      stopListeningRef.current?.();
+      stopListening();
+    }
     if (streamAbortRef.current) streamAbortRef.current.abort();
     streamAbortRef.current = null;
     streamRunningRef.current = false;
@@ -2826,6 +2832,13 @@ const App: React.FC = () => {
 
   const applyVoiceInput = useCallback((spoken: string) => {
     setInferenceText(spoken);
+    // A full-screen interruption keeps its old request locked until its
+    // backend cancellation finishes. Keep an early final transcript instead
+    // of dropping it if the user finishes speaking during that short window.
+    if (inferenceSubmissionRef.current) {
+      pendingVoiceSubmissionRef.current = spoken;
+      return;
+    }
     void runInference(spoken, '/chat');
   }, [runInference]);
   const {
@@ -2834,8 +2847,107 @@ const App: React.FC = () => {
     stopListening,
     hasSupport: hasSpeechSupport,
     transcript: speechTranscript,
+    error: speechInputError,
   } = useSpeechToText(applyVoiceInput);
   const composerDisplayText = isListening ? speechTranscript : inferenceText;
+
+  const exitAvatarFullscreen = useCallback(async () => {
+    const fullscreenDocument = document as Document & {
+      webkitFullscreenElement?: Element | null;
+      webkitExitFullscreen?: () => Promise<void> | void;
+    };
+    const activeElement = document.fullscreenElement || fullscreenDocument.webkitFullscreenElement;
+    if (activeElement === avatarFullscreenRef.current) {
+      try {
+        if (document.exitFullscreen) {
+          await document.exitFullscreen();
+        } else {
+          await fullscreenDocument.webkitExitFullscreen?.();
+        }
+      } catch {
+        // The CSS fallback is still safe when a browser declines native full screen.
+      }
+    }
+    setIsAvatarFullscreen(false);
+  }, []);
+
+  const enterAvatarFullscreen = useCallback(async () => {
+    const target = avatarFullscreenRef.current;
+    if (!target) return;
+
+    // Set this first so browsers without the Fullscreen API still receive a
+    // focused, app-level full-screen experience.
+    setIsAvatarFullscreen(true);
+    const fullscreenTarget = target as HTMLElement & {
+      webkitRequestFullscreen?: () => Promise<void> | void;
+    };
+    try {
+      if (target.requestFullscreen) {
+        await target.requestFullscreen();
+      } else {
+        await fullscreenTarget.webkitRequestFullscreen?.();
+      }
+    } catch {
+      // iOS and embedded browsers may reject native full screen. Keep the
+      // viewport-covering CSS fallback active instead.
+    }
+  }, []);
+
+  useEffect(() => {
+    const fullscreenDocument = document as Document & {
+      webkitFullscreenElement?: Element | null;
+    };
+    const syncFullscreenState = () => {
+      const activeElement = document.fullscreenElement || fullscreenDocument.webkitFullscreenElement;
+      if (!activeElement) setIsAvatarFullscreen(false);
+    };
+
+    document.addEventListener('fullscreenchange', syncFullscreenState);
+    document.addEventListener('webkitfullscreenchange', syncFullscreenState as EventListener);
+    return () => {
+      document.removeEventListener('fullscreenchange', syncFullscreenState);
+      document.removeEventListener('webkitfullscreenchange', syncFullscreenState as EventListener);
+    };
+  }, []);
+
+  useEffect(() => {
+    document.body.classList.toggle('ph-avatar-fullscreen-open', isAvatarFullscreen);
+    return () => document.body.classList.remove('ph-avatar-fullscreen-open');
+  }, [isAvatarFullscreen]);
+
+  useEffect(() => {
+    if (!isAvatarFullscreen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        void exitAvatarFullscreen();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [exitAvatarFullscreen, isAvatarFullscreen]);
+
+  const startFullscreenTalk = async () => {
+    if (isListening || isStoppingInference || isProfileLoading || !hasSpeechSupport || apiStatus !== 'online') return;
+
+    // Calling SpeechRecognition from the original button event matters on
+    // Safari and mobile browsers. Stop the active stream first, but preserve
+    // the new microphone session while the best-effort backend interrupt ends.
+    if (isInferenceActive || inferenceSubmissionRef.current) {
+      const stopPromise = stopInference({ preserveVoiceInput: true });
+      startListening();
+      await stopPromise;
+      const queuedTranscript = pendingVoiceSubmissionRef.current;
+      pendingVoiceSubmissionRef.current = null;
+      if (queuedTranscript) {
+        void runInference(queuedTranscript, '/chat');
+      }
+      return;
+    }
+
+    void unlockAudio();
+    startListening();
+  };
 
   const selectProfile = async (item: ProfileInfo) => {
     if (isProfileSwitchBlocked || profileSwitchRef.current || profileMutationRef.current) {
@@ -3263,12 +3375,50 @@ const App: React.FC = () => {
             </div>
 
             <div className="ph-minimal-workspace">
-              <section className="ph-minimal-preview">
-                <div className="ph-minimal-preview-heading"><span>Live preview</span><span><i className={`ph-mini-dot ${isProfileLoading ? 'is-preparing' : isInferenceActive ? 'is-speaking' : ''}`} />{isProfileLoading ? 'Preparing' : isInferenceActive ? (videoState === 'playing' ? 'Speaking' : inferenceStatusLabel) : 'Ready'}</span></div>
+              <section
+                ref={avatarFullscreenRef}
+                className={`ph-minimal-preview ${isAvatarFullscreen ? 'is-avatar-fullscreen' : ''}`}
+              >
+                <div className="ph-minimal-preview-heading">
+                  <span className="ph-minimal-preview-label">Live preview</span>
+                  <div className="ph-minimal-preview-actions">
+                    <span className="ph-minimal-preview-state"><i className={`ph-mini-dot ${isProfileLoading ? 'is-preparing' : isInferenceActive ? 'is-speaking' : ''}`} />{isProfileLoading ? 'Preparing' : isInferenceActive ? (videoState === 'playing' ? 'Speaking' : inferenceStatusLabel) : 'Ready'}</span>
+                    <button
+                      type="button"
+                      className="ph-minimal-fullscreen-button"
+                      onClick={() => void (isAvatarFullscreen ? exitAvatarFullscreen() : enterAvatarFullscreen())}
+                      aria-label={isAvatarFullscreen ? 'Exit full screen' : 'Open avatar in full screen'}
+                      title={isAvatarFullscreen ? 'Exit full screen' : 'Full screen'}
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V5h4M20 9V5h-4M4 15v4h4M20 15v4h-4" /></svg>
+                      <span>{isAvatarFullscreen ? 'Exit' : 'Full screen'}</span>
+                    </button>
+                  </div>
+                </div>
                 <div className="ph-minimal-canvas-wrap">
                   <canvas ref={videoCanvasRef} width={960} height={1280} aria-label="Live avatar preview" />
                   {isProfileLoading && <div className="ph-minimal-buffering ph-minimal-preparing">Preparing avatar…</div>}
                   {videoState === 'buffering' && stepStatuses.inference === 'running' && <div className="ph-minimal-buffering">Buffering…</div>}
+                  {isAvatarFullscreen && (
+                    <div className="ph-fullscreen-talk-area" aria-live="polite">
+                      {isListening ? (
+                        <span className="ph-fullscreen-listening">Listening…</span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="ph-fullscreen-talk-button"
+                          onClick={() => void startFullscreenTalk()}
+                          disabled={!hasSpeechSupport || isProfileLoading || isStoppingInference || apiStatus !== 'online'}
+                          title={hasSpeechSupport ? (isInferenceActive ? 'Interrupt the response and speak' : 'Speak to your avatar') : 'Voice input is not supported by this browser'}
+                          aria-label={isInferenceActive ? 'Interrupt the response and speak' : 'Talk to your avatar'}
+                        >
+                          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm6-3a1 1 0 0 0-2 0 4 4 0 0 1-8 0 1 1 0 0 0-2 0 6 6 0 0 0 5 5.91V19H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-2.09A6 6 0 0 0 18 11Z" /></svg>
+                          <span>Talk</span>
+                        </button>
+                      )}
+                      {speechInputError && <span className="ph-fullscreen-talk-error" role="alert">{speechInputError}</span>}
+                    </div>
+                  )}
                 </div>
                 <div className="ph-minimal-preview-footer"><span>Chatterbox + {avatarBackend === 'wav2lip' ? 'Wav2Lip' : 'MuseTalk'}</span><span>{videoQueue ? `${videoQueue} frames` : `${videoFps} FPS`}</span></div>
               </section>
